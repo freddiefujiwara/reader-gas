@@ -1,0 +1,825 @@
+// reader-gas: Web版RSSリーダー /reader のバックエンドAPI (Google Apps Script)。
+// 正本は Google Sheets (feeds / articles / states / owner_sessions の4タブ)。
+// スプレッドシートIDはスクリプトプロパティ SPREADSHEET_ID から読む (コードに直書きしない)。
+// 毎時トリガー fetchFeeds が18フィードを巡回して articles へ追記し、
+// フロントは doPost の list / mark / markAllRead で既読・スターを同期する。
+// 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、
+// オーナー本人 (ALLOWED_EMAIL) にだけ30日セッションを発行する。
+// セッションは owner_sessions タブにトークンの SHA-256 ハッシュだけを保存し、
+// 複数端末の同時セッションを妨げない。
+// 一時アクセスリンク (share) は読み取り専用: exchange_share で検証し、
+// role=readonly のセッションを発行する。mark 系は readonly を拒否する。
+// 自前フィード (is_private) の取得トークンはスクリプトプロパティ
+// A_ZE_GS_TOKEN を X-Api-Token ヘッダーで送るだけにし、シートにもコードにも書かない。
+
+const ALLOWED_EMAIL = 'zegenvs@gmail.com';
+const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
+const OWNER_SHEET_NAME = 'owner_sessions';
+const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
+const SESSION_HEADERS = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
+const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'enabled', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
+const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
+const STATES_HEADERS = ['article_id', 'is_read', 'is_starred', 'read_at', 'starred_at', 'updated_at'];
+const RETENTION_DAYS = 60;
+const MAX_ARTICLES = 5000;
+const SUMMARY_MAX_CHARS = 500;
+
+// --- Sheets helpers (xuexi-gas と同型) ---
+
+function rowsToObjects(values) {
+  if (!values || values.length < 2) return [];
+  const headers = values[0];
+  const out = [];
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    if (!row || row.every((c) => c === '' || c === null || c === undefined)) continue;
+    const obj = {};
+    headers.forEach((h, idx) => {
+      obj[h] = row[idx] === undefined ? '' : row[idx];
+    });
+    out.push(obj);
+  }
+  return out;
+}
+
+function readSheetAsObjects(ss, sheetName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return [];
+  const values = sheet.getDataRange().getValues();
+  return rowsToObjects(values);
+}
+
+function getSheetOrCreate(ss, sheetName, headers) {
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    if (headers && headers.length) sheet.appendRow(headers);
+  }
+  return sheet;
+}
+
+function openDataSpreadsheet() {
+  const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (!id) throw new Error('SPREADSHEET_ID is not set in script properties');
+  return SpreadsheetApp.openById(id);
+}
+
+function isTruthy(value) {
+  return value === true || value === 1 || value === 'TRUE' || value === 'true' || value === '1';
+}
+
+function cellIso(value) {
+  if (!value) return '';
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+
+// --- SHA-256 ---
+// GAS では Utilities.computeDigest を優先し、無い環境 (Node テスト) では
+// 純JS実装にフォールバックする。どちらも同じ16進文字列を返す。
+
+function utf8Bytes(str) {
+  const bytes = [];
+  const s = String(str);
+  for (let i = 0; i < s.length; i++) {
+    let cp = s.charCodeAt(i);
+    if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < s.length) {
+      const lo = s.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) {
+        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+        i++;
+      }
+    }
+    if (cp < 0x80) bytes.push(cp);
+    else if (cp < 0x800) bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+    else if (cp < 0x10000) bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    else bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+  }
+  return bytes;
+}
+
+function sha256HexPure(str) {
+  const K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  ];
+  const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  const bytes = utf8Bytes(str);
+  const bitLen = bytes.length * 8;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  // 64-bit length: inputs here are far below 2^32 bits, high word is 0.
+  bytes.push(0, 0, 0, 0);
+  bytes.push((bitLen >>> 24) & 0xff, (bitLen >>> 16) & 0xff, (bitLen >>> 8) & 0xff, bitLen & 0xff);
+  const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
+  const w = new Array(64);
+  for (let block = 0; block < bytes.length; block += 64) {
+    for (let t = 0; t < 16; t++) {
+      const i = block + t * 4;
+      w[t] = ((bytes[i] << 24) | (bytes[i + 1] << 16) | (bytes[i + 2] << 8) | bytes[i + 3]) >>> 0;
+    }
+    for (let t = 16; t < 64; t++) {
+      const s0 = (rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3)) >>> 0;
+      const s1 = (rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10)) >>> 0;
+      w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+    }
+    let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (let t = 0; t < 64; t++) {
+      const S1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0;
+      const ch = ((e & f) ^ (~e & g)) >>> 0;
+      const temp1 = (h + S1 + ch + K[t] + w[t]) >>> 0;
+      const S0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0;
+      const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const temp2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + temp1) >>> 0;
+      d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+    }
+    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+  }
+  return H.map((x) => ('0000000' + x.toString(16)).slice(-8)).join('');
+}
+
+function sha256Hex(str) {
+  if (typeof Utilities !== 'undefined' && Utilities.computeDigest) {
+    const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(str), Utilities.Charset.UTF_8);
+    return digest.map((b) => ('0' + ((b & 0xff).toString(16))).slice(-2)).join('');
+  }
+  return sha256HexPure(str);
+}
+
+function articleId(feedId, guidOrLink) {
+  return sha256Hex(String(feedId) + '\n' + String(guidOrLink));
+}
+
+function hashesEqual(a, b) {
+  const x = String(a || '').toLowerCase();
+  const y = String(b || '').toLowerCase();
+  if (!x || !y || x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i);
+  return diff === 0;
+}
+
+function isSessionExpired(expiresAt, now) {
+  const exp = Date.parse(cellIso(expiresAt));
+  if (!exp) return true;
+  const n = now ? Date.parse(cellIso(now)) : Date.now();
+  return exp <= n;
+}
+
+// --- Minimal XML layer (pure JS, no XmlService, no dependencies) ---
+// Sufficient for well-formed RSS 2.0 / RSS 1.0 (RDF) / Atom documents.
+// Node: { name (local, lowercase), attrs, children, text }
+
+function decodeXmlEntities(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, num) => String.fromCodePoint(parseInt(num, 10)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function localName(tag) {
+  const raw = String(tag || '').trim();
+  const idx = raw.indexOf(':');
+  return (idx >= 0 ? raw.slice(idx + 1) : raw).toLowerCase();
+}
+
+function parseAttrs(attrText) {
+  const attrs = {};
+  const re = /([A-Za-z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = re.exec(attrText)) !== null) {
+    attrs[localName(m[1])] = decodeXmlEntities(m[2] !== undefined ? m[2] : m[3]);
+    attrs[m[1]] = attrs[localName(m[1])];
+  }
+  return attrs;
+}
+
+function parseXml(xmlText) {
+  const src = String(xmlText || '');
+  const root = { name: '#root', attrs: {}, children: [], text: '' };
+  const stack = [root];
+  let i = 0;
+  const pushText = (raw, isCdata) => {
+    if (!raw) return;
+    stack[stack.length - 1].text += isCdata ? raw : decodeXmlEntities(raw);
+  };
+  while (i < src.length) {
+    const lt = src.indexOf('<', i);
+    if (lt < 0) { pushText(src.slice(i), false); break; }
+    if (lt > i) pushText(src.slice(i, lt), false);
+    if (src.startsWith('<!--', lt)) {
+      const end = src.indexOf('-->', lt + 4);
+      i = end < 0 ? src.length : end + 3;
+      continue;
+    }
+    if (src.startsWith('<![CDATA[', lt)) {
+      const end = src.indexOf(']]>', lt + 9);
+      pushText(end < 0 ? src.slice(lt + 9) : src.slice(lt + 9, end), true);
+      i = end < 0 ? src.length : end + 3;
+      continue;
+    }
+    if (src.startsWith('<?', lt)) {
+      const end = src.indexOf('?>', lt + 2);
+      i = end < 0 ? src.length : end + 2;
+      continue;
+    }
+    if (src.startsWith('<!', lt)) {
+      const end = src.indexOf('>', lt + 2);
+      i = end < 0 ? src.length : end + 1;
+      continue;
+    }
+    const gt = src.indexOf('>', lt + 1);
+    if (gt < 0) break;
+    const inside = src.slice(lt + 1, gt);
+    if (inside.startsWith('/')) {
+      const name = localName(inside.slice(1));
+      // Pop back to the matching open element (tolerates minor mis-nesting).
+      for (let s = stack.length - 1; s > 0; s--) {
+        if (stack[s].name === name) { stack.length = s; break; }
+      }
+      i = gt + 1;
+      continue;
+    }
+    const selfClosing = inside.endsWith('/');
+    const bodyText = selfClosing ? inside.slice(0, -1) : inside;
+    const spaceIdx = bodyText.search(/[\s]/);
+    const tagName = spaceIdx < 0 ? bodyText : bodyText.slice(0, spaceIdx);
+    const attrText = spaceIdx < 0 ? '' : bodyText.slice(spaceIdx + 1);
+    const node = { name: localName(tagName), attrs: parseAttrs(attrText), children: [], text: '' };
+    stack[stack.length - 1].children.push(node);
+    if (!selfClosing) stack.push(node);
+    i = gt + 1;
+  }
+  return root;
+}
+
+function childNodes(node, name) {
+  if (!node) return [];
+  return node.children.filter((c) => c.name === name);
+}
+
+function firstChildNode(node, name) {
+  const found = childNodes(node, name);
+  return found.length ? found[0] : null;
+}
+
+function nodeText(node) {
+  if (!node) return '';
+  // Element text plus descendants' text (covers Atom summary/content nesting).
+  let out = node.text || '';
+  node.children.forEach((c) => { out += nodeText(c); });
+  return out.trim();
+}
+
+function childText(node, name) {
+  return nodeText(firstChildNode(node, name));
+}
+
+function findAllNodes(node, name, out) {
+  const acc = out || [];
+  if (!node) return acc;
+  node.children.forEach((c) => {
+    if (c.name === name) acc.push(c);
+    findAllNodes(c, name, acc);
+  });
+  return acc;
+}
+
+function stripTags(html) {
+  // Decode first so escaped markup (&lt;p&gt;...) is stripped as markup too,
+  // then strip real tags. Plain-text entities survive the tag pass.
+  const decoded = decodeXmlEntities(String(html || ''));
+  return decoded.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function summarize(html, maxChars) {
+  const limit = maxChars || SUMMARY_MAX_CHARS;
+  const text = stripTags(html);
+  return text.length > limit ? text.slice(0, limit) : text;
+}
+
+function toIsoDate(value) {
+  if (!value) return '';
+  const t = Date.parse(String(value).trim());
+  if (!t && t !== 0) return '';
+  if (Number.isNaN(t)) return '';
+  return new Date(t).toISOString();
+}
+
+function parseFeed(xmlText, feed) {
+  const feedId = feed && feed.id ? String(feed.id) : '';
+  const root = parseXml(xmlText);
+  const items = [];
+  const pushItem = (guid, title, link, publishedAt, summarySource, author) => {
+    const key = guid || link;
+    if (!key || !link) return;
+    items.push({
+      guid: String(key),
+      title: String(title || '').trim() || '(no title)',
+      link: String(link).trim(),
+      publishedAt: toIsoDate(publishedAt),
+      summary: summarize(summarySource || ''),
+      author: String(author || '').trim(),
+      feedId,
+    });
+  };
+  // RSS 2.0: rss > channel > item
+  findAllNodes(root, 'channel').forEach((channel) => {
+    childNodes(channel, 'item').forEach((item) => {
+      pushItem(
+        childText(item, 'guid') || childText(item, 'link'),
+        childText(item, 'title'),
+        childText(item, 'link'),
+        childText(item, 'pubdate') || childText(item, 'date'),
+        childText(item, 'description') || childText(item, 'encoded'),
+        childText(item, 'author') || childText(item, 'creator')
+      );
+    });
+  });
+  // RSS 1.0 / RDF: item elements that are direct children of the root element.
+  const docEl = root.children.length ? root.children[0] : null;
+  if (docEl) {
+    childNodes(docEl, 'item').forEach((item) => {
+      pushItem(
+        item.attrs.about || childText(item, 'link'),
+        childText(item, 'title'),
+        childText(item, 'link'),
+        childText(item, 'date'),
+        childText(item, 'description'),
+        childText(item, 'creator')
+      );
+    });
+  }
+  // Atom: entry elements anywhere under the feed root.
+  findAllNodes(root, 'entry').forEach((entry) => {
+    const links = childNodes(entry, 'link');
+    let href = '';
+    links.forEach((l) => {
+      if (!href && (!l.attrs.rel || l.attrs.rel === 'alternate')) href = l.attrs.href || '';
+    });
+    if (!href && links.length) href = links[0].attrs.href || '';
+    const authorNode = firstChildNode(entry, 'author');
+    pushItem(
+      childText(entry, 'id') || href,
+      nodeText(firstChildNode(entry, 'title')),
+      href,
+      childText(entry, 'published') || childText(entry, 'updated'),
+      childText(entry, 'summary') || childText(entry, 'content'),
+      authorNode ? childText(authorNode, 'name') : ''
+    );
+  });
+  return items;
+}
+
+// --- Retention (pure decision logic) ---
+// Eligible for pruning: no state, or read and not starred.
+// Prune when older than RETENTION_DAYS, or beyond the newest MAX_ARTICLES.
+
+function prunePlan(articles, states, nowIso, options) {
+  const opts = options || {};
+  const retentionMs = (opts.retentionDays || RETENTION_DAYS) * 24 * 60 * 60 * 1000;
+  const maxArticles = opts.maxArticles || MAX_ARTICLES;
+  const now = nowIso ? Date.parse(nowIso) : Date.now();
+  const stateById = {};
+  (states || []).forEach((s) => { stateById[s.article_id] = s; });
+  const sorted = (articles || []).slice().sort((a, b) => {
+    const ta = Date.parse(cellIso(a.published_at) || cellIso(a.fetched_at) || '') || 0;
+    const tb = Date.parse(cellIso(b.published_at) || cellIso(b.fetched_at) || '') || 0;
+    return tb - ta;
+  });
+  const keepRank = {};
+  sorted.forEach((a, idx) => { keepRank[a.id] = idx < maxArticles; });
+  const deleteArticleIds = [];
+  sorted.forEach((a) => {
+    const st = stateById[a.id];
+    const starred = st ? isTruthy(st.is_starred) : false;
+    if (starred) return;
+    const eligible = !st || isTruthy(st.is_read);
+    if (!eligible) return;
+    const t = Date.parse(cellIso(a.published_at) || cellIso(a.fetched_at) || '') || 0;
+    const tooOld = t > 0 && now - t > retentionMs;
+    const beyondCap = !keepRank[a.id];
+    if (tooOld || beyondCap) deleteArticleIds.push(a.id);
+  });
+  const deleteSet = {};
+  deleteArticleIds.forEach((id) => { deleteSet[id] = true; });
+  const articleSet = {};
+  (articles || []).forEach((a) => { articleSet[a.id] = true; });
+  const deleteStateIds = [];
+  (states || []).forEach((s) => {
+    if (isTruthy(s.is_starred)) return;
+    if (deleteSet[s.article_id] || !articleSet[s.article_id]) deleteStateIds.push(s.article_id);
+  });
+  return { deleteArticleIds, deleteStateIds };
+}
+
+function pruneArticles() {
+  const ss = openDataSpreadsheet();
+  const articles = readSheetAsObjects(ss, 'articles');
+  const states = readSheetAsObjects(ss, 'states');
+  const plan = prunePlan(articles, states, new Date().toISOString());
+  deleteRowsById(ss, 'articles', 'id', plan.deleteArticleIds);
+  deleteRowsById(ss, 'states', 'article_id', plan.deleteStateIds);
+  return plan;
+}
+
+function deleteRowsById(ss, sheetName, keyHeader, ids) {
+  if (!ids || !ids.length) return;
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return;
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return;
+  const keyIdx = values[0].indexOf(keyHeader);
+  if (keyIdx < 0) return;
+  const target = {};
+  ids.forEach((id) => { target[String(id)] = true; });
+  const rowsDesc = [];
+  for (let i = 1; i < values.length; i++) {
+    if (target[String(values[i][keyIdx])]) rowsDesc.push(i + 1);
+  }
+  rowsDesc.sort((a, b) => b - a);
+  rowsDesc.forEach((rowNum) => sheet.deleteRow(rowNum));
+}
+
+// --- Auth (tweet-gas pattern, simplified for reader) ---
+
+function isAllowedIdTokenPayload(json, clientId) {
+  if (!json) return false;
+  const verified = json.email_verified === true || json.email_verified === 'true';
+  if (!verified) return false;
+  if (json.email !== ALLOWED_EMAIL) return false;
+  if (clientId && json.aud !== clientId) return false;
+  return true;
+}
+
+function verifyIdToken(idToken) {
+  if (!idToken) return null;
+  const res = UrlFetchApp.fetch(TOKENINFO_URL + '?id_token=' + encodeURIComponent(String(idToken)), {
+    method: 'get',
+    muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() !== 200) return null;
+  let json = null;
+  try { json = JSON.parse(res.getContentText()); } catch (e) { return null; }
+  const clientId = PropertiesService.getScriptProperties().getProperty('GOOGLE_CLIENT_ID');
+  if (!isAllowedIdTokenPayload(json, clientId)) return null;
+  return json;
+}
+
+function generateRawToken() {
+  return (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+}
+
+function issueSession(role) {
+  const ss = openDataSpreadsheet();
+  const sheet = getSheetOrCreate(ss, OWNER_SHEET_NAME, SESSION_HEADERS);
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresIso = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
+  const token = generateRawToken();
+  // Multiple concurrent sessions: issuing never revokes the others.
+  sheet.appendRow([sha256Hex(token), nowIso, expiresIso, '', 0, '', role]);
+  return { sessionToken: token, expiresAt: expiresIso, role };
+}
+
+function validateSession(token) {
+  if (!token) return null;
+  const ss = openDataSpreadsheet();
+  const sheet = getSheetOrCreate(ss, OWNER_SHEET_NAME, SESSION_HEADERS);
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return null;
+  const headers = values[0];
+  const hashIdx = headers.indexOf('token_hash');
+  const expIdx = headers.indexOf('expires_at');
+  const revIdx = headers.indexOf('revoked_at');
+  const roleIdx = headers.indexOf('role');
+  const hash = sha256Hex(String(token));
+  const nowIso = new Date().toISOString();
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    if (!hashesEqual(row[hashIdx], hash)) continue;
+    if (revIdx >= 0 && cellIso(row[revIdx])) return null;
+    const expiresAt = cellIso(row[expIdx]);
+    if (isSessionExpired(expiresAt, nowIso)) return null;
+    const accessIdx = headers.indexOf('access_count');
+    const lastIdx = headers.indexOf('last_accessed_at');
+    if (accessIdx >= 0) sheet.getRange(i + 1, accessIdx + 1).setValue(Number(row[accessIdx] || 0) + 1);
+    if (lastIdx >= 0) sheet.getRange(i + 1, lastIdx + 1).setValue(nowIso);
+    const role = roleIdx >= 0 && row[roleIdx] ? String(row[roleIdx]) : 'owner';
+    return { role, expiresAt };
+  }
+  return null;
+}
+
+function issueShareLink() {
+  const props = PropertiesService.getScriptProperties();
+  const token = generateRawToken();
+  const expiresIso = new Date(Date.now() + SHARE_TTL_SECONDS * 1000).toISOString();
+  // Re-issuing overwrites the stored hash, which invalidates the old link.
+  props.setProperties({
+    SHARE_TOKEN_HASH: sha256Hex(token),
+    SHARE_EXPIRES_AT: expiresIso,
+  }, false);
+  return { shareToken: token, expiresAt: expiresIso };
+}
+
+function validateShareToken(token) {
+  if (!token) return false;
+  const props = PropertiesService.getScriptProperties();
+  const expectedHash = props.getProperty('SHARE_TOKEN_HASH');
+  const expiresAt = props.getProperty('SHARE_EXPIRES_AT');
+  if (!expectedHash || !expiresAt) return false;
+  if (isSessionExpired(expiresAt, new Date().toISOString())) return false;
+  return hashesEqual(sha256Hex(String(token)), expectedHash);
+}
+
+// --- Feed fetching (hourly trigger) ---
+
+function headerValue(headers, name) {
+  if (!headers) return '';
+  const lower = name.toLowerCase();
+  const keys = Object.keys(headers);
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i].toLowerCase() === lower) return String(headers[keys[i]] || '');
+  }
+  return '';
+}
+
+function updateFeedRow(sheet, headers, rowNum, patch) {
+  Object.keys(patch).forEach((key) => {
+    const idx = headers.indexOf(key);
+    if (idx >= 0) sheet.getRange(rowNum, idx + 1).setValue(patch[key]);
+  });
+}
+
+function fetchFeeds() {
+  const ss = openDataSpreadsheet();
+  const feedsSheet = getSheetOrCreate(ss, 'feeds', FEEDS_HEADERS);
+  const articlesSheet = getSheetOrCreate(ss, 'articles', ARTICLES_HEADERS);
+  getSheetOrCreate(ss, 'states', STATES_HEADERS);
+  const feedValues = feedsSheet.getDataRange().getValues();
+  if (feedValues.length < 2) return { ok: true, fetched: 0 };
+  const headers = feedValues[0];
+  const feeds = rowsToObjects(feedValues);
+  // Map feed id -> 1-based sheet row number (header is row 1).
+  const rowNumById = {};
+  for (let i = 1; i < feedValues.length; i++) {
+    const obj = {};
+    headers.forEach((h, idx) => { obj[h] = feedValues[i][idx]; });
+    if (obj.id) rowNumById[obj.id] = i + 1;
+  }
+  const enabledFeeds = feeds.filter((f) => f.id && f.url && isTruthy(f.enabled));
+  const apiToken = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
+  const requests = enabledFeeds.map((feed) => {
+    const reqHeaders = {};
+    if (feed.etag) reqHeaders['If-None-Match'] = String(feed.etag);
+    if (feed.last_modified) reqHeaders['If-Modified-Since'] = String(feed.last_modified);
+    if (isTruthy(feed.is_private) && apiToken) reqHeaders['X-Api-Token'] = apiToken;
+    return { url: String(feed.url), method: 'get', headers: reqHeaders, muteHttpExceptions: true };
+  });
+  const responses = requests.length ? UrlFetchApp.fetchAll(requests) : [];
+  const existingIds = {};
+  readSheetAsObjects(ss, 'articles').forEach((a) => { existingIds[a.id] = true; });
+  const fetchedAt = new Date().toISOString();
+  let addedTotal = 0;
+  enabledFeeds.forEach((feed, idx) => {
+    const rowNum = rowNumById[feed.id];
+    try {
+      if (isTruthy(feed.is_private) && !apiToken) throw new Error('A_ZE_GS_TOKEN is not set');
+      const res = responses[idx];
+      const code = res.getResponseCode();
+      if (code === 304) {
+        updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '304', last_error: '' });
+        return;
+      }
+      if (code !== 200) throw new Error('HTTP ' + code);
+      const resHeaders = typeof res.getHeaders === 'function' ? res.getHeaders() : {};
+      const entries = parseFeed(res.getContentText(), feed);
+      let added = 0;
+      entries.forEach((entry) => {
+        const id = articleId(feed.id, entry.guid || entry.link);
+        if (existingIds[id]) return;
+        existingIds[id] = true;
+        articlesSheet.appendRow([id, feed.id, entry.title, entry.link, entry.publishedAt, fetchedAt, entry.summary, entry.author]);
+        added++;
+      });
+      addedTotal += added;
+      updateFeedRow(feedsSheet, headers, rowNum, {
+        last_fetched_at: fetchedAt,
+        last_status: '200',
+        last_error: '',
+        etag: headerValue(resHeaders, 'ETag') || String(feed.etag || ''),
+        last_modified: headerValue(resHeaders, 'Last-Modified') || String(feed.last_modified || ''),
+      });
+    } catch (err) {
+      // Per-feed errors are isolated: record and continue with the rest.
+      updateFeedRow(feedsSheet, headers, rowNum, {
+        last_fetched_at: fetchedAt,
+        last_status: 'error',
+        last_error: String((err && err.message) || err).slice(0, 500),
+      });
+    }
+  });
+  pruneArticles();
+  return { ok: true, fetched: enabledFeeds.length, added: addedTotal };
+}
+
+function setupFetchTrigger() {
+  ScriptApp.getProjectTriggers().forEach((t) => {
+    if (t.getHandlerFunction() === 'fetchFeeds') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('fetchFeeds').timeBased().everyHours(1).create();
+}
+
+// --- Article listing / state changes ---
+
+function filterArticles(articles, options) {
+  const opts = options || {};
+  let out = (articles || []).slice();
+  if (opts.feedId) out = out.filter((a) => a.feed_id === opts.feedId || a.feedId === opts.feedId);
+  if (opts.filter === 'unread') out = out.filter((a) => !a.isRead);
+  if (opts.filter === 'starred') out = out.filter((a) => a.isStarred);
+  out.sort((a, b) => {
+    const ta = Date.parse(a.publishedAt || a.fetchedAt || '') || 0;
+    const tb = Date.parse(b.publishedAt || b.fetchedAt || '') || 0;
+    return tb - ta;
+  });
+  return out;
+}
+
+function buildListPayload(body) {
+  const ss = openDataSpreadsheet();
+  const feeds = readSheetAsObjects(ss, 'feeds');
+  const feedById = {};
+  feeds.forEach((f) => { feedById[f.id] = f; });
+  const stateById = {};
+  readSheetAsObjects(ss, 'states').forEach((s) => { stateById[s.article_id] = s; });
+  const merged = readSheetAsObjects(ss, 'articles').map((a) => {
+    const st = stateById[a.id];
+    const feed = feedById[a.feed_id];
+    return {
+      id: a.id,
+      feedId: a.feed_id,
+      feedTitle: feed ? String(feed.title || '') : '',
+      title: String(a.title || ''),
+      link: String(a.link || ''),
+      publishedAt: cellIso(a.published_at),
+      fetchedAt: cellIso(a.fetched_at),
+      summary: String(a.summary || ''),
+      author: String(a.author || ''),
+      isRead: st ? isTruthy(st.is_read) : false,
+      isStarred: st ? isTruthy(st.is_starred) : false,
+    };
+  });
+  const unreadByFeed = {};
+  merged.forEach((a) => {
+    if (!a.isRead) unreadByFeed[a.feedId] = (unreadByFeed[a.feedId] || 0) + 1;
+  });
+  const filtered = filterArticles(merged, {
+    feedId: body.feedId ? String(body.feedId) : '',
+    filter: ['unread', 'starred'].indexOf(body.filter) >= 0 ? body.filter : 'all',
+  });
+  let limit = Number(body.limit || 100);
+  if (!Number.isFinite(limit) || limit <= 0) limit = 100;
+  limit = Math.min(limit, 500);
+  let offset = Number(body.offset || 0);
+  if (!Number.isFinite(offset) || offset < 0) offset = 0;
+  return {
+    ok: true,
+    articles: filtered.slice(offset, offset + limit),
+    total: filtered.length,
+    feeds: feeds.filter((f) => f.id).map((f) => ({
+      id: f.id,
+      title: String(f.title || ''),
+      url: String(f.url || ''),
+      category: String(f.category || ''),
+      isPrivate: isTruthy(f.is_private),
+      unreadCount: unreadByFeed[f.id] || 0,
+    })),
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+function upsertState(ss, articleIdValue, patch) {
+  const sheet = getSheetOrCreate(ss, 'states', STATES_HEADERS);
+  const values = sheet.getDataRange().getValues();
+  const headers = values.length ? values[0] : STATES_HEADERS;
+  const nowIso = new Date().toISOString();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) !== String(articleIdValue)) continue;
+    const current = {};
+    headers.forEach((h, idx) => { current[h] = values[i][idx]; });
+    const next = {
+      is_read: patch.isRead !== undefined ? patch.isRead : isTruthy(current.is_read),
+      is_starred: patch.isStarred !== undefined ? patch.isStarred : isTruthy(current.is_starred),
+      read_at: patch.isRead !== undefined ? (patch.isRead ? nowIso : '') : cellIso(current.read_at),
+      starred_at: patch.isStarred !== undefined ? (patch.isStarred ? nowIso : '') : cellIso(current.starred_at),
+      updated_at: nowIso,
+    };
+    headers.forEach((h, idx) => {
+      if (h === 'article_id') return;
+      if (next[h] !== undefined) sheet.getRange(i + 1, idx + 1).setValue(next[h]);
+    });
+    return next;
+  }
+  const row = [String(articleIdValue),
+    patch.isRead !== undefined ? patch.isRead : false,
+    patch.isStarred !== undefined ? patch.isStarred : false,
+    patch.isRead ? nowIso : '',
+    patch.isStarred ? nowIso : '',
+    nowIso];
+  sheet.appendRow(row);
+  return { is_read: row[1], is_starred: row[2] };
+}
+
+function handleMark(body) {
+  const ss = openDataSpreadsheet();
+  const articleIdValue = String(body.articleId || '');
+  if (!articleIdValue) return { ok: false, error: 'bad_request' };
+  const exists = readSheetAsObjects(ss, 'articles').some((a) => String(a.id) === articleIdValue);
+  if (!exists) return { ok: false, error: 'not_found' };
+  const patch = {};
+  if (body.isRead !== undefined) patch.isRead = body.isRead === true;
+  if (body.isStarred !== undefined) patch.isStarred = body.isStarred === true;
+  upsertState(ss, articleIdValue, patch);
+  return { ok: true, articleId: articleIdValue, isRead: patch.isRead, isStarred: patch.isStarred };
+}
+
+function handleMarkAllRead(body) {
+  const ss = openDataSpreadsheet();
+  const feedId = body.feedId ? String(body.feedId) : '';
+  const articles = readSheetAsObjects(ss, 'articles').filter((a) => !feedId || a.feed_id === feedId);
+  let count = 0;
+  articles.forEach((a) => { upsertState(ss, a.id, { isRead: true }); count++; });
+  return { ok: true, marked: count };
+}
+
+// --- Web App entry points ---
+
+function jsonOutput(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function doGet(e) {
+  return jsonOutput({ ok: true, service: 'reader-gas' });
+}
+
+function doPost(e) {
+  let body;
+  try {
+    body = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return jsonOutput({ ok: false, error: 'bad_request' });
+  }
+  try {
+    const action = String(body.action || '');
+    if (action === 'exchange_session') {
+      const identity = verifyIdToken(body.idToken);
+      if (!identity) return jsonOutput({ ok: false, error: 'unauthorized' });
+      const issued = issueSession('owner');
+      return jsonOutput({ ok: true, sessionToken: issued.sessionToken, expiresAt: issued.expiresAt, role: 'owner' });
+    }
+    if (action === 'exchange_share') {
+      if (!validateShareToken(body.shareToken)) return jsonOutput({ ok: false, error: 'unauthorized' });
+      const issued = issueSession('readonly');
+      return jsonOutput({ ok: true, sessionToken: issued.sessionToken, expiresAt: issued.expiresAt, role: 'readonly', readonly: true });
+    }
+    const sessionToken = body.sessionToken || body.session_token || '';
+    const session = validateSession(sessionToken);
+    if (!session) return jsonOutput({ ok: false, error: 'unauthorized' });
+    if (action === 'issue_share') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      const link = issueShareLink();
+      return jsonOutput({ ok: true, shareToken: link.shareToken, expiresAt: link.expiresAt });
+    }
+    if (action === 'list') {
+      return jsonOutput(buildListPayload(body));
+    }
+    if (action === 'mark') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(handleMark(body));
+    }
+    if (action === 'markAllRead') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(handleMarkAllRead(body));
+    }
+    return jsonOutput({ ok: false, error: 'unknown_action' });
+  } catch (err) {
+    return jsonOutput({ ok: false, error: String((err && err.message) || err) });
+  }
+}
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles };
