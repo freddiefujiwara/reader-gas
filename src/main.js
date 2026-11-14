@@ -2,7 +2,7 @@
 // 正本は Google Sheets (feeds / articles / states / owner_sessions の4タブ)。
 // スプレッドシートIDはスクリプトプロパティ SPREADSHEET_ID から読む (コードに直書きしない)。
 // 毎時トリガー fetchFeeds が YouTube フィードだけを巡回して articles へ追記する (v2)。
-// フロントは doPost の list / mark / markAllRead で既読・スターを同期する。
+// フロントは doPost の list で既読状態を初回だけ取り込み、フィード管理も doPost で行う。
 // フィード管理 (listFeeds / saveFeed / deleteFeed / reorderFeeds) はオーナー専用とし、
 // is_private は URL のホストが a.ze.gs のときだけ立てる (トークン漏洩防止)。
 // 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、
@@ -10,7 +10,9 @@
 // セッションは owner_sessions タブにトークンの SHA-256 ハッシュだけを保存し、
 // 複数端末の同時セッションを妨げない。
 // 一時アクセスリンク (share) は読み取り専用: exchange_share で検証し、
-// role=readonly のセッションを発行する。mark 系は readonly を拒否する。
+// role=readonly のセッションを発行する。書き込み系の操作は readonly を拒否する。
+// 新規の共有リンク発行 (issue_share) は廃止したため、新しいリンクは作れない
+// (既存リンクは SHARE_EXPIRES_AT の期限まで有効)。
 // v2 では RSS フィードの巡回はクライアント側 (url-fetch-gas 経由) で行うため、
 // サーバー側の巡回は YouTube だけを対象にする。A_ZE_GS_TOKEN はもう読まない。
 
@@ -18,7 +20,6 @@ const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
 const OWNER_SHEET_NAME = 'owner_sessions';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
-const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SESSION_HEADERS = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
 const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'enabled', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
 const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
@@ -335,7 +336,7 @@ function buildRssXml(feed, articleRows) {
 }
 
 // --- Retention (pure decision logic) ---
-// Eligible for pruning: no state, or read and not starred.
+// Eligible for pruning: no state row, or read.
 // Prune when older than RETENTION_DAYS, or beyond the newest MAX_ARTICLES.
 
 function prunePlan(articles, states, nowIso, options) {
@@ -355,8 +356,6 @@ function prunePlan(articles, states, nowIso, options) {
   const deleteArticleIds = [];
   sorted.forEach((a) => {
     const st = stateById[a.id];
-    const starred = st ? isTruthy(st.is_starred) : false;
-    if (starred) return;
     const eligible = !st || isTruthy(st.is_read);
     if (!eligible) return;
     // 経過日数は「取り込んだ日」から数える (公開日が古い動画などを
@@ -372,7 +371,6 @@ function prunePlan(articles, states, nowIso, options) {
   (articles || []).forEach((a) => { articleSet[a.id] = true; });
   const deleteStateIds = [];
   (states || []).forEach((s) => {
-    if (isTruthy(s.is_starred)) return;
     if (deleteSet[s.article_id] || !articleSet[s.article_id]) deleteStateIds.push(s.article_id);
   });
   return { deleteArticleIds, deleteStateIds };
@@ -518,14 +516,12 @@ function validateSession(token) {
   const headers = values[0];
   const hashIdx = headers.indexOf('token_hash');
   const expIdx = headers.indexOf('expires_at');
-  const revIdx = headers.indexOf('revoked_at');
   const roleIdx = headers.indexOf('role');
   const hash = sha256Hex(String(token));
   const nowIso = new Date().toISOString();
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
     if (!hashesEqual(row[hashIdx], hash)) continue;
-    if (revIdx >= 0 && cellIso(row[revIdx])) return null;
     const expiresAt = cellIso(row[expIdx]);
     if (isSessionExpired(expiresAt, nowIso)) return null;
     const accessIdx = headers.indexOf('access_count');
@@ -536,18 +532,6 @@ function validateSession(token) {
     return { role, expiresAt };
   }
   return null;
-}
-
-function issueShareLink() {
-  const props = PropertiesService.getScriptProperties();
-  const token = generateRawToken();
-  const expiresIso = new Date(Date.now() + SHARE_TTL_SECONDS * 1000).toISOString();
-  // Re-issuing overwrites the stored hash, which invalidates the old link.
-  props.setProperties({
-    SHARE_TOKEN_HASH: sha256Hex(token),
-    SHARE_EXPIRES_AT: expiresIso,
-  }, false);
-  return { shareToken: token, expiresAt: expiresIso };
 }
 
 function validateShareToken(token) {
@@ -645,29 +629,12 @@ function setupFetchTrigger() {
   ScriptApp.newTrigger('fetchFeeds').timeBased().everyHours(1).create();
 }
 
-// --- Article listing / state changes ---
+// --- Article listing ---
 
-// カテゴリに属するフィードの id 一覧 (カテゴリ絞り込み用)。
-function feedIdsForCategory(feeds, category) {
-  const target = String(category || '').trim();
-  if (!target) return [];
-  return (feeds || [])
-    .filter((f) => String(f.category || '').trim() === target)
-    .map((f) => String(f.id || ''))
-    .filter((id) => id);
-}
-
-function filterArticles(articles, options) {
-  const opts = options || {};
-  let out = (articles || []).slice();
-  if (opts.feedId) out = out.filter((a) => a.feed_id === opts.feedId || a.feedId === opts.feedId);
-  if (Array.isArray(opts.feedIds)) {
-    const allowed = {};
-    opts.feedIds.forEach((id) => { allowed[id] = true; });
-    out = out.filter((a) => allowed[a.feed_id || a.feedId]);
-  }
-  if (opts.filter === 'unread') out = out.filter((a) => !a.isRead);
-  if (opts.filter === 'starred') out = out.filter((a) => a.isStarred);
+// list 用: 状態マージ済みの記事を新しい順に並べるだけにする
+// (フィード/カテゴリ/未読の絞り込みは v2 ではクライアント側で行う)。
+function filterArticles(articles) {
+  const out = (articles || []).slice();
   out.sort((a, b) => {
     const ta = Date.parse(a.publishedAt || a.fetchedAt || '') || 0;
     const tb = Date.parse(b.publishedAt || b.fetchedAt || '') || 0;
@@ -695,106 +662,32 @@ function buildListPayload(body) {
       publishedAt: cellIso(a.published_at),
       fetchedAt: cellIso(a.fetched_at),
       summary: String(a.summary || ''),
-      author: String(a.author || ''),
       isRead: st ? isTruthy(st.is_read) : false,
-      isStarred: st ? isTruthy(st.is_starred) : false,
     };
   });
   const unreadByFeed = {};
-  const starredByFeed = {};
   merged.forEach((a) => {
     if (!a.isRead) unreadByFeed[a.feedId] = (unreadByFeed[a.feedId] || 0) + 1;
-    if (a.isStarred) starredByFeed[a.feedId] = (starredByFeed[a.feedId] || 0) + 1;
   });
-  const category = body.category ? String(body.category).trim() : '';
-  const filtered = filterArticles(merged, {
-    feedId: body.feedId ? String(body.feedId) : '',
-    feedIds: category ? feedIdsForCategory(feeds, category) : null,
-    filter: ['unread', 'starred'].indexOf(body.filter) >= 0 ? body.filter : 'all',
-  });
+  const sorted = filterArticles(merged);
   let limit = Number(body.limit || 100);
   if (!Number.isFinite(limit) || limit <= 0) limit = 100;
   limit = Math.min(limit, 500);
-  let offset = Number(body.offset || 0);
-  if (!Number.isFinite(offset) || offset < 0) offset = 0;
   const serviceUrl = getServiceUrl();
   return {
     ok: true,
-    articles: filtered.slice(offset, offset + limit),
-    total: filtered.length,
+    articles: sorted.slice(0, limit),
     feeds: feeds.filter((f) => f.id).map((f) => ({
       id: f.id,
       title: String(f.title || ''),
       url: String(f.url || ''),
       fetchUrl: buildFetchUrl(f, serviceUrl),
       category: String(f.category || ''),
+      enabled: isTruthy(f.enabled),
       isPrivate: isTruthy(f.is_private),
       unreadCount: unreadByFeed[f.id] || 0,
-      starredCount: starredByFeed[f.id] || 0,
     })),
-    generatedAt: new Date().toISOString(),
   };
-}
-
-function upsertState(ss, articleIdValue, patch) {
-  const sheet = getSheetOrCreate(ss, 'states', STATES_HEADERS);
-  const values = sheet.getDataRange().getValues();
-  const headers = values.length ? values[0] : STATES_HEADERS;
-  const nowIso = new Date().toISOString();
-  for (let i = 1; i < values.length; i++) {
-    if (String(values[i][0]) !== String(articleIdValue)) continue;
-    const current = {};
-    headers.forEach((h, idx) => { current[h] = values[i][idx]; });
-    const next = {
-      is_read: patch.isRead !== undefined ? patch.isRead : isTruthy(current.is_read),
-      is_starred: patch.isStarred !== undefined ? patch.isStarred : isTruthy(current.is_starred),
-      read_at: patch.isRead !== undefined ? (patch.isRead ? nowIso : '') : cellIso(current.read_at),
-      starred_at: patch.isStarred !== undefined ? (patch.isStarred ? nowIso : '') : cellIso(current.starred_at),
-      updated_at: nowIso,
-    };
-    headers.forEach((h, idx) => {
-      if (h === 'article_id') return;
-      if (next[h] !== undefined) sheet.getRange(i + 1, idx + 1).setValue(next[h]);
-    });
-    return next;
-  }
-  const row = [String(articleIdValue),
-    patch.isRead !== undefined ? patch.isRead : false,
-    patch.isStarred !== undefined ? patch.isStarred : false,
-    patch.isRead ? nowIso : '',
-    patch.isStarred ? nowIso : '',
-    nowIso];
-  sheet.appendRow(row);
-  return { is_read: row[1], is_starred: row[2] };
-}
-
-function handleMark(body) {
-  const ss = openDataSpreadsheet();
-  const articleIdValue = String(body.articleId || '');
-  if (!articleIdValue) return { ok: false, error: 'bad_request' };
-  const exists = readSheetAsObjects(ss, 'articles').some((a) => String(a.id) === articleIdValue);
-  if (!exists) return { ok: false, error: 'not_found' };
-  const patch = {};
-  if (body.isRead !== undefined) patch.isRead = body.isRead === true;
-  if (body.isStarred !== undefined) patch.isStarred = body.isStarred === true;
-  upsertState(ss, articleIdValue, patch);
-  return { ok: true, articleId: articleIdValue, isRead: patch.isRead, isStarred: patch.isStarred };
-}
-
-function handleMarkAllRead(body) {
-  const ss = openDataSpreadsheet();
-  const feedId = body.feedId ? String(body.feedId) : '';
-  const category = body.category ? String(body.category).trim() : '';
-  let categoryIds = null;
-  if (category) {
-    categoryIds = {};
-    feedIdsForCategory(readSheetAsObjects(ss, 'feeds'), category).forEach((id) => { categoryIds[id] = true; });
-  }
-  const articles = readSheetAsObjects(ss, 'articles').filter((a) =>
-    (!feedId || a.feed_id === feedId) && (!categoryIds || categoryIds[a.feed_id]));
-  let count = 0;
-  articles.forEach((a) => { upsertState(ss, a.id, { isRead: true }); count++; });
-  return { ok: true, marked: count };
 }
 
 // --- Feed management (owner only) ---
@@ -919,7 +812,7 @@ function buildFetchUrl(feed, serviceUrl) {
 }
 
 // Shapes a feeds-tab object (or a buildFeedRow result) into the API feed item.
-function feedToApiShape(feedObj, unreadCount, starredCount, serviceUrl) {
+function feedToApiShape(feedObj, unreadCount, serviceUrl) {
   const f = feedObj || {};
   const base = serviceUrl !== undefined ? String(serviceUrl || '') : getServiceUrl();
   const priv = f.is_private !== undefined ? f.is_private : f.isPrivate;
@@ -938,7 +831,6 @@ function feedToApiShape(feedObj, unreadCount, starredCount, serviceUrl) {
     lastError: String(error || ''),
     lastFetchedAt: cellIso(fetched),
     unreadCount: unreadCount || 0,
-    starredCount: starredCount || 0,
   };
 }
 
@@ -955,30 +847,15 @@ function countUnreadByFeed(articles, states) {
   return counts;
 }
 
-// Starred = articles whose state row has is_starred truthy.
-function countStarredByFeed(articles, states) {
-  const starredById = {};
-  (states || []).forEach((s) => { starredById[s.article_id] = isTruthy(s.is_starred); });
-  const counts = {};
-  (articles || []).forEach((a) => {
-    if (!a || !a.id) return;
-    const feedId = a.feed_id !== undefined ? a.feed_id : a.feedId;
-    if (!feedId) return;
-    if (starredById[a.id]) counts[feedId] = (counts[feedId] || 0) + 1;
-  });
-  return counts;
-}
-
 function buildListFeedsPayload() {
   const ss = openDataSpreadsheet();
   const feeds = readSheetAsObjects(ss, 'feeds');
   const articleRows = readSheetAsObjects(ss, 'articles');
   const stateRows = readSheetAsObjects(ss, 'states');
   const unreadByFeed = countUnreadByFeed(articleRows, stateRows);
-  const starredByFeed = countStarredByFeed(articleRows, stateRows);
   return {
     ok: true,
-    feeds: feeds.filter((f) => f.id).map((f) => feedToApiShape(f, unreadByFeed[f.id] || 0, starredByFeed[f.id] || 0)),
+    feeds: feeds.filter((f) => f.id).map((f) => feedToApiShape(f, unreadByFeed[f.id] || 0)),
   };
 }
 
@@ -1107,11 +984,6 @@ function doPost(e) {
     const sessionToken = body.sessionToken || body.session_token || '';
     const session = validateSession(sessionToken);
     if (!session) return jsonOutput({ ok: false, error: 'unauthorized' });
-    if (action === 'issue_share') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      const link = issueShareLink();
-      return jsonOutput({ ok: true, shareToken: link.shareToken, expiresAt: link.expiresAt });
-    }
     if (action === 'listFeeds') {
       if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
       return jsonOutput(buildListFeedsPayload());
@@ -1131,17 +1003,9 @@ function doPost(e) {
     if (action === 'list') {
       return jsonOutput(buildListPayload(body));
     }
-    if (action === 'mark') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(handleMark(body));
-    }
-    if (action === 'markAllRead') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(handleMarkAllRead(body));
-    }
     return jsonOutput({ ok: false, error: 'unknown_action' });
   } catch (err) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, selectFetchTargets, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, countStarredByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
+export { rowsToObjects, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };

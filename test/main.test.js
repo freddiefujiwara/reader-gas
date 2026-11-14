@@ -15,7 +15,7 @@ import {
   isSessionExpired,
   prunePlan,
   filterArticles,
-  feedIdsForCategory,
+  buildListPayload,
   selectFetchTargets,
   youtubeChannelIdFromUrl,
   youtubeUploadsPlaylistId,
@@ -33,7 +33,6 @@ import {
   feedRowValues,
   feedToApiShape,
   countUnreadByFeed,
-  countStarredByFeed,
   remainingRowsAfterDelete,
   reorderRowsByIds,
   validateFeedOrder,
@@ -111,7 +110,7 @@ test('hashesEqual / isSessionExpired', () => {
   assert.equal(isSessionExpired('', '2026-06-01T00:00:00.000Z'), true);
 });
 
-test('prunePlan: 古い既読は削除、未読とスターは保持、孤児stateを掃除', () => {
+test('prunePlan: 古い既読は削除、未読は保持、孤児stateを掃除', () => {
   const now = '2026-11-14T00:00:00.000Z';
   const articles = [
     { id: 'old-read', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '' },
@@ -129,11 +128,12 @@ test('prunePlan: 古い既読は削除、未読とスターは保持、孤児sta
     { article_id: 'ghost-starred', is_read: false, is_starred: true },
   ];
   const plan = prunePlan(articles, states, now);
-  assert.deepEqual(plan.deleteArticleIds.sort(), ['old-nostate', 'old-read']);
+  assert.deepEqual(plan.deleteArticleIds.sort(), ['old-nostate', 'old-read', 'old-starred']);
   assert.ok(plan.deleteStateIds.includes('old-read'));
+  assert.ok(plan.deleteStateIds.includes('old-starred'));
   assert.ok(plan.deleteStateIds.includes('ghost'));
-  assert.ok(!plan.deleteStateIds.includes('ghost-starred'));
-  assert.ok(!plan.deleteStateIds.includes('old-starred'));
+  assert.ok(plan.deleteStateIds.includes('ghost-starred'));
+  assert.ok(!plan.deleteStateIds.includes('old-unread'));
 });
 
 test('prunePlan: 公開日が古くても取り込みが新しい未読は保持する', () => {
@@ -160,16 +160,15 @@ test('prunePlan: 上限を超えた既読は新しい順を残して削除', () 
   assert.deepEqual(plan.deleteArticleIds, ['a1']);
 });
 
-test('filterArticles: フィルタと新しい順ソート', () => {
+test('filterArticles: 新しい順にソートする (publishedAt 優先、無ければ fetchedAt)', () => {
   const articles = [
-    { id: '1', feedId: 'zenn', publishedAt: '2026-11-12T00:00:00.000Z', isRead: true, isStarred: false },
-    { id: '2', feedId: 'nhk', publishedAt: '2026-11-13T00:00:00.000Z', isRead: false, isStarred: true },
-    { id: '3', feedId: 'zenn', publishedAt: '2026-11-14T00:00:00.000Z', isRead: false, isStarred: false },
+    { id: '1', feedId: 'zenn', publishedAt: '2026-11-12T00:00:00.000Z', fetchedAt: '', isRead: true },
+    { id: '2', feedId: 'nhk', publishedAt: '2026-11-13T00:00:00.000Z', fetchedAt: '', isRead: false },
+    { id: '3', feedId: 'zenn', publishedAt: '', fetchedAt: '2026-11-14T00:00:00.000Z', isRead: false },
   ];
-  assert.deepEqual(filterArticles(articles, {}).map((a) => a.id), ['3', '2', '1']);
-  assert.deepEqual(filterArticles(articles, { filter: 'unread' }).map((a) => a.id), ['3', '2']);
-  assert.deepEqual(filterArticles(articles, { filter: 'starred' }).map((a) => a.id), ['2']);
-  assert.deepEqual(filterArticles(articles, { feedId: 'zenn' }).map((a) => a.id), ['3', '1']);
+  assert.deepEqual(filterArticles(articles).map((a) => a.id), ['3', '2', '1']);
+  assert.deepEqual(filterArticles([]), []);
+  assert.deepEqual(filterArticles(null), []);
 });
 
 test('toFeedBool: 真偽値と文字列形式、未指定はフォールバック', () => {
@@ -288,7 +287,7 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
   assert.deepEqual(shaped, {
     id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', fetchUrl: 'https://a.ze.gs/x.freddie.xml', category: 'private',
     enabled: true, isPrivate: true,
-    lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7, starredCount: 0,
+    lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
   assert.equal(feedToApiShape({ id: 'x' }).enabled, false);
@@ -309,21 +308,6 @@ test('countUnreadByFeed: 状態なしと未読を数え、既読は数えない'
   ];
   assert.deepEqual(countUnreadByFeed(articles, states), { zenn: 2, nhk: 1 });
   assert.deepEqual(countUnreadByFeed([], []), {});
-});
-
-test('countStarredByFeed: スター付きだけを数える', () => {
-  const articles = [
-    { id: 'a1', feed_id: 'zenn' },
-    { id: 'a2', feed_id: 'zenn' },
-    { id: 'b1', feed_id: 'nhk' },
-  ];
-  const states = [
-    { article_id: 'a1', is_read: true, is_starred: true },
-    { article_id: 'a2', is_read: false, is_starred: 'FALSE' },
-    { article_id: 'b1', is_read: false, is_starred: 'TRUE' },
-  ];
-  assert.deepEqual(countStarredByFeed(articles, states), { zenn: 1, nhk: 1 });
-  assert.deepEqual(countStarredByFeed([], []), {});
 });
 
 test('remainingRowsAfterDelete: 一致した行だけを取り除き、ヘッダーは残す', () => {
@@ -460,28 +444,6 @@ test('validateFeedOrder: 現在の全IDと集合が一致する順列だけを�
   // 文字列でない要素・空文字
   assert.equal(validateFeedOrder(['a', 'b', 3], current).ok, false);
   assert.equal(validateFeedOrder(['a', 'b', ''], current).ok, false);
-});
-
-test('feedIdsForCategory: カテゴリに属する id を返す', () => {
-  const feeds = [
-    { id: 'a', category: '楽天' },
-    { id: 'b', category: '投資・FIRE' },
-    { id: 'c', category: '楽天' },
-    { id: 'd', category: '' },
-  ];
-  assert.deepEqual(feedIdsForCategory(feeds, '楽天'), ['a', 'c']);
-  assert.deepEqual(feedIdsForCategory(feeds, ''), []);
-  assert.deepEqual(feedIdsForCategory(feeds, '無し'), []);
-});
-
-test('filterArticles: feedIds でカテゴリ単位に絞る', () => {
-  const articles = [
-    { id: '1', feedId: 'a', publishedAt: '2026-01-03T00:00:00.000Z', isRead: false, isStarred: false },
-    { id: '2', feedId: 'b', publishedAt: '2026-01-02T00:00:00.000Z', isRead: false, isStarred: false },
-    { id: '3', feed_id: 'c', publishedAt: '2026-01-01T00:00:00.000Z', isRead: false, isStarred: false },
-  ];
-  assert.deepEqual(filterArticles(articles, { feedIds: ['a', 'c'] }).map((x) => x.id), ['1', '3']);
-  assert.deepEqual(filterArticles(articles, { feedIds: [] }), []);
 });
 
 test('youtubeChannelIdFromUrl: videos.xml の URL から channel_id を抜く', () => {
@@ -636,9 +598,65 @@ test('feedToApiShape: fetchUrl が付く (YouTube は注入したベース URL �
   const base = 'https://script.google.com/macros/s/AKfycTEST/exec';
   const yt = feedToApiShape(
     { id: 'yt-sample', title: 'YT', url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A' },
-    0, 0, base
+    0, base
   );
   assert.equal(yt.fetchUrl, base + '?rss=yt-sample');
-  const normal = feedToApiShape({ id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed' }, 0, 0, base);
+  const normal = feedToApiShape({ id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed' }, 0, base);
   assert.equal(normal.fetchUrl, 'https://zenn.dev/feed');
+});
+
+test('buildListPayload: フィードに enabled が付き、無効フィードは false になる', () => {
+  // GAS グローバルの最小スタブ (シートは行列だけを持つフェイク)。
+  const tables = {
+    feeds: [
+      ['id', 'title', 'url', 'category', 'enabled', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'],
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', true, false, '', '', '', '', ''],
+      ['yt-off', 'YT off', 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', '', false, false, '', '', '', '', ''],
+    ],
+    articles: [
+      ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'],
+      ['a1', 'zenn', '記事1', 'https://example.com/1', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '要約1', '著者1'],
+      ['a2', 'zenn', '記事2', 'https://example.com/2', '2026-11-13T00:00:00.000Z', '2026-11-13T01:00:00.000Z', '', ''],
+    ],
+    states: [
+      ['article_id', 'is_read', 'is_starred', 'read_at', 'starred_at', 'updated_at'],
+      ['a1', true, false, '2026-11-14T02:00:00.000Z', '', '2026-11-14T02:00:00.000Z'],
+    ],
+  };
+  const ss = {
+    getSheetByName(name) {
+      const values = tables[name];
+      if (!values) return null;
+      return { getDataRange: () => ({ getValues: () => values }) };
+    },
+  };
+  globalThis.PropertiesService = {
+    getScriptProperties: () => ({ getProperty: (k) => (k === 'SPREADSHEET_ID' ? 'fake-id' : null) }),
+  };
+  globalThis.SpreadsheetApp = { openById: () => ss };
+  try {
+    const payload = buildListPayload({});
+    assert.equal(payload.ok, true);
+    const byId = {};
+    payload.feeds.forEach((f) => { byId[f.id] = f; });
+    // クライアントは f.enabled !== false で取得対象から外すため、
+    // 無効フィードには enabled:false が明示されなければならない。
+    assert.equal(byId['zenn'].enabled, true);
+    assert.equal(byId['yt-off'].enabled, false);
+    assert.equal(byId['zenn'].unreadCount, 1);
+    // 既読マージは残る (初回取り込みが id と isRead だけを使う)。
+    assert.deepEqual(payload.articles.map((a) => [a.id, a.isRead]), [['a1', true], ['a2', false]]);
+    // v1 の残り (author / isStarred / total / generatedAt / starredCount) は出さない。
+    assert.ok(!('author' in payload.articles[0]));
+    assert.ok(!('isStarred' in payload.articles[0]));
+    assert.ok(!('total' in payload));
+    assert.ok(!('generatedAt' in payload));
+    assert.ok(!('starredCount' in byId['zenn']));
+    // limit は効き、上限は 500 にクランプされる。
+    assert.equal(buildListPayload({ limit: 1 }).articles.length, 1);
+    assert.equal(buildListPayload({ limit: 9999 }).articles.length, 2);
+  } finally {
+    delete globalThis.PropertiesService;
+    delete globalThis.SpreadsheetApp;
+  }
 });
