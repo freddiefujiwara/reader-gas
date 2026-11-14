@@ -332,6 +332,22 @@ function youtubeChannelIdFromUrl(url) {
   return m ? m[1] : '';
 }
 
+// YouTube API のエラー応答から、原因が分かる短い文言だけを取り出す
+// (APIキー自体は応答に含まれない)。
+function youtubeApiErrorDetail(bodyText) {
+  try {
+    const body = JSON.parse(String(bodyText || ''));
+    const err = body && body.error ? body.error : null;
+    if (!err) return '';
+    const msg = String(err.message || '').trim();
+    const reason = err.errors && err.errors[0] ? String(err.errors[0].reason || '').trim() : '';
+    const detail = msg || reason;
+    return detail ? ' - ' + detail.slice(0, 200) : '';
+  } catch (e) {
+    return '';
+  }
+}
+
 function youtubeUploadsPlaylistId(channelId) {
   const id = String(channelId || '');
   return id.startsWith('UC') ? 'UU' + id.slice(2) : '';
@@ -758,7 +774,7 @@ function fetchFeeds() {
         + '&key=' + encodeURIComponent(youtubeApiKey);
       const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
       const code = res.getResponseCode();
-      if (code !== 200) throw new Error('YouTube API HTTP ' + code);
+      if (code !== 200) throw new Error('YouTube API HTTP ' + code + youtubeApiErrorDetail(res.getContentText()));
       const entries = parseYouTubePlaylistItems(res.getContentText(), feed);
       addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt);
       updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '200', last_error: '' });
@@ -1224,4 +1240,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
