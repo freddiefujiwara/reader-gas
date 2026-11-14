@@ -53,10 +53,6 @@ function parseJson(text) {
   check('item が1件以上ある', items.length >= 1, 'items=' + items.length);
   const guid = /<guid[^>]*>([^<]+)<\/guid>/.exec(text);
   check('guid が空でない', !!guid && guid[1].trim().length > 0);
-  check(
-    'item に音声 enclosure (a.ze.gs/audio-yt/) がある',
-    text.includes('<enclosure url="https://a.ze.gs/audio-yt/')
-  );
 }
 
 // 3. 実在する非 YouTube フィードは feed_not_found

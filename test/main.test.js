@@ -28,13 +28,15 @@ import {
   parseYouTubeChannelTitle,
   parseChannelLookupResponse,
   youtubeApiErrorDetail,
+  parseAudioUrlsMap,
+  fetchAudioUrlsMap,
+  freshAudioUrl,
+  planYouTubeAudioTriggers,
+  fireYouTubeAudioTriggers,
   escapeXml,
   videoIdFromLink,
   toRfc822,
   buildRssXml,
-  youtubeAudioFileUrl,
-  planYouTubeAudioTriggers,
-  fireYouTubeAudioTriggers,
   buildFetchUrl,
   parseFeedUrl,
   validateFeedInput,
@@ -671,9 +673,6 @@ test('buildRssXml: チャンネル情報とアイテムを RSS 2.0 で出す', (
   // guid はリンクから抜いた動画ID (isPermaLink="false")
   assert.ok(xml.includes('<guid isPermaLink="false">vidNew22222</guid>'));
   assert.ok(xml.includes('<guid isPermaLink="false">vidOld11111</guid>'));
-  // enclosure は動画IDから組み立てた音声ファイル URL (生成前から付ける)
-  assert.ok(xml.includes('<enclosure url="https://a.ze.gs/audio-yt/vidNew22222.m4a" type="audio/x-m4a" length="0"/>'));
-  assert.ok(xml.includes('<enclosure url="https://a.ze.gs/audio-yt/vidOld11111.m4a" type="audio/x-m4a" length="0"/>'));
   // pubDate は RFC-822
   assert.ok(xml.includes('<pubDate>Sat, 14 Nov 2026 01:00:00 GMT</pubDate>'));
   // description は summary、author はフィードタイトル
@@ -989,9 +988,6 @@ test('doGet: ?rss= は対象フィードの記事だけを RSS で返す', () =>
     assert.ok(xml.includes('動画その1'));
     assert.ok(xml.includes('動画その2'));
     assert.ok(!xml.includes('別フィードの動画'));
-    // 音声 enclosure が動画IDから組み立てて付く
-    assert.ok(xml.includes('<enclosure url="https://a.ze.gs/audio-yt/vidTech1111.m4a" type="audio/x-m4a" length="0"/>'));
-    assert.ok(xml.includes('<enclosure url="https://a.ze.gs/audio-yt/vidTech2222.m4a" type="audio/x-m4a" length="0"/>'));
   } finally { restore(); }
 });
 
@@ -1353,26 +1349,6 @@ test('buildRssXml: 日付が無いアイテムは pubDate を出さず、v= が�
   const xml = buildRssXml(YT_FEED_FOR_RSS, rows);
   assert.equal((xml.match(/<pubDate>/g) || []).length, 1);
   assert.ok(xml.includes('<guid isPermaLink="false"></guid>'));
-  // enclosure は動画IDがあるアイテムにだけ付く (生成先の無い URL は出さない)
-  assert.ok(xml.includes('<enclosure url="https://a.ze.gs/audio-yt/vidDateless.m4a" type="audio/x-m4a" length="0"/>'));
-  assert.equal((xml.match(/<enclosure /g) || []).length, 1);
-});
-
-test('youtubeAudioFileUrl: 動画IDから音声ファイル URL を組み立てる', () => {
-  assert.equal(youtubeAudioFileUrl('dQw4w9WgXcQ'), 'https://a.ze.gs/audio-yt/dQw4w9WgXcQ.m4a');
-});
-
-test('planYouTubeAudioTriggers: 新しい順に並べ、動画IDの重複と空IDを除く', () => {
-  const plan = planYouTubeAudioTriggers([
-    { videoId: 'old1', publishedAt: '2026-11-10T00:00:00.000Z' },
-    { videoId: 'new1', publishedAt: '2026-11-14T00:00:00.000Z' },
-    { videoId: 'new1', publishedAt: '2026-11-14T00:00:00.000Z' },
-    { videoId: '', publishedAt: '2026-11-14T00:00:00.000Z' },
-    { videoId: 'mid1', publishedAt: '2026-11-12T00:00:00.000Z' },
-  ]);
-  assert.deepEqual(plan, ['new1', 'mid1', 'old1']);
-  assert.deepEqual(planYouTubeAudioTriggers([]), []);
-  assert.deepEqual(planYouTubeAudioTriggers(null), []);
 });
 
 test('buildRssXml: 記事0件でもチャンネルだけの整った形になる', () => {
@@ -1873,10 +1849,127 @@ test('fetchFeeds: タイトルが入っていれば channels.list を呼ばず�
 });
 
 // ============================================================
-// 音声生成トリガー (yt-audio): 今回の巡回で新規に追加した動画にだけ、
-// 保存後に a.ze.gs へ発火する。発火は差し込み口 (fetchFeeds の引数)
-// 経由で記録し、既定実装は UrlFetchApp の記録で確認する。
+// 音声ストリーム URL の配布 (ogp 方式): ze が公開する
+// audio-urls.json の新鮮なエントリだけを ?rss= の enclosure にし、
+// 毎時巡回では各フィードの最新10本ぶん抽出トリガーを発火する。
 // ============================================================
+
+test('parseAudioUrlsMap: 形の合うエントリだけを残し、不正な入力は空マップ', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const map = parseAudioUrlsMap(JSON.stringify({
+    vidGood1111: { url: 'https://stream.example.com/a', ts: nowSec },
+    vidNoUrl111: { ts: nowSec },
+    vidNoTs1111: { url: 'https://stream.example.com/b' },
+    vidBadTs111: { url: 'https://stream.example.com/c', ts: 'abc' },
+    vidScalar11: 'https://stream.example.com/d',
+  }));
+  assert.deepEqual(map, { vidGood1111: { url: 'https://stream.example.com/a', ts: nowSec } });
+  assert.deepEqual(parseAudioUrlsMap('not json'), {});
+  assert.deepEqual(parseAudioUrlsMap(''), {});
+  assert.deepEqual(parseAudioUrlsMap('[1,2]'), {});
+  assert.deepEqual(parseAudioUrlsMap('null'), {});
+});
+
+test('freshAudioUrl: 抽出から5時間以内だけ URL を返し、古い・無いエントリは空', () => {
+  const nowMs = Date.parse('2026-11-15T12:00:00.000Z');
+  const nowSec = Math.floor(nowMs / 1000);
+  const map = {
+    vidFresh111: { url: 'https://stream.example.com/fresh', ts: nowSec - 3600 },
+    vidEdge1111: { url: 'https://stream.example.com/edge', ts: nowSec - 5 * 3600 },
+    vidStale111: { url: 'https://stream.example.com/stale', ts: nowSec - 5 * 3600 - 1 },
+  };
+  assert.equal(freshAudioUrl(map, 'vidFresh111', nowMs), 'https://stream.example.com/fresh');
+  // ちょうど5時間は新鮮な側に倒す
+  assert.equal(freshAudioUrl(map, 'vidEdge1111', nowMs), 'https://stream.example.com/edge');
+  assert.equal(freshAudioUrl(map, 'vidStale111', nowMs), '');
+  assert.equal(freshAudioUrl(map, 'vidMissing1', nowMs), '');
+  assert.equal(freshAudioUrl(null, 'vidFresh111', nowMs), '');
+  assert.equal(freshAudioUrl(undefined, 'vidFresh111', nowMs), '');
+});
+
+test('buildRssXml: 新鮮なエントリがあるアイテムにだけ enclosure を付ける', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = [
+    ytArticleRow('2026-11-14T01:00:00.000Z', 'vidFresh111', '新鮮な動画', ''),
+    ytArticleRow('2026-11-13T01:00:00.000Z', 'vidStale111', '古い動画', ''),
+    ytArticleRow('2026-11-12T01:00:00.000Z', 'vidMissing1', '無い動画', ''),
+  ];
+  const audioUrls = {
+    vidFresh111: { url: 'https://stream.example.com/play?vid=1&sig=abc', ts: nowSec - 60 },
+    vidStale111: { url: 'https://stream.example.com/stale', ts: nowSec - 6 * 3600 },
+  };
+  const xml = buildRssXml(YT_FEED_FOR_RSS, rows, audioUrls);
+  // URL は XML エスケープしてそのまま入る (& → &amp;)
+  assert.ok(xml.includes('<enclosure url="https://stream.example.com/play?vid=1&amp;sig=abc" type="audio/x-m4a" length="0"/>'));
+  assert.equal((xml.match(/<enclosure /g) || []).length, 1);
+  // マップを渡さなければ enclosure は付かない (従来どおり)
+  const plain = buildRssXml(YT_FEED_FOR_RSS, rows);
+  assert.ok(!plain.includes('<enclosure'));
+});
+
+test('fetchAudioUrlsMap: HTTPエラーや例外は空マップ (RSS は enclosure 無しで続く)', () => {
+  const restore500 = installGasGlobals({
+    UrlFetchApp: { fetch: () => ({ getResponseCode: () => 500, getContentText: () => '' }) },
+  });
+  try {
+    assert.deepEqual(fetchAudioUrlsMap(), {});
+  } finally { restore500(); }
+  const restoreThrow = installGasGlobals({
+    UrlFetchApp: { fetch: () => { throw new Error('network down'); } },
+  });
+  try {
+    assert.deepEqual(fetchAudioUrlsMap(), {});
+  } finally { restoreThrow(); }
+});
+
+function audioRssSpreadsheet(videoId) {
+  return new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['yt-audio-feed', '音声テスト', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '200', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW,
+      ['rowA', 'yt-audio-feed', '音声つき動画', 'https://www.youtube.com/watch?v=' + videoId, '2026-11-14T01:00:00.000Z', '2026-11-14T02:00:00.000Z', '概要', '音声テスト'],
+    ],
+  });
+}
+
+test('doGet: ?rss= は audio-urls.json の新鮮なエントリを enclosure として配信する', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const mapJson = JSON.stringify({ vidAudio111: { url: 'https://stream.example.com/vidAudio111', ts: nowSec - 60 } });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => audioRssSpreadsheet('vidAudio111') },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
+    ContentService: fakeContentService(),
+    UrlFetchApp: {
+      fetch: (url) => {
+        assert.equal(String(url), 'https://a.ze.gs/audio-urls.json');
+        return { getResponseCode: () => 200, getContentText: () => mapJson };
+      },
+    },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.ok(xml.includes('<enclosure url="https://stream.example.com/vidAudio111" type="audio/x-m4a" length="0"/>'));
+  } finally { restore(); }
+});
+
+test('doGet: audio-urls.json の取得に失敗しても RSS は enclosure 無しで配信される', () => {
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => audioRssSpreadsheet('vidAudioFail') },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
+    ContentService: fakeContentService(),
+    UrlFetchApp: { fetch: () => { throw new Error('ze unreachable'); } },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.ok(xml.includes('音声つき動画'));
+    assert.ok(!xml.includes('<enclosure'));
+  } finally { restore(); }
+});
+
+// --- 抽出トリガー (yt-audio) ---
 
 function playlistBodyWith(items) {
   return JSON.stringify({
@@ -1889,12 +1982,12 @@ function playlistBodyWith(items) {
   });
 }
 
-// articles の初期行と追加プロパティを差し替えられる fetchFeeds 用環境。
-function fetchAudioEnv({ props = {}, articlesRows = [], responder }) {
+const YT_FEED_ROW_X = ['yt-x', 'YT チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''];
+
+// feedsRows と articles の初期行を差し替えられる fetchFeeds 用環境。
+function fetchAudioEnv({ props = {}, feedsRows, articlesRows = [], responder }) {
   const ss = new FakeSpreadsheet({
-    feeds: [FEED_HEADERS_ROW,
-      ['yt-x', 'YT チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
-    ],
+    feeds: [FEED_HEADERS_ROW, ...feedsRows],
     articles: [ARTICLE_HEADERS_ROW, ...articlesRows],
     // states は fetchFeeds が getSheetOrCreate で作る
   });
@@ -1909,57 +2002,111 @@ function fetchAudioEnv({ props = {}, articlesRows = [], responder }) {
   return { ss, restore };
 }
 
-test('fetchFeeds: 音声トリガーは今回の巡回で新規追加した動画にだけ発火する', () => {
-  const existingRow = [
-    articleId('yt-x', 'vidOld12345'), 'yt-x', '既存動画', 'https://www.youtube.com/watch?v=vidOld12345',
-    '2026-11-10T00:00:00.000Z', '2026-11-10T01:00:00.000Z', '', 'YT チャンネル',
+test('planYouTubeAudioTriggers: フィードごとに新しい順の最大10本を選び、重複を除く', () => {
+  const mk = (prefix, days) => days.map((d) => ({
+    videoId: prefix + String(d).padStart(2, '0'),
+    publishedAt: '2026-11-' + String(d).padStart(2, '0') + 'T00:00:00.000Z',
+  }));
+  // フィードA: 12本 (古い順に渡しても新しい10本だけが選ばれる)
+  const feedA = mk('vidA', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  // フィードB: A と重なる1本 + 独自2本 + 空ID
+  const feedB = [
+    { videoId: 'vidA12', publishedAt: '2026-11-12T00:00:00.000Z' },
+    { videoId: 'vidB02', publishedAt: '2026-11-02T00:00:00.000Z' },
+    { videoId: 'vidB01', publishedAt: '2026-11-01T00:00:00.000Z' },
+    { videoId: '', publishedAt: '2026-11-03T00:00:00.000Z' },
   ];
-  const body = playlistBodyWith([
-    ['vidOld12345', '2026-11-10T00:00:00Z'],
-    ['vidNew12345', '2026-11-14T00:00:00Z'],
-  ]);
+  const plan = planYouTubeAudioTriggers([feedA, feedB]);
+  assert.equal(plan.length, 12); // A の10本 + B の独自2本 (重複と空IDは除く)
+  assert.equal(plan[0], 'vidA12');
+  assert.equal(plan[9], 'vidA03');
+  assert.deepEqual(plan.slice(10), ['vidB02', 'vidB01']);
+  assert.deepEqual(planYouTubeAudioTriggers([]), []);
+  assert.deepEqual(planYouTubeAudioTriggers(null), []);
+  assert.deepEqual(planYouTubeAudioTriggers([null, []]), []);
+});
+
+test('fetchFeeds: 抽出トリガーは各フィードの最新10本に発火する', () => {
+  const items = [];
+  for (let i = 1; i <= 12; i++) {
+    items.push(['vidT' + String(i).padStart(5, '0'), '2026-11-' + String(i).padStart(2, '0') + 'T00:00:00Z']);
+  }
+  const body = playlistBodyWith(items);
   const { restore } = fetchAudioEnv({
     props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
-    articlesRows: [existingRow],
+    feedsRows: [YT_FEED_ROW_X],
     responder: () => ({ getResponseCode: () => 200, getContentText: () => body }),
   });
   const calls = [];
   try {
     const result = fetchFeeds((videoId, token) => { calls.push([videoId, token]); });
     assert.equal(result.ok, true);
-    // 既存の動画は再追加されないため発火せず、新着の1件だけが対象になる
-    assert.equal(result.added, 1);
-    assert.deepEqual(calls, [['vidNew12345', 'fake-ze-token']]);
+    assert.equal(result.added, 12);
+    assert.equal(calls.length, 10);
+    assert.equal(calls[0][0], 'vidT00012');
+    assert.ok(!calls.some(([id]) => id === 'vidT00001' || id === 'vidT00002'));
+    assert.ok(calls.every(([, token]) => token === 'fake-ze-token'));
   } finally { restore(); }
 });
 
-test('fetchFeeds: 音声トリガーは1回の巡回で新しい順に最大10件まで', () => {
-  const items = [];
-  for (let i = 0; i < 12; i++) {
-    const day = String(i + 1).padStart(2, '0');
-    items.push(['vidCap' + String(i).padStart(5, '0'), '2026-11-' + day + 'T00:00:00Z']);
-  }
-  const body = playlistBodyWith(items);
+test('fetchFeeds: 抽出トリガーは新着でなくても発火する (既存動画も対象)', () => {
+  const existingRows = [1, 2, 3].map((i) => {
+    const vid = 'vidOld0000' + i;
+    return [articleId('yt-x', vid), 'yt-x', '既存動画' + i, 'https://www.youtube.com/watch?v=' + vid,
+      '2026-11-1' + i + 'T00:00:00.000Z', '2026-11-1' + i + 'T01:00:00.000Z', '', 'YT チャンネル'];
+  });
+  const body = playlistBodyWith([
+    ['vidOld00001', '2026-11-11T00:00:00Z'],
+    ['vidOld00002', '2026-11-12T00:00:00Z'],
+    ['vidOld00003', '2026-11-13T00:00:00Z'],
+  ]);
   const { restore } = fetchAudioEnv({
     props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [YT_FEED_ROW_X],
+    articlesRows: existingRows,
     responder: () => ({ getResponseCode: () => 200, getContentText: () => body }),
   });
   const calls = [];
   try {
     const result = fetchFeeds((videoId) => { calls.push(videoId); });
-    assert.equal(result.added, 12);
-    assert.equal(calls.length, 10);
-    // 先頭は最も新しい動画で、最も古い2件は省かれる
-    assert.equal(calls[0], 'vidCap00011');
-    assert.ok(!calls.includes('vidCap00000'));
-    assert.ok(!calls.includes('vidCap00001'));
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 0);
+    assert.deepEqual(calls, ['vidOld00003', 'vidOld00002', 'vidOld00001']);
   } finally { restore(); }
 });
 
-test('fetchFeeds: A_ZE_GS_TOKEN 未設定なら音声トリガーは発火しない (エラーにもしない)', () => {
+test('fetchFeeds: 抽出トリガーはフィードをまたいだ重複を除いて発火する', () => {
+  const rowA = ['yt-a', 'チャンネルA', 'https://www.youtube.com/channel/UCaaaaaaaaaaA', '', 'FALSE', '', '', '', '', ''];
+  const rowB = ['yt-b', 'チャンネルB', 'https://www.youtube.com/channel/UCbbbbbbbbbbB', '', 'FALSE', '', '', '', '', ''];
+  const bodyA = playlistBodyWith([
+    ['vidShared01', '2026-11-10T00:00:00Z'],
+    ['vidOnlyA001', '2026-11-09T00:00:00Z'],
+  ]);
+  const bodyB = playlistBodyWith([
+    ['vidShared01', '2026-11-10T00:00:00Z'],
+    ['vidOnlyB001', '2026-11-08T00:00:00Z'],
+  ]);
+  const { restore } = fetchAudioEnv({
+    props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [rowA, rowB],
+    responder: (url) => ({
+      getResponseCode: () => 200,
+      getContentText: () => (String(url).includes('playlistId=UUaaaaaaaaaaA') ? bodyA : bodyB),
+    }),
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.deepEqual(calls, ['vidShared01', 'vidOnlyA001', 'vidOnlyB001']);
+  } finally { restore(); }
+});
+
+test('fetchFeeds: A_ZE_GS_TOKEN 未設定なら抽出トリガーは発火しない (エラーにもしない)', () => {
   const body = playlistBodyWith([['vidNew12345', '2026-11-14T00:00:00Z']]);
   const { restore } = fetchAudioEnv({
     // A_ZE_GS_TOKEN は渡さない
+    feedsRows: [YT_FEED_ROW_X],
     responder: () => ({ getResponseCode: () => 200, getContentText: () => body }),
   });
   const calls = [];
@@ -1971,10 +2118,11 @@ test('fetchFeeds: A_ZE_GS_TOKEN 未設定なら音声トリガーは発火しな
   } finally { restore(); }
 });
 
-test('fetchFeeds: 音声トリガーが例外を投げても巡回は成功する', () => {
+test('fetchFeeds: 抽出トリガーが例外を投げても巡回は成功する', () => {
   const body = playlistBodyWith([['vidNew12345', '2026-11-14T00:00:00Z']]);
   const { ss, restore } = fetchAudioEnv({
     props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [YT_FEED_ROW_X],
     responder: () => ({ getResponseCode: () => 200, getContentText: () => body }),
   });
   try {
@@ -1987,11 +2135,12 @@ test('fetchFeeds: 音声トリガーが例外を投げても巡回は成功す�
   } finally { restore(); }
 });
 
-test('fetchFeeds: 既定の音声トリガーは a.ze.gs/yt-audio/<videoId> をトークンヘッダー付きで叩く', () => {
+test('fetchFeeds: 既定の抽出トリガーは a.ze.gs/yt-audio/<videoId> をトークンヘッダー付きで叩く', () => {
   const body = playlistBodyWith([['vidNew12345', '2026-11-14T00:00:00Z']]);
   const requests = [];
   const { restore } = fetchAudioEnv({
     props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [YT_FEED_ROW_X],
     responder: (url, params) => {
       requests.push([String(url), params]);
       if (String(url).startsWith('https://a.ze.gs/')) {
@@ -2012,6 +2161,26 @@ test('fetchFeeds: 既定の音声トリガーは a.ze.gs/yt-audio/<videoId> を�
   } finally { restore(); }
 });
 
+test('fireYouTubeAudioTriggers: 1回の巡回で最大250件まで (全体キャップ)', () => {
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+  });
+  const feedVideos = [];
+  for (let f = 0; f < 30; f++) {
+    const videos = [];
+    for (let i = 0; i < 10; i++) {
+      videos.push({ videoId: 'vid' + f + '_' + i, publishedAt: '2026-11-14T00:00:00.000Z' });
+    }
+    feedVideos.push(videos);
+  }
+  let count = 0;
+  try {
+    const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; });
+    assert.equal(fired, 250);
+    assert.equal(count, 250);
+  } finally { restore(); }
+});
+
 test('fireYouTubeAudioTriggers: トークンが無ければ差し込み口も呼ばれない', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({}).service,
@@ -2019,7 +2188,7 @@ test('fireYouTubeAudioTriggers: トークンが無ければ差し込み口も呼
   let called = 0;
   try {
     const fired = fireYouTubeAudioTriggers(
-      [{ videoId: 'vidNew12345', publishedAt: '2026-11-14T00:00:00.000Z' }],
+      [[{ videoId: 'vidNew12345', publishedAt: '2026-11-14T00:00:00.000Z' }]],
       () => { called++; }
     );
     assert.equal(fired, 0);

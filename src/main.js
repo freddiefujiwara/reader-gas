@@ -14,8 +14,8 @@
 // 新規の共有リンク発行 (issue_share) は廃止したため、新しいリンクは作れない
 // (既存リンクは SHARE_EXPIRES_AT の期限まで有効)。
 // v2 では RSS フィードの巡回はクライアント側 (url-fetch-gas 経由) で行うため、
-// サーバー側の巡回は YouTube だけを対象にする。A_ZE_GS_TOKEN は a.ze.gs の
-// 音声生成トリガー (yt-audio コマンド) を叩くときにだけ読む。
+// サーバー側の巡回は YouTube だけを対象にする。A_ZE_GS_TOKEN は
+// 音声抽出トリガー (yt-audio コマンド) を叩くときにだけ読む。
 // v3 フェーズ1: フィードIDは URL のハッシュ (feedIdFromUrl) で決め、タイトルは
 // 自動取得のみとする (YouTube は登録時に空で受け、fetchFeeds が補完する)。
 // 既存シートの ID 付け替えは後続フェーズで行うため、当面は slug ID の行も混在する。
@@ -358,6 +358,65 @@ function lookupYouTubeChannelByHandle(handle) {
   }
 }
 
+// --- YouTube 音声ストリーム URL の配布 (ogp 方式) ---
+// 音声ファイルはどこにも置かない。reader-gas が毎時巡回で yt-audio
+// トリガー (後述) を叩くと、ze 側のバッチがストリーム URL を非同期に
+// 抽出し、a.ze.gs/audio-urls.json に videoId -> { url, ts } の形で
+// 公開する。?rss= の出力ではこの JSON を読み、抽出から5時間以内の
+// エントリがあるアイテムにだけ、その URL を enclosure として付ける
+// (ストリーム URL は短命なので、古いエントリには付けない)。
+
+const AUDIO_URLS_JSON_URL = 'https://a.ze.gs/audio-urls.json';
+const AUDIO_URL_FRESH_MS = 5 * 60 * 60 * 1000;
+
+// audio-urls.json の本文を videoId -> { url, ts } のマップとして読む
+// (純関数)。JSON でない・オブジェクトでない場合は空マップにする。
+// 値の形が想定と違うエントリは落とす。ts は抽出時刻 (epoch 秒)。
+function parseAudioUrlsMap(jsonText) {
+  let data;
+  try { data = JSON.parse(String(jsonText || '')); } catch (e) { return {}; }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
+  const map = {};
+  Object.keys(data).forEach((videoId) => {
+    const entry = data[videoId];
+    if (!entry || typeof entry !== 'object') return;
+    const url = String(entry.url || '');
+    const ts = Number(entry.ts);
+    if (!url || !Number.isFinite(ts)) return;
+    map[videoId] = { url, ts };
+  });
+  return map;
+}
+
+// 実行内だけの簡易キャッシュ (GAS の実行ごとにリセットされる)。
+// 取得に成功したときだけ保持し、失敗時は毎回引き直す。
+let audioUrlsMapCache = null;
+
+// a.ze.gs/audio-urls.json を取得する。失敗 (HTTPエラー・例外・
+// UrlFetchApp 自体が無い環境) はすべて空マップとして扱い、
+// RSS 出力自体は enclosure 無しで続ける。
+function fetchAudioUrlsMap() {
+  if (audioUrlsMapCache) return audioUrlsMapCache;
+  try {
+    const res = UrlFetchApp.fetch(AUDIO_URLS_JSON_URL, { method: 'get', muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return {};
+    audioUrlsMapCache = parseAudioUrlsMap(res.getContentText());
+    return audioUrlsMapCache;
+  } catch (e) {
+    return {};
+  }
+}
+
+// マップに新鮮な (抽出から5時間以内) エントリがあればその URL を
+// 返し、無ければ空文字。nowMs はテスト用の差し込み口。
+function freshAudioUrl(audioUrls, videoId, nowMs) {
+  const entry = (audioUrls || {})[String(videoId || '')];
+  if (!entry) return '';
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  if (now - entry.ts * 1000 > AUDIO_URL_FRESH_MS) return '';
+  return String(entry.url || '');
+}
+
 // --- YouTube RSS 出力 (v2: 取得をクライアントへ寄せるための出口) ---
 // YouTube フィードの記事を RSS 2.0 で返す。クライアントはこの URL を
 // 通常のフィード URL と同じ経路で取得する (YouTube 専用の形式は作らない)。
@@ -377,16 +436,6 @@ function videoIdFromLink(link) {
   return m ? m[1] : '';
 }
 
-// YouTube 動画の音声ファイル (ze 側で生成) の公開 URL。生成は非同期
-// (巡回時の yt-audio トリガー → ze のバッチ) のため、ファイルが出来る
-// まではこの URL は中身を返さない。それでも enclosure は最初から
-// 付けておき、生成が済んだ時点でそのまま再生できるようにする。
-const YT_AUDIO_FILE_BASE_URL = 'https://a.ze.gs/audio-yt/';
-
-function youtubeAudioFileUrl(videoId) {
-  return YT_AUDIO_FILE_BASE_URL + String(videoId || '') + '.m4a';
-}
-
 function toRfc822(isoString) {
   const t = Date.parse(cellIso(isoString) || String(isoString || ''));
   if (Number.isNaN(t)) return '';
@@ -397,7 +446,9 @@ const RSS_MAX_ITEMS = 50;
 
 // articleRows は articles タブの行オブジェクト (ARTICLES_HEADERS のキー)。
 // published_at (無ければ fetched_at) の新しい順に最大 RSS_MAX_ITEMS 件。
-function buildRssXml(feed, articleRows) {
+// audioUrls は audio-urls.json のマップ (videoId -> { url, ts })。
+// 省略時・該当エントリが古い/無いアイテムには enclosure を付けない。
+function buildRssXml(feed, articleRows, audioUrls) {
   const f = feed || {};
   const title = String(f.title || '');
   const channelId = youtubeChannelIdFromUrl(f.url);
@@ -422,9 +473,10 @@ function buildRssXml(feed, articleRows) {
     lines.push('      <title>' + escapeXml(a.title) + '</title>');
     lines.push('      <link>' + escapeXml(link) + '</link>');
     lines.push('      <guid isPermaLink="false">' + escapeXml(videoId) + '</guid>');
-    // 音声ファイルの enclosure。動画IDが無いアイテムには生成先が無いため付けない。
-    if (videoId) {
-      lines.push('      <enclosure url="' + escapeXml(youtubeAudioFileUrl(videoId)) + '" type="audio/x-m4a" length="0"/>');
+    // 音声ストリーム URL の enclosure。新鮮なエントリがあるときだけ付ける。
+    const audioUrl = freshAudioUrl(audioUrls, videoId);
+    if (audioUrl) {
+      lines.push('      <enclosure url="' + escapeXml(audioUrl) + '" type="audio/x-m4a" length="0"/>');
     }
     if (pubDate) lines.push('      <pubDate>' + pubDate + '</pubDate>');
     lines.push('      <description>' + escapeXml(a.summary) + '</description>');
@@ -655,16 +707,13 @@ function updateFeedRow(sheet, headers, rowNum, patch) {
 }
 
 // 正規化済みエントリを articles へ未登録分だけ追加し、追加件数を返す。
-// addedOut を渡すと、追加したエントリをその配列にも積む (音声生成
-// トリガーの発火対象は「今回追加した分」だけに限るため)。
-function appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt, addedOut) {
+function appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt) {
   let added = 0;
   (entries || []).forEach((entry) => {
     const id = articleId(feed.id, entry.guid || entry.link);
     if (existingIds[id]) return;
     existingIds[id] = true;
     articlesSheet.appendRow([id, feed.id, entry.title, entry.link, entry.publishedAt, fetchedAt, entry.summary, entry.author]);
-    if (addedOut) addedOut.push(entry);
     added++;
   });
   return added;
@@ -678,32 +727,38 @@ function selectFetchTargets(feeds) {
   return (feeds || []).filter((f) => f && f.id && f.url && youtubeChannelIdFromUrl(f.url));
 }
 
-// --- YouTube 音声生成トリガー (ze 連携) ---
+// --- YouTube 音声抽出トリガー (ze 連携) ---
 // ogp のフォールバックと同じ形: reader-gas が a.ze.gs の altd コマンド
-// yt-audio を叩くと ze 側のキューに積まれ、ze のバッチが音声を取り出して
-// audio-yt/<videoId>.m4a として公開する。生成は非同期で、RSS の
-// enclosure は生成前からその URL を指す。トリガーは今回の巡回で
-// 新規に追加した動画にだけ発火し、失敗しても巡回自体は失敗にしない
-// (fire-and-forget)。
+// yt-audio を叩くと ze 側のキューに積まれ、ze のバッチが音声ストリーム
+// URL を抽出して audio-urls.json として公開する (非同期)。
+// ?rss= はその JSON の新鮮なエントリを enclosure として配信する。
+// 発火対象は各 YouTube フィードの最新10本で、新着かどうかは問わない
+// (ze 側が抽出済みのものは重複排除するため、毎時叩き直しても安い)。
+// 失敗しても巡回自体は失敗にしない (fire-and-forget)。
 
 const YT_AUDIO_TRIGGER_BASE_URL = 'https://a.ze.gs/yt-audio/';
-const YT_AUDIO_TRIGGER_MAX_PER_RUN = 10;
+const YT_AUDIO_TRIGGER_PER_FEED = 10;
+const YT_AUDIO_TRIGGER_MAX_PER_RUN = 250;
 
-// 発火対象を選ぶ純関数: 公開日時の新しい順に並べ、動画IDで重複を除く。
+// 発火対象を選ぶ純関数: フィードごとに公開日時の新しい順に最大
+// YT_AUDIO_TRIGGER_PER_FEED 本を選び、動画IDで重複を除いて並べる。
 // 上限件数の適用は発火側 (fireYouTubeAudioTriggers) で行う。
-function planYouTubeAudioTriggers(newVideos) {
-  const sorted = (newVideos || []).slice().sort((a, b) => {
-    const tb = Date.parse((b && b.publishedAt) || '') || 0;
-    const ta = Date.parse((a && a.publishedAt) || '') || 0;
-    return tb - ta;
-  });
+// feedVideos はフィードごとの { videoId, publishedAt } の配列の配列。
+function planYouTubeAudioTriggers(feedVideos) {
   const seen = {};
   const ids = [];
-  sorted.forEach((v) => {
-    const videoId = String((v && v.videoId) || '');
-    if (!videoId || seen[videoId]) return;
-    seen[videoId] = true;
-    ids.push(videoId);
+  (feedVideos || []).forEach((videos) => {
+    const sorted = (videos || []).slice().sort((a, b) => {
+      const tb = Date.parse((b && b.publishedAt) || '') || 0;
+      const ta = Date.parse((a && a.publishedAt) || '') || 0;
+      return tb - ta;
+    });
+    sorted.slice(0, YT_AUDIO_TRIGGER_PER_FEED).forEach((v) => {
+      const videoId = String((v && v.videoId) || '');
+      if (!videoId || seen[videoId]) return;
+      seen[videoId] = true;
+      ids.push(videoId);
+    });
   });
   return ids;
 }
@@ -717,21 +772,21 @@ function fireYouTubeAudioTrigger(videoId, token) {
   });
 }
 
-// 新着動画ぶんのトリガーをまとめて発火し、発火件数を返す。
+// 発火対象ぶんのトリガーをまとめて発火し、発火件数を返す。
 // A_ZE_GS_TOKEN が未設定なら何もしない (エラーにもしない)。
-// 1回の巡回では新しい順に最大 YT_AUDIO_TRIGGER_MAX_PER_RUN 件までとし、
+// 1回の巡回では最大 YT_AUDIO_TRIGGER_MAX_PER_RUN 件までとし、
 // 残りはログに残して省く。fireTrigger はテスト用の差し込み口
 // (省略時は fireYouTubeAudioTrigger)。時間ベーストリガーから呼ばれる
 // fetchFeeds 経由ではイベントオブジェクトが渡ってくるため、関数で
 // なければ既定実装に落とす。
-function fireYouTubeAudioTriggers(newVideos, fireTrigger) {
+function fireYouTubeAudioTriggers(feedVideos, fireTrigger) {
   const token = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
   if (!token) return 0;
   const fire = typeof fireTrigger === 'function' ? fireTrigger : fireYouTubeAudioTrigger;
-  const planned = planYouTubeAudioTriggers(newVideos);
+  const planned = planYouTubeAudioTriggers(feedVideos);
   const targets = planned.slice(0, YT_AUDIO_TRIGGER_MAX_PER_RUN);
   if (planned.length > targets.length) {
-    console.log('yt-audio: triggers capped at ' + targets.length + ' of ' + planned.length + ' new videos');
+    console.log('yt-audio: triggers capped at ' + targets.length + ' of ' + planned.length + ' videos');
   }
   let fired = 0;
   targets.forEach((videoId) => {
@@ -745,7 +800,7 @@ function fireYouTubeAudioTriggers(newVideos, fireTrigger) {
   return fired;
 }
 
-// fireTrigger はテスト用の差し込み口 (音声生成トリガー用)。
+// fireTrigger はテスト用の差し込み口 (音声抽出トリガー用)。
 // 時間ベーストリガーからは引数なし (実際はイベントオブジェクト) で呼ばれる。
 function fetchFeeds(fireTrigger) {
   const ss = openDataSpreadsheet();
@@ -768,8 +823,8 @@ function fetchFeeds(fireTrigger) {
   readSheetAsObjects(ss, 'articles').forEach((a) => { existingIds[a.id] = true; });
   const fetchedAt = new Date().toISOString();
   let addedTotal = 0;
-  // 今回の巡回で新規に追加した動画 (音声生成トリガーの発火対象)。
-  const newVideos = [];
+  // フィードごとの動画一覧 (音声抽出トリガーの発火対象の選定用)。
+  const feedVideos = [];
   // YouTube フィードは公式APIから取り込む (RSS は 404 のため)。
   const youtubeApiKey = PropertiesService.getScriptProperties().getProperty('YOUTUBE_API_KEY');
   youtubeFeeds.forEach((feed) => {
@@ -804,12 +859,11 @@ function fetchFeeds(fireTrigger) {
       const code = res.getResponseCode();
       if (code !== 200) throw new Error('YouTube API HTTP ' + code + youtubeApiErrorDetail(res.getContentText()));
       const entries = parseYouTubePlaylistItems(res.getContentText(), feed);
-      const addedEntries = [];
-      addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt, addedEntries);
-      addedEntries.forEach((entry) => {
-        const videoId = String(entry.guid || '') || videoIdFromLink(entry.link);
-        if (videoId) newVideos.push({ videoId, publishedAt: entry.publishedAt || '' });
-      });
+      addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt);
+      feedVideos.push(entries.map((entry) => ({
+        videoId: String(entry.guid || '') || videoIdFromLink(entry.link),
+        publishedAt: entry.publishedAt || '',
+      })).filter((v) => v.videoId));
       updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '200', last_error: '' });
     } catch (err) {
       updateFeedRow(feedsSheet, headers, rowNum, {
@@ -819,10 +873,10 @@ function fetchFeeds(fireTrigger) {
       });
     }
   });
-  // 新着動画の音声生成を ze へ依頼する (記事の保存が済んでから発火する)。
-  // トリガーの成否は巡回結果に影響させない。
+  // 各フィードの最新10本の音声抽出を ze へ依頼する (記事の保存が
+  // 済んでから発火する)。トリガーの成否は巡回結果に影響させない。
   try {
-    fireYouTubeAudioTriggers(newVideos, fireTrigger);
+    fireYouTubeAudioTriggers(feedVideos, fireTrigger);
   } catch (e) {
     // 依頼できなくても記事の取り込みは成功として扱う。
   }
@@ -1215,7 +1269,7 @@ function doGet(e) {
     }
     const rows = readSheetAsObjects(ss, 'articles').filter((a) => String(a.feed_id) === rssFeedId);
     // MIME は付けない (取得側はプロキシ経由で本文だけを読むため)。
-    return ContentService.createTextOutput(buildRssXml(feed, rows));
+    return ContentService.createTextOutput(buildRssXml(feed, rows, fetchAudioUrlsMap()));
   }
   return jsonOutput({ ok: true, service: 'reader-gas' });
 }
@@ -1267,4 +1321,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, youtubeAudioFileUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, freshAudioUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
