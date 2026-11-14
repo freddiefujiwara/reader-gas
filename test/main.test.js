@@ -21,6 +21,11 @@ import {
   youtubeUploadsPlaylistId,
   parseYouTubePlaylistItems,
   youtubeApiErrorDetail,
+  escapeXml,
+  videoIdFromLink,
+  toRfc822,
+  buildRssXml,
+  buildFetchUrl,
   toFeedBool,
   parseFeedUrl,
   validateFeedInput,
@@ -370,7 +375,7 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
     last_status: '200', last_error: '', last_fetched_at: new Date('2026-11-14T00:15:30.088Z'),
   }, 7);
   assert.deepEqual(shaped, {
-    id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', category: 'private',
+    id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', fetchUrl: 'https://a.ze.gs/x.freddie.xml', category: 'private',
     enabled: true, isPrivate: true,
     lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7, starredCount: 0,
   });
@@ -604,4 +609,104 @@ test('youtubeApiErrorDetail: エラー応答から原因だけを抜く', () => 
   assert.equal(youtubeApiErrorDetail(body), ' - API key not valid. Please pass a valid API key.');
   assert.equal(youtubeApiErrorDetail('not json'), '');
   assert.equal(youtubeApiErrorDetail('{}'), '');
+});
+
+test('escapeXml: XML の特殊文字をエスケープする', () => {
+  assert.equal(escapeXml('a & b <c> "d" \'e\''), 'a &amp; b &lt;c&gt; &quot;d&quot; &apos;e&apos;');
+  assert.equal(escapeXml('plain'), 'plain');
+  assert.equal(escapeXml(''), '');
+  assert.equal(escapeXml(null), '');
+  assert.equal(escapeXml(undefined), '');
+});
+
+test('videoIdFromLink: watch URL から動画IDを抜く。それ以外は空文字', () => {
+  assert.equal(videoIdFromLink('https://www.youtube.com/watch?v=dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
+  assert.equal(videoIdFromLink('https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s'), 'dQw4w9WgXcQ');
+  assert.equal(videoIdFromLink('https://www.youtube.com/watch?list=PLx&v=abc-DEF_123'), 'abc-DEF_123');
+  assert.equal(videoIdFromLink('https://example.com/articles/1'), '');
+  assert.equal(videoIdFromLink(''), '');
+});
+
+test('toRfc822: ISO を RFC-822 (GMT) へ変換する。不正は空文字', () => {
+  assert.equal(toRfc822('2026-11-14T01:00:00.000Z'), 'Sat, 14 Nov 2026 01:00:00 GMT');
+  assert.equal(toRfc822('not a date'), '');
+  assert.equal(toRfc822(''), '');
+});
+
+const YT_FEED_FOR_RSS = {
+  id: 'yt-sample',
+  title: 'Sample & Channel',
+  url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A',
+};
+
+function ytArticleRow(publishedAt, videoId, title, summary) {
+  return {
+    id: 'row-' + videoId, feed_id: 'yt-sample', title,
+    link: 'https://www.youtube.com/watch?v=' + videoId,
+    published_at: publishedAt, fetched_at: publishedAt, summary, author: 'someone',
+  };
+}
+
+test('buildRssXml: チャンネル情報とアイテムを RSS 2.0 で出す', () => {
+  const xml = buildRssXml(YT_FEED_FOR_RSS, [
+    ytArticleRow('2026-11-13T01:00:00.000Z', 'vidOld11111', '古い動画', 'old summary'),
+    ytArticleRow('2026-11-14T01:00:00.000Z', 'vidNew22222', '新しい <動画> & テスト', 'new summary'),
+  ]);
+  assert.ok(xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>'));
+  assert.ok(xml.includes('<rss version="2.0">'));
+  // チャンネル: タイトルはエスケープされ、リンクはチャンネルページ
+  assert.ok(xml.includes('<title>Sample &amp; Channel</title>'));
+  assert.ok(xml.includes('<link>https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A</link>'));
+  assert.ok(xml.includes('<description>Sample &amp; Channel</description>'));
+  // アイテム: タイトルの & < > がエスケープされる
+  assert.ok(xml.includes('<title>新しい &lt;動画&gt; &amp; テスト</title>'));
+  // guid はリンクから抜いた動画ID (isPermaLink="false")
+  assert.ok(xml.includes('<guid isPermaLink="false">vidNew22222</guid>'));
+  assert.ok(xml.includes('<guid isPermaLink="false">vidOld11111</guid>'));
+  // pubDate は RFC-822
+  assert.ok(xml.includes('<pubDate>Sat, 14 Nov 2026 01:00:00 GMT</pubDate>'));
+  // description は summary、author はフィードタイトル
+  assert.ok(xml.includes('<description>new summary</description>'));
+  assert.ok(xml.includes('<author>Sample &amp; Channel</author>'));
+  // 新しい順
+  assert.ok(xml.indexOf('vidNew22222') < xml.indexOf('vidOld11111'));
+});
+
+test('buildRssXml: 最大50件に絞る', () => {
+  const rows = [];
+  for (let i = 0; i < 55; i++) {
+    rows.push(ytArticleRow('2026-11-14T00:00:00.000Z', 'vid' + String(i).padStart(8, '0'), '動画' + i, ''));
+  }
+  const xml = buildRssXml(YT_FEED_FOR_RSS, rows);
+  assert.equal((xml.match(/<item>/g) || []).length, 50);
+});
+
+test('buildRssXml: published_at が無ければ fetched_at で並べ、pubDate にも使う', () => {
+  const rows = [
+    { ...ytArticleRow('', 'vidFetch111', 'A', ''), fetched_at: '2026-11-12T01:00:00.000Z' },
+    { ...ytArticleRow('', 'vidFetch222', 'B', ''), fetched_at: '2026-11-13T01:00:00.000Z' },
+  ];
+  const xml = buildRssXml(YT_FEED_FOR_RSS, rows);
+  assert.ok(xml.indexOf('vidFetch222') < xml.indexOf('vidFetch111'));
+  assert.ok(xml.includes('<pubDate>Fri, 13 Nov 2026 01:00:00 GMT</pubDate>'));
+});
+
+test('buildFetchUrl: YouTube は RSS 出力 URL、それ以外はフィード URL そのまま', () => {
+  const base = 'https://script.google.com/macros/s/AKfycTEST/exec';
+  const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  assert.equal(buildFetchUrl({ id: 'yt-sample', url: ytUrl }, base), base + '?rss=yt-sample');
+  assert.equal(buildFetchUrl({ id: 'zenn', url: 'https://zenn.dev/feed' }, base), 'https://zenn.dev/feed');
+  // ベース URL が取れない環境ではフィード URL にフォールバックする
+  assert.equal(buildFetchUrl({ id: 'yt-sample', url: ytUrl }, ''), ytUrl);
+});
+
+test('feedToApiShape: fetchUrl が付く (YouTube は注入したベース URL で組み立てる)', () => {
+  const base = 'https://script.google.com/macros/s/AKfycTEST/exec';
+  const yt = feedToApiShape(
+    { id: 'yt-sample', title: 'YT', url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A' },
+    0, 0, base
+  );
+  assert.equal(yt.fetchUrl, base + '?rss=yt-sample');
+  const normal = feedToApiShape({ id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed' }, 0, 0, base);
+  assert.equal(normal.fetchUrl, 'https://zenn.dev/feed');
 });
