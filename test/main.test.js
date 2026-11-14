@@ -2016,7 +2016,7 @@ test('planYouTubeAudioTriggers: フィードごとに新しい順の最大10本�
     { videoId: 'vidB01', publishedAt: '2026-11-01T00:00:00.000Z' },
     { videoId: '', publishedAt: '2026-11-03T00:00:00.000Z' },
   ];
-  const plan = planYouTubeAudioTriggers([feedA, feedB]);
+  const plan = planYouTubeAudioTriggers([feedA, feedB], Date.parse('2026-11-15T00:00:00.000Z'));
   assert.equal(plan.length, 12); // A の10本 + B の独自2本 (重複と空IDは除く)
   assert.equal(plan[0], 'vidA12');
   assert.equal(plan[9], 'vidA03');
@@ -2024,6 +2024,54 @@ test('planYouTubeAudioTriggers: フィードごとに新しい順の最大10本�
   assert.deepEqual(planYouTubeAudioTriggers([]), []);
   assert.deepEqual(planYouTubeAudioTriggers(null), []);
   assert.deepEqual(planYouTubeAudioTriggers([null, []]), []);
+});
+
+test('planYouTubeAudioTriggers: 公開30日以内の動画だけが対象 (境界は含む)', () => {
+  const now = Date.parse('2026-11-15T12:00:00.000Z');
+  const videos = [[
+    { videoId: 'vidFresh001', publishedAt: '2026-11-15T00:00:00.000Z' },
+    // ちょうど30日前は対象に含む
+    { videoId: 'vidEdge0001', publishedAt: '2026-10-16T12:00:00.000Z' },
+    // 30日を1ミリ秒でも超えたら対象外
+    { videoId: 'vidStale001', publishedAt: '2026-10-16T11:59:59.999Z' },
+    { videoId: 'vidOld00001', publishedAt: '2026-09-01T00:00:00.000Z' },
+  ]];
+  assert.deepEqual(planYouTubeAudioTriggers(videos, now), ['vidFresh001', 'vidEdge0001']);
+});
+
+test('planYouTubeAudioTriggers: 最新10本に入っていても30日超の動画は選ばない', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  // 12本中9本が30日以内、3本が30日超 → 選ばれるのは9本だけ
+  const feed = [];
+  for (let d = 7; d <= 15; d++) {
+    feed.push({ videoId: 'vidIn' + String(d).padStart(2, '0'), publishedAt: '2026-11-' + String(d).padStart(2, '0') + 'T00:00:00.000Z' });
+  }
+  ['2026-10-10', '2026-10-05', '2026-09-20'].forEach((date, i) => {
+    feed.push({ videoId: 'vidOut0' + i, publishedAt: date + 'T00:00:00.000Z' });
+  });
+  const plan = planYouTubeAudioTriggers([feed], now);
+  assert.equal(plan.length, 9);
+  assert.ok(plan.every((id) => id.startsWith('vidIn')));
+});
+
+test('planYouTubeAudioTriggers: 更新の止まったチャンネル (全て30日超) は何も選ばない', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const staleFeed = [1, 2, 3].map((i) => ({
+    videoId: 'vidStale00' + i,
+    publishedAt: '2026-08-0' + i + 'T00:00:00.000Z',
+  }));
+  assert.deepEqual(planYouTubeAudioTriggers([staleFeed], now), []);
+});
+
+test('planYouTubeAudioTriggers: 公開日時が読めない動画は対象外', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const videos = [[
+    { videoId: 'vidNoDate01', publishedAt: '' },
+    { videoId: 'vidBadDate1', publishedAt: 'not-a-date' },
+    { videoId: 'vidMissing1' },
+    { videoId: 'vidOk000001', publishedAt: '2026-11-14T00:00:00.000Z' },
+  ]];
+  assert.deepEqual(planYouTubeAudioTriggers(videos, now), ['vidOk000001']);
 });
 
 test('fetchFeeds: 抽出トリガーは各フィードの最新10本に発火する', () => {
@@ -2072,6 +2120,25 @@ test('fetchFeeds: 抽出トリガーは新着でなくても発火する (既存
     assert.equal(result.ok, true);
     assert.equal(result.added, 0);
     assert.deepEqual(calls, ['vidOld00003', 'vidOld00002', 'vidOld00001']);
+  } finally { restore(); }
+});
+
+test('fetchFeeds: 最新動画でも公開30日を超えていれば抽出トリガーは発火しない', () => {
+  const body = playlistBodyWith([
+    ['vidStale001', '2026-08-01T00:00:00Z'],
+    ['vidStale002', '2026-08-02T00:00:00Z'],
+  ]);
+  const { restore } = fetchAudioEnv({
+    props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [YT_FEED_ROW_X],
+    responder: () => ({ getResponseCode: () => 200, getContentText: () => body }),
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 2); // 記事の取り込み自体は行われる
+    assert.deepEqual(calls, []);
   } finally { restore(); }
 });
 
@@ -2175,7 +2242,7 @@ test('fireYouTubeAudioTriggers: 1回の巡回で最大250件まで (全体キャ
   }
   let count = 0;
   try {
-    const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; });
+    const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, Date.parse('2026-11-15T00:00:00.000Z'));
     assert.equal(fired, 250);
     assert.equal(count, 250);
   } finally { restore(); }
