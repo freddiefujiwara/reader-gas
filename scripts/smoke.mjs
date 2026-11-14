@@ -8,6 +8,11 @@
 const EXEC_URL = process.env.READER_GAS_EXEC_URL
   || 'https://script.google.com/macros/s/AKfycbz-0BmbGrFsfaI9vkVsvc-f_69iq0HIfJMluS_H_SXpUnLxlU6lvYkDgmZpIvw1IpwB/exec';
 
+// RSS 出力を確認する YouTube フィードの ID。環境変数 READER_SMOKE_YT_FEED_ID で
+// 差し替えできる。既定値は移行前の slug ID で、シート移行フェーズ
+// (フィード ID のハッシュ化) が終わったらハッシュ ID に変わる。
+const YT_FEED_ID = process.env.READER_SMOKE_YT_FEED_ID || 'yt-rakutentech';
+
 let failures = 0;
 function check(name, cond, detail) {
   if (cond) {
@@ -41,8 +46,8 @@ function parseJson(text) {
 
 // 2. YouTube フィードの RSS 出力
 {
-  const { text } = await getText(EXEC_URL + '?rss=yt-rakutentech');
-  check('?rss=yt-rakutentech が XML で始まる', text.startsWith('<?xml'), text.slice(0, 80));
+  const { text } = await getText(EXEC_URL + '?rss=' + YT_FEED_ID);
+  check('?rss=' + YT_FEED_ID + ' が XML で始まる', text.startsWith('<?xml'), text.slice(0, 80));
   check('RSS 2.0 である', text.includes('<rss version="2.0">'));
   const items = text.match(/<item>/g) || [];
   check('item が1件以上ある', items.length >= 1, 'items=' + items.length);

@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import {
   rowsToObjects,
   articleId,
+  feedIdFromUrl,
   sha256Hex,
   sha256HexPure,
   stripTags,
@@ -22,6 +23,7 @@ import {
   youtubeChannelIdFromUrl,
   youtubeUploadsPlaylistId,
   parseYouTubePlaylistItems,
+  parseYouTubeChannelTitle,
   youtubeApiErrorDetail,
   escapeXml,
   videoIdFromLink,
@@ -43,6 +45,7 @@ import {
   issueSession,
   validateSession,
   validateShareToken,
+  handleSaveFeed,
   handleDeleteFeed,
   doGet,
   doPost,
@@ -222,8 +225,8 @@ test('validateFeedInput: 正常系は正規化し、既定値を補う', () => {
 
 test('validateFeedInput: 不正な入力は ok:false と理由を返す', () => {
   const base = { id: 'ok-id', title: 'Title', url: 'https://example.com/feed' };
-  // id (slug)
-  assert.equal(validateFeedInput({ ...base, id: '' }).ok, false);
+  // id (slug): 指定があれば形式を検証する。空は「未指定」として許可される
+  // (追加時の ID は URL のハッシュで決まる。専用テストで固定する)。
   assert.equal(validateFeedInput({ ...base, id: 'Bad Slug' }).ok, false);
   assert.equal(validateFeedInput({ ...base, id: '-leading-hyphen' }).ok, false);
   assert.equal(validateFeedInput({ ...base, id: 'under_score' }).ok, false);
@@ -1313,4 +1316,242 @@ test('dist/Code.gs: export 文が残らず、スクリプトとして構文が�
   const code = readFileSync(new URL('../dist/Code.gs', import.meta.url), 'utf8');
   assert.ok(!/^\s*export\b/m.test(code), 'dist/Code.gs に export 文が残っている');
   new vm.Script(code); // 構文が壊れていれば SyntaxError で落ちる
+});
+
+// ============================================================
+// v3 フェーズ1: フィード ID のハッシュ化とタイトル自動化。
+// フロント (reader) も同じ規則で ID を算出するため、ベクトルは正規の値で固定する。
+// ============================================================
+
+test('feedIdFromUrl: URL の SHA-256 先頭16文字 (正規ベクトル)', () => {
+  assert.equal(feedIdFromUrl('https://feeds.rebuild.fm/rebuildfm'), 'b81e59da11f890d2');
+  assert.equal(feedIdFromUrl('https://anchor.fm/s/8c2088c/podcast/rss'), '87e6ebcd1afd6416');
+  const id = feedIdFromUrl('https://example.com/feed');
+  assert.match(id, /^[0-9a-f]{16}$/);
+  assert.equal(id, feedIdFromUrl('https://example.com/feed'));
+  assert.notEqual(id, feedIdFromUrl('https://example.com/other'));
+  assert.equal(feedIdFromUrl(''), feedIdFromUrl(''));
+});
+
+test('validateFeedInput: id は任意で、空なら未指定として通る', () => {
+  const noId = validateFeedInput({ title: 'Title', url: 'https://example.com/feed' });
+  assert.equal(noId.ok, true);
+  assert.equal(noId.feed.id, '');
+  const emptyId = validateFeedInput({ id: '   ', title: 'Title', url: 'https://example.com/feed' });
+  assert.equal(emptyId.ok, true);
+  assert.equal(emptyId.feed.id, '');
+  // 指定があれば従来どおり slug 形式が検証される
+  assert.equal(validateFeedInput({ id: 'ok-id', title: 'T', url: 'https://example.com/feed' }).feed.id, 'ok-id');
+});
+
+test('validateFeedInput: YouTube 疑似フィードだけタイトル空を許可する', () => {
+  const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const yt = validateFeedInput({ title: '', url: ytUrl });
+  assert.equal(yt.ok, true);
+  assert.equal(yt.feed.title, '');
+  // www 無し・タイトル未指定でも同じ
+  const ytBare = validateFeedInput({ url: 'https://youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A' });
+  assert.equal(ytBare.ok, true);
+  // タイトルがあれば通常どおり保持される
+  assert.equal(validateFeedInput({ title: 'My Ch', url: ytUrl }).feed.title, 'My Ch');
+  // channel_id の無い YouTube URL と通常フィードは従来どおりタイトル必須
+  assert.equal(validateFeedInput({ title: '', url: 'https://www.youtube.com/feeds/videos.xml?user=someone' }).ok, false);
+  assert.equal(validateFeedInput({ title: '', url: 'https://example.com/feed' }).ok, false);
+});
+
+test('parseYouTubeChannelTitle: channels.list 応答からチャンネル名を取り出す', () => {
+  const json = JSON.stringify({ items: [{ snippet: { title: '  楽天テック  ' } }] });
+  assert.equal(parseYouTubeChannelTitle(json), '楽天テック');
+  assert.equal(parseYouTubeChannelTitle(JSON.stringify({ items: [] })), '');
+  assert.equal(parseYouTubeChannelTitle(JSON.stringify({})), '');
+  assert.equal(parseYouTubeChannelTitle('not json'), '');
+  assert.equal(parseYouTubeChannelTitle(''), '');
+});
+
+// handleSaveFeed の合成テスト。feeds / articles / states を持つフェイクを使う。
+function saveFeedEnv(feedRows) {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW, ...feedRows],
+    articles: [ARTICLE_HEADERS_ROW],
+    states: [STATE_HEADERS_ROW],
+  });
+  const restore = installSpreadsheet(ss);
+  return { ss, restore };
+}
+
+test('handleSaveFeed: 追加時はクライアント指定の id を無視し、URL のハッシュを ID にする', () => {
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    const res = handleSaveFeed({ feed: { id: 'rebuild', title: 'Rebuild', url: 'https://feeds.rebuild.fm/rebuildfm', category: 'tech' } });
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.id, 'b81e59da11f890d2');
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][0], 'b81e59da11f890d2');
+    assert.equal(rows[1][1], 'Rebuild');
+    assert.equal(rows[1][2], 'https://feeds.rebuild.fm/rebuildfm');
+    // id を送らなくても同じ ID で追加される
+    const res2 = handleSaveFeed({ feed: { title: 'COTEN', url: 'https://anchor.fm/s/8c2088c/podcast/rss' } });
+    assert.equal(res2.ok, true);
+    assert.equal(res2.feed.id, '87e6ebcd1afd6416');
+    assert.equal(ss.sheets['feeds'].rows.length, 3);
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: 同じ URL の再追加は行を増やさず、その行の更新になる (冪等)', () => {
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    handleSaveFeed({ feed: { title: 'Rebuild', url: 'https://feeds.rebuild.fm/rebuildfm' } });
+    const res = handleSaveFeed({ feed: { id: 'another-slug', title: 'Rebuild FM', url: 'https://feeds.rebuild.fm/rebuildfm', category: 'podcast' } });
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.id, 'b81e59da11f890d2');
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][1], 'Rebuild FM');
+    assert.equal(rows[1][3], 'podcast');
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: slug ID の既存行は URL 一致で更新され、ID とタイトルを維持する', () => {
+  const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const { ss, restore } = saveFeedEnv([
+    ['yt-legacy', '補完済みタイトル', ytUrl, '', 'TRUE', 'FALSE', '', '', '', '200', ''],
+  ]);
+  try {
+    // タイトル空で再追加しても、補完済みのタイトルを消さない
+    const res = handleSaveFeed({ feed: { title: '', url: ytUrl, category: 'video' } });
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.id, 'yt-legacy');
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][0], 'yt-legacy');
+    assert.equal(rows[1][1], '補完済みタイトル');
+    assert.equal(rows[1][3], 'video');
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: id 指定の更新 (カテゴリ・有効化) は従来どおり行を書き換える', () => {
+  const { ss, restore } = saveFeedEnv([
+    ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'TRUE', 'FALSE', '', '', '', '', ''],
+  ]);
+  try {
+    const res = handleSaveFeed({ feed: { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'blog', enabled: false } });
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.id, 'zenn');
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][3], 'blog');
+    assert.equal(rows[1][4], false);
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: YouTube はタイトル空で追加でき、通常フィードは弾く', () => {
+  const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    const yt = handleSaveFeed({ feed: { url: ytUrl } });
+    assert.equal(yt.ok, true);
+    assert.equal(yt.feed.title, '');
+    assert.equal(yt.feed.id, feedIdFromUrl(ytUrl));
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][1], '');
+    const rss = handleSaveFeed({ feed: { url: 'https://example.com/feed' } });
+    assert.equal(rss.ok, false);
+    assert.equal(ss.sheets['feeds'].rows.length, 2);
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: ハッシュ衝突 (同じ ID・別 URL の行がある) は conflict で弾く', () => {
+  const targetUrl = 'https://example.com/feed-b';
+  const collidingId = feedIdFromUrl(targetUrl);
+  const { ss, restore } = saveFeedEnv([
+    [collidingId, 'Feed A', 'https://example.com/feed-a', '', 'TRUE', 'FALSE', '', '', '', '', ''],
+  ]);
+  try {
+    const res = handleSaveFeed({ feed: { title: 'Feed B', url: targetUrl } });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'conflict');
+    // 行は増えず、既存行も書き換わらない
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][2], 'https://example.com/feed-a');
+  } finally { restore(); }
+});
+
+// fetchFeeds のタイトル補完テスト。URL で playlistItems / channels を振り分ける。
+function fetchTitleEnv({ feedTitle, responder }) {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['yt-x', feedTitle, 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', '', 'TRUE', 'FALSE', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW],
+  });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key' }).service,
+    UrlFetchApp: { fetch: (url) => responder(url) },
+    Utilities: fakeUtilities,
+  });
+  return { ss, restore };
+}
+
+const PLAYLIST_BODY = JSON.stringify({
+  items: [
+    { snippet: { title: '新着動画', description: '説明', publishedAt: '2026-11-14T00:00:00Z', channelTitle: 'YT チャンネル', resourceId: { videoId: 'vidNew12345' } } },
+  ],
+});
+const CHANNELS_BODY = JSON.stringify({ items: [{ snippet: { title: '正式チャンネル名' } }] });
+
+test('fetchFeeds: タイトル未設定なら channels.list のチャンネル名で補完する', () => {
+  const { ss, restore } = fetchTitleEnv({
+    feedTitle: '',
+    responder: (url) => (url.includes('/channels?')
+      ? { getResponseCode: () => 200, getContentText: () => CHANNELS_BODY }
+      : { getResponseCode: () => 200, getContentText: () => PLAYLIST_BODY }),
+  });
+  try {
+    const result = fetchFeeds();
+    assert.equal(result.added, 1);
+    const row = ss.sheets['feeds'].rows[1];
+    assert.equal(row[1], '正式チャンネル名');
+    assert.equal(row[9], '200');
+  } finally { restore(); }
+});
+
+test('fetchFeeds: タイトル補完が失敗しても巡回は続け、タイトルは空のまま', () => {
+  const { ss, restore } = fetchTitleEnv({
+    feedTitle: '',
+    responder: (url) => {
+      if (url.includes('/channels?')) throw new Error('network down');
+      return { getResponseCode: () => 200, getContentText: () => PLAYLIST_BODY };
+    },
+  });
+  try {
+    const result = fetchFeeds();
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 1);
+    const row = ss.sheets['feeds'].rows[1];
+    assert.equal(row[1], '');
+    assert.equal(row[9], '200');
+    assert.equal(row[10], '');
+  } finally { restore(); }
+});
+
+test('fetchFeeds: タイトルが入っていれば channels.list を呼ばず、上書きもしない', () => {
+  const fetchedUrls = [];
+  const { ss, restore } = fetchTitleEnv({
+    feedTitle: '既存タイトル',
+    responder: (url) => {
+      fetchedUrls.push(url);
+      return { getResponseCode: () => 200, getContentText: () => PLAYLIST_BODY };
+    },
+  });
+  try {
+    const result = fetchFeeds();
+    assert.equal(result.added, 1);
+    assert.ok(fetchedUrls.length > 0);
+    assert.ok(fetchedUrls.every((u) => !u.includes('/channels?')), fetchedUrls.join(','));
+    assert.equal(ss.sheets['feeds'].rows[1][1], '既存タイトル');
+  } finally { restore(); }
 });

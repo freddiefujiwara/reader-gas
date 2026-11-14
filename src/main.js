@@ -15,6 +15,9 @@
 // (既存リンクは SHARE_EXPIRES_AT の期限まで有効)。
 // v2 では RSS フィードの巡回はクライアント側 (url-fetch-gas 経由) で行うため、
 // サーバー側の巡回は YouTube だけを対象にする。A_ZE_GS_TOKEN はもう読まない。
+// v3 フェーズ1: フィードIDは URL のハッシュ (feedIdFromUrl) で決め、タイトルは
+// 自動取得のみとする (YouTube は登録時に空で受け、fetchFeeds が補完する)。
+// 既存シートの ID 付け替えは後続フェーズで行うため、当面は slug ID の行も混在する。
 
 const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
@@ -162,6 +165,13 @@ function articleId(feedId, guidOrLink) {
   return sha256Hex(String(feedId) + '\n' + String(guidOrLink));
 }
 
+// フィードIDは URL の SHA-256 (16進・小文字) の先頭16文字で決める (v3)。
+// フロント側も同じ規則で算出するため、入力は検証・整形済みの URL 文字列
+// (シートに保存される文字列) そのままでなければならない。
+function feedIdFromUrl(url) {
+  return sha256Hex(String(url || '')).slice(0, 16);
+}
+
 function hashesEqual(a, b) {
   const x = String(a || '').toLowerCase();
   const y = String(b || '').toLowerCase();
@@ -270,6 +280,16 @@ function parseYouTubePlaylistItems(jsonText, feed) {
     });
   });
   return entries;
+}
+
+// channels.list の応答からチャンネル名を取り出す。タイトル未設定の
+// YouTube フィード (登録時に空で入る) の補完に使う。取れなければ空文字。
+function parseYouTubeChannelTitle(jsonText) {
+  let data;
+  try { data = JSON.parse(String(jsonText || '')); } catch (e) { return ''; }
+  const items = data && Array.isArray(data.items) ? data.items : [];
+  const sn = (items[0] && items[0].snippet) || {};
+  return String(sn.title || '').trim();
 }
 
 // --- YouTube RSS 出力 (v2: 取得をクライアントへ寄せるための出口) ---
@@ -600,6 +620,26 @@ function fetchFeeds() {
     const rowNum = rowNumById[feed.id];
     try {
       if (!youtubeApiKey) throw new Error('YOUTUBE_API_KEY is not set');
+      // タイトル未設定なら channels.list でチャンネル名を補完する
+      // (YouTube フィードは登録時にタイトルを自動取得できないため空で入る)。
+      // 補完の失敗は巡回自体の失敗にせず、タイトルは空のまま続ける。
+      if (!String(feed.title || '').trim()) {
+        try {
+          const channelUrl = 'https://www.googleapis.com/youtube/v3/channels?part=snippet'
+            + '&id=' + encodeURIComponent(youtubeChannelIdFromUrl(feed.url))
+            + '&key=' + encodeURIComponent(youtubeApiKey);
+          const channelRes = UrlFetchApp.fetch(channelUrl, { method: 'get', muteHttpExceptions: true });
+          if (channelRes.getResponseCode() === 200) {
+            const channelTitle = parseYouTubeChannelTitle(channelRes.getContentText());
+            if (channelTitle) {
+              updateFeedRow(feedsSheet, headers, rowNum, { title: channelTitle });
+              feed.title = channelTitle;
+            }
+          }
+        } catch (titleErr) {
+          // 補完できなくても記事の取り込みは続ける。
+        }
+      }
       const playlistId = youtubeUploadsPlaylistId(youtubeChannelIdFromUrl(feed.url));
       const apiUrl = 'https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=20'
         + '&playlistId=' + encodeURIComponent(playlistId)
@@ -738,15 +778,18 @@ function parseFeedUrl(rawUrl) {
 // Returns { ok:true, feed:{id,title,url,category,enabled,isPrivate} } or { ok:false, message }.
 // NOTE: isPrivate は入力値では決めず、URL のホストが a.ze.gs そのもののときだけ
 // true に強制する。現在はホスト由来のマーカーとしてだけ使い、トークンは関与しない。
+// id は任意: 指定があれば形式だけを検証する。追加時の実 ID は URL のハッシュで
+// 決めるため、id は「どの行を更新するか」の指定としてだけ使う (handleSaveFeed)。
+// title は原則必須だが、YouTube 疑似フィードだけは空を許す (登録時に自動取得
+// できないため。fetchFeeds が Data API から補完する)。
 function validateFeedInput(input) {
   if (!input || typeof input !== 'object') return { ok: false, message: 'feed is required' };
   const id = String(input.id === undefined || input.id === null ? '' : input.id).trim();
-  if (!id) return { ok: false, message: 'id is required' };
-  if (!FEED_ID_PATTERN.test(id)) return { ok: false, message: 'id must be a slug (lowercase letters, digits, hyphens)' };
-  const title = String(input.title === undefined || input.title === null ? '' : input.title).trim();
-  if (!title) return { ok: false, message: 'title is required' };
+  if (id && !FEED_ID_PATTERN.test(id)) return { ok: false, message: 'id must be a slug (lowercase letters, digits, hyphens)' };
   const parsed = parseFeedUrl(input.url);
   if (!parsed.ok) return { ok: false, message: parsed.message };
+  const title = String(input.title === undefined || input.title === null ? '' : input.title).trim();
+  if (!title && !youtubeChannelIdFromUrl(parsed.url)) return { ok: false, message: 'title is required' };
   let category = '';
   if (input.category !== undefined && input.category !== null) {
     if (typeof input.category !== 'string') return { ok: false, message: 'category must be a string' };
@@ -868,15 +911,43 @@ function handleSaveFeed(body) {
   const values = sheet.getDataRange().getValues();
   const headers = values.length ? values[0] : FEEDS_HEADERS;
   const idIdx = headers.indexOf('id');
+  const urlIdx = headers.indexOf('url');
+  const rowAt = (i) => {
+    const obj = {};
+    headers.forEach((h, idx) => { obj[h] = values[i][idx]; });
+    return obj;
+  };
   let existing = null;
   let rowNum = -1;
-  if (idIdx >= 0) {
+  // 1) id の指定があり、その行があればその行を更新する (管理画面の編集経路。
+  //    移行前の slug ID の行もそのまま扱う)。
+  if (feed.id && idIdx >= 0) {
     for (let i = 1; i < values.length; i++) {
-      if (String(values[i][idIdx]) !== feed.id) continue;
-      existing = {};
-      headers.forEach((h, idx) => { existing[h] = values[i][idx]; });
-      rowNum = i + 1;
-      break;
+      if (String(values[i][idIdx]) === feed.id) { existing = rowAt(i); rowNum = i + 1; break; }
+    }
+  }
+  // 2) 同じ URL の行があれば、その行の更新として扱う (再追加の冪等化)。
+  //    行の ID は維持する。
+  if (!existing && urlIdx >= 0) {
+    for (let i = 1; i < values.length; i++) {
+      if (String(values[i][urlIdx]) === feed.url) { existing = rowAt(i); rowNum = i + 1; break; }
+    }
+  }
+  if (existing) {
+    feed.id = String(existing.id || '');
+    // タイトル未指定 (YouTube の空タイトル) の更新では既存タイトルを消さない。
+    if (!feed.title) feed.title = String(existing.title || '');
+  } else {
+    // 3) 新規追加: ID はクライアント指定を無視し、URL のハッシュで決める。
+    //    同じ ID の行が別 URL で存在したらハッシュ衝突として弾く
+    //    (同じ URL の行は手順2で拾われているため、ここには来ない)。
+    feed.id = feedIdFromUrl(feed.url);
+    if (idIdx >= 0) {
+      for (let i = 1; i < values.length; i++) {
+        if (String(values[i][idIdx]) === feed.id) {
+          return { ok: false, error: 'conflict', message: 'feed id collision for url: ' + feed.url };
+        }
+      }
     }
   }
   const rowObj = buildFeedRow(feed, existing);
@@ -1008,4 +1079,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
