@@ -1,7 +1,7 @@
 // reader-gas: Web版RSSリーダー /reader のバックエンドAPI (Google Apps Script)。
 // 正本は Google Sheets (feeds / articles / states / owner_sessions の4タブ)。
 // スプレッドシートIDはスクリプトプロパティ SPREADSHEET_ID から読む (コードに直書きしない)。
-// 毎時トリガー fetchFeeds が18フィードを巡回して articles へ追記し、
+// 毎時トリガー fetchFeeds が YouTube フィードだけを巡回して articles へ追記する (v2)。
 // フロントは doPost の list / mark / markAllRead で既読・スターを同期する。
 // フィード管理 (listFeeds / saveFeed / deleteFeed / reorderFeeds) はオーナー専用とし、
 // is_private は URL のホストが a.ze.gs のときだけ立てる (トークン漏洩防止)。
@@ -11,8 +11,8 @@
 // 複数端末の同時セッションを妨げない。
 // 一時アクセスリンク (share) は読み取り専用: exchange_share で検証し、
 // role=readonly のセッションを発行する。mark 系は readonly を拒否する。
-// 自前フィード (is_private) の取得トークンはスクリプトプロパティ
-// A_ZE_GS_TOKEN を X-Api-Token ヘッダーで送るだけにし、シートにもコードにも書かない。
+// v2 では RSS フィードの巡回はクライアント側 (url-fetch-gas 経由) で行うため、
+// サーバー側の巡回は YouTube だけを対象にする。A_ZE_GS_TOKEN はもう読まない。
 
 const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
@@ -765,6 +765,13 @@ function appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt) 
   return added;
 }
 
+// サーバー側で巡回する対象を選ぶ。v2 では RSS フィードの巡回は
+// クライアント側で行うため、対象は有効な YouTube フィードだけになる。
+// 非 YouTube フィードは行の更新も含めて一切触らない。
+function selectFetchTargets(feeds) {
+  return (feeds || []).filter((f) => f && f.id && f.url && isTruthy(f.enabled) && youtubeChannelIdFromUrl(f.url));
+}
+
 function fetchFeeds() {
   const ss = openDataSpreadsheet();
   const feedsSheet = getSheetOrCreate(ss, 'feeds', FEEDS_HEADERS);
@@ -781,52 +788,11 @@ function fetchFeeds() {
     headers.forEach((h, idx) => { obj[h] = feedValues[i][idx]; });
     if (obj.id) rowNumById[obj.id] = i + 1;
   }
-  const allEnabledFeeds = feeds.filter((f) => f.id && f.url && isTruthy(f.enabled));
-  const enabledFeeds = allEnabledFeeds.filter((f) => !youtubeChannelIdFromUrl(f.url));
-  const youtubeFeeds = allEnabledFeeds.filter((f) => youtubeChannelIdFromUrl(f.url));
-  const apiToken = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
-  const requests = enabledFeeds.map((feed) => {
-    const reqHeaders = {};
-    if (feed.etag) reqHeaders['If-None-Match'] = String(feed.etag);
-    if (feed.last_modified) reqHeaders['If-Modified-Since'] = String(feed.last_modified);
-    if (isTruthy(feed.is_private) && apiToken) reqHeaders['X-Api-Token'] = apiToken;
-    return { url: String(feed.url), method: 'get', headers: reqHeaders, muteHttpExceptions: true };
-  });
-  const responses = requests.length ? UrlFetchApp.fetchAll(requests) : [];
+  const youtubeFeeds = selectFetchTargets(feeds);
   const existingIds = {};
   readSheetAsObjects(ss, 'articles').forEach((a) => { existingIds[a.id] = true; });
   const fetchedAt = new Date().toISOString();
   let addedTotal = 0;
-  enabledFeeds.forEach((feed, idx) => {
-    const rowNum = rowNumById[feed.id];
-    try {
-      if (isTruthy(feed.is_private) && !apiToken) throw new Error('A_ZE_GS_TOKEN is not set');
-      const res = responses[idx];
-      const code = res.getResponseCode();
-      if (code === 304) {
-        updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '304', last_error: '' });
-        return;
-      }
-      if (code !== 200) throw new Error('HTTP ' + code);
-      const resHeaders = typeof res.getHeaders === 'function' ? res.getHeaders() : {};
-      const entries = parseFeed(res.getContentText(), feed);
-      addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt);
-      updateFeedRow(feedsSheet, headers, rowNum, {
-        last_fetched_at: fetchedAt,
-        last_status: '200',
-        last_error: '',
-        etag: headerValue(resHeaders, 'ETag') || String(feed.etag || ''),
-        last_modified: headerValue(resHeaders, 'Last-Modified') || String(feed.last_modified || ''),
-      });
-    } catch (err) {
-      // Per-feed errors are isolated: record and continue with the rest.
-      updateFeedRow(feedsSheet, headers, rowNum, {
-        last_fetched_at: fetchedAt,
-        last_status: 'error',
-        last_error: String((err && err.message) || err).slice(0, 500),
-      });
-    }
-  });
   // YouTube フィードは公式APIから取り込む (RSS は 404 のため)。
   const youtubeApiKey = PropertiesService.getScriptProperties().getProperty('YOUTUBE_API_KEY');
   youtubeFeeds.forEach((feed) => {
@@ -852,7 +818,7 @@ function fetchFeeds() {
     }
   });
   pruneArticles();
-  return { ok: true, fetched: allEnabledFeeds.length, added: addedTotal };
+  return { ok: true, fetched: youtubeFeeds.length, added: addedTotal };
 }
 
 function setupFetchTrigger() {
@@ -1361,4 +1327,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, countStarredByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, selectFetchTargets, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, countStarredByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
