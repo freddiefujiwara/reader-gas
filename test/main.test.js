@@ -2074,6 +2074,40 @@ test('planYouTubeAudioTriggers: 公開日時が読めない動画は対象外', 
   assert.deepEqual(planYouTubeAudioTriggers(videos, now), ['vidOk000001']);
 });
 
+test('planYouTubeAudioTriggers: 常時対応チャンネルは30日超・10本超・日時不明でも全件選ぶ', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const special = [];
+  for (let i = 1; i <= 15; i++) {
+    special.push({
+      videoId: 'vidS' + String(i).padStart(5, '0'),
+      // 後半は30日より古い日付にする
+      publishedAt: i <= 7 ? '2026-11-10T00:00:00.000Z' : '2025-01-10T00:00:00.000Z',
+      channelId: 'UCbiDZXbr391oT_vsRiqwPFg',
+    });
+  }
+  // 公開日時が読めない動画も常時対応では対象 (通常フィードとは逆)
+  special.push({ videoId: 'vidSNoDate1', publishedAt: '', channelId: 'UCbiDZXbr391oT_vsRiqwPFg' });
+  // 動画IDが無いものだけは除く
+  special.push({ videoId: '', publishedAt: '2026-11-10T00:00:00.000Z', channelId: 'UCbiDZXbr391oT_vsRiqwPFg' });
+  const plan = planYouTubeAudioTriggers([special], now);
+  assert.equal(plan.length, 16); // 15本 + 日時不明1本
+  assert.equal(plan[0], 'vidS00001');
+  assert.ok(plan.includes('vidS00015'));
+  assert.ok(plan.includes('vidSNoDate1'));
+});
+
+test('planYouTubeAudioTriggers: 常時対応と通常フィードが混ざっても通常分は30日で絞る', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const special = [
+    { videoId: 'vidSOld0001', publishedAt: '2024-05-01T00:00:00.000Z', channelId: 'UCbiDZXbr391oT_vsRiqwPFg' },
+  ];
+  const normal = [
+    { videoId: 'vidNOld0001', publishedAt: '2024-05-01T00:00:00.000Z', channelId: 'UCsomeOtherCh' },
+    { videoId: 'vidNNew0001', publishedAt: '2026-11-14T00:00:00.000Z', channelId: 'UCsomeOtherCh' },
+  ];
+  assert.deepEqual(planYouTubeAudioTriggers([special, normal], now), ['vidSOld0001', 'vidNNew0001']);
+});
+
 test('fetchFeeds: 抽出トリガーは各フィードの最新10本に発火する', () => {
   const items = [];
   for (let i = 1; i <= 12; i++) {
@@ -2169,6 +2203,28 @@ test('fetchFeeds: 抽出トリガーはフィードをまたいだ重複を除�
   } finally { restore(); }
 });
 
+test('fetchFeeds: 常時対応チャンネルは30日超でも取得できた全件に発火する', () => {
+  const rowSpecial = ['yt-special', '藤原史和 川口を歩くQAエンジニア', 'https://www.youtube.com/channel/UCbiDZXbr391oT_vsRiqwPFg', '', 'FALSE', '', '', '', '', ''];
+  const items = [];
+  for (let i = 1; i <= 12; i++) {
+    // 全て公開から30日を大きく超えた日付にする
+    items.push(['vidK' + String(i).padStart(5, '0'), '2025-0' + ((i % 9) + 1) + '-15T00:00:00Z']);
+  }
+  const body = playlistBodyWith(items);
+  const { restore } = fetchAudioEnv({
+    props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [rowSpecial],
+    responder: () => ({ getResponseCode: () => 200, getContentText: () => body }),
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 12);
+    assert.equal(calls.length, 12); // 10本上限も30日制限も付けない
+  } finally { restore(); }
+});
+
 test('fetchFeeds: A_ZE_GS_TOKEN 未設定なら抽出トリガーは発火しない (エラーにもしない)', () => {
   const body = playlistBodyWith([['vidNew12345', '2026-11-14T00:00:00Z']]);
   const { restore } = fetchAudioEnv({
@@ -2228,7 +2284,7 @@ test('fetchFeeds: 既定の抽出トリガーは a.ze.gs/yt-audio/<videoId> を�
   } finally { restore(); }
 });
 
-test('fireYouTubeAudioTriggers: 1回の巡回で最大250件まで (全体キャップ)', () => {
+test('fireYouTubeAudioTriggers: 1回の巡回で最大280件まで (全体キャップ)', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
   });
@@ -2243,8 +2299,35 @@ test('fireYouTubeAudioTriggers: 1回の巡回で最大250件まで (全体キャ
   let count = 0;
   try {
     const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, Date.parse('2026-11-15T00:00:00.000Z'));
-    assert.equal(fired, 250);
-    assert.equal(count, 250);
+    assert.equal(fired, 280);
+    assert.equal(count, 280);
+  } finally { restore(); }
+});
+
+test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全体キャップ280件で収まる', () => {
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+  });
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const special = [];
+  for (let i = 0; i < 20; i++) {
+    // 常時対応分は古い動画でも全件が計画に入る
+    special.push({ videoId: 'vidSp' + i, publishedAt: '2020-01-01T00:00:00.000Z', channelId: 'UCbiDZXbr391oT_vsRiqwPFg' });
+  }
+  const feedVideos = [special];
+  for (let f = 0; f < 27; f++) {
+    const videos = [];
+    for (let i = 0; i < 10; i++) {
+      videos.push({ videoId: 'vidN' + f + '_' + i, publishedAt: '2026-11-14T00:00:00.000Z' });
+    }
+    feedVideos.push(videos);
+  }
+  let count = 0;
+  try {
+    // 計画は 20 + 270 = 290件 → キャップで280件に絞られる
+    const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, now);
+    assert.equal(fired, 280);
+    assert.equal(count, 280);
   } finally { restore(); }
 });
 

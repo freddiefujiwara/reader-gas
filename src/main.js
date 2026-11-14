@@ -736,26 +736,52 @@ function selectFetchTargets(feeds) {
 // 最新10本で、新着かどうかは問わない (ze 側が抽出済みのものは
 // 重複排除するため、毎時叩き直しても安い)。更新の止まった
 // チャンネルは最新動画でも30日を超えていれば何も発火しない。
+// 例外は YT_AUDIO_ALWAYS_CHANNEL_ID のチャンネルだけで、こちらは
+// 30日制限も最新10本の上限も付けず、取得できた動画を毎時すべて
+// 依頼し直して常時再生可能な状態を保つ (下の定数のコメント参照)。
 // 失敗しても巡回自体は失敗にしない (fire-and-forget)。
 
 const YT_AUDIO_TRIGGER_BASE_URL = 'https://a.ze.gs/yt-audio/';
 const YT_AUDIO_TRIGGER_PER_FEED = 10;
-const YT_AUDIO_TRIGGER_MAX_PER_RUN = 250;
+// 全体キャップ。通常分 (最大23フィード×10本=230) と常時対応分
+// (最大20本) が同時でも収まるよう、合計の上限に余裕を持たせた値。
+const YT_AUDIO_TRIGGER_MAX_PER_RUN = 280;
 const YT_AUDIO_TRIGGER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+// 常時対応チャンネル (本人のチャンネル「藤原史和 川口を歩くQAエンジニア」)。
+// reader-gas が毎時、このチャンネルの動画をすべて yt-audio のキューへ
+// 入れ直し、ze 側のバッチは URL が4時間を超えたエントリを取り直す。
+// そのため、このチャンネルの音声 URL は失効前に更新され続け、
+// 常に新鮮な enclosure が付く (= 常に再生可能)。ze 側の変更は不要。
+const YT_AUDIO_ALWAYS_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
 
 // 発火対象を選ぶ純関数: フィードごとに、まず公開日時が読めて
 // 30日以内 (ちょうど30日前を含む) の動画だけに絞り、その中で
 // 新しい順に最大 YT_AUDIO_TRIGGER_PER_FEED 本を選び、動画IDで
 // 重複を除いて並べる。公開日時が読めない動画は安全側で対象外。
+// ただし常時対応チャンネル (YT_AUDIO_ALWAYS_CHANNEL_ID) のフィードは
+// 例外で、公開日時や件数に関係なく、動画IDのある全件を選ぶ
+// (公開日時が読めない動画も対象。常時再生可能を保つため)。
 // 上限件数の適用は発火側 (fireYouTubeAudioTriggers) で行う。
 // nowMs はテスト用の差し込み口 (省略時は現在時刻)。
-// feedVideos はフィードごとの { videoId, publishedAt } の配列の配列。
+// feedVideos はフィードごとの { videoId, publishedAt, channelId }
+// の配列の配列 (channelId は常時対応チャンネルの判定用)。
 function planYouTubeAudioTriggers(feedVideos, nowMs) {
   const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const seen = {};
   const ids = [];
   (feedVideos || []).forEach((videos) => {
-    const fresh = (videos || []).filter((v) => {
+    const list = videos || [];
+    if (list.some((v) => v && v.channelId === YT_AUDIO_ALWAYS_CHANNEL_ID)) {
+      // 常時対応チャンネル: 取得できた順 (新しい順) に全件を選ぶ。
+      list.forEach((v) => {
+        const videoId = String((v && v.videoId) || '');
+        if (!videoId || seen[videoId]) return;
+        seen[videoId] = true;
+        ids.push(videoId);
+      });
+      return;
+    }
+    const fresh = list.filter((v) => {
       const ts = Date.parse((v && v.publishedAt) || '');
       return !isNaN(ts) && now - ts <= YT_AUDIO_TRIGGER_MAX_AGE_MS;
     });
@@ -874,6 +900,7 @@ function fetchFeeds(fireTrigger) {
       feedVideos.push(entries.map((entry) => ({
         videoId: String(entry.guid || '') || videoIdFromLink(entry.link),
         publishedAt: entry.publishedAt || '',
+        channelId: youtubeChannelIdFromUrl(feed.url),
       })).filter((v) => v.videoId));
       updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '200', last_error: '' });
     } catch (err) {
@@ -884,9 +911,9 @@ function fetchFeeds(fireTrigger) {
       });
     }
   });
-  // 各フィードの公開30日以内の最新10本の音声抽出を ze へ依頼する
-  // (記事の保存が済んでから発火する)。トリガーの成否は巡回結果に
-  // 影響させない。
+  // 各フィードの公開30日以内の最新10本 (常時対応チャンネルは全件) の
+  // 音声抽出を ze へ依頼する (記事の保存が済んでから発火する)。
+  // トリガーの成否は巡回結果に影響させない。
   try {
     fireYouTubeAudioTriggers(feedVideos, fireTrigger);
   } catch (e) {
