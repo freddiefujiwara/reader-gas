@@ -65,10 +65,15 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 ```sh
 npm test   # node build.js && node --test test/main.test.js
 npm run build
+npm run smoke   # 本番 /exec のスモークチェック (下記)
 ```
 
 - `src/main.js` の最後の `export { ... };` は必ず1行で書く (`build.js` が正規表現で除去して `dist/Code.gs` を作る)
 - サーバー側ではフィード XML を解析しない (RSS/Atom の解析はクライアント側)。YouTube は Data API の JSON を使う
+
+### デプロイ後のスモークチェック
+
+`npm run smoke` (`scripts/smoke.mjs`) が、デプロイ後の確認を担う。本番の `/exec` を匿名で叩き、ヘルス応答 (`{ok:true, service:"reader-gas"}`)、YouTube フィードの RSS 出力 (`?rss=yt-rakutentech` に item と guid があること)、実在する非 YouTube フィードと未知 ID の `feed_not_found`、セッション無し `list` の `unauthorized` を確認する。1件でも外れたら終了コード 1 で終わる。対象 URL は環境変数 `READER_GAS_EXEC_URL` で差し替えできる (未設定時は本番 URL)。
 
 ## CI
 
