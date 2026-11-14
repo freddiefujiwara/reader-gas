@@ -215,12 +215,12 @@ test('validateFeedInput: 正常系は正規化し、既定値を補う', () => {
     title: 'Zenn',
     url: 'https://zenn.dev/feed',
     category: '',
-    enabled: true,
     isPrivate: false,
   });
   const r2 = validateFeedInput({ id: 'nhk', title: 'NHK', url: 'https://www3.nhk.or.jp/rss/news/cat0.xml', category: ' news ', enabled: 'FALSE', isPrivate: false });
   assert.equal(r2.feed.category, 'news');
-  assert.equal(r2.feed.enabled, false);
+  // enabled は廃止: 入力にあっても無視され、正規化結果に含まれない。
+  assert.ok(!('enabled' in r2.feed));
 });
 
 test('validateFeedInput: 不正な入力は ok:false と理由を返す', () => {
@@ -260,7 +260,8 @@ test('validateFeedInput: isPrivate は a.ze.gs のときだけ強制的に true�
 });
 
 test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変更で etag/last_modified だけ消える', () => {
-  const feed = { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech', enabled: true, isPrivate: false };
+  // enabled: false を渡しても、行では TRUE 固定になる (廃止後の契約)。
+  const feed = { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech', enabled: false, isPrivate: false };
   const created = buildFeedRow(feed, null);
   assert.deepEqual(created, {
     id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech',
@@ -288,7 +289,14 @@ test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変
 
 test('feedRowValues: ヘッダー順に並べ、未知ヘッダーは空文字', () => {
   const row = buildFeedRow({ id: 'a', title: 'A', url: 'https://example.com/f', category: '', enabled: false, isPrivate: false }, null);
-  assert.deepEqual(feedRowValues(row, ['id', 'url', 'enabled', 'etag']), ['a', 'https://example.com/f', false, '']);
+  assert.deepEqual(feedRowValues(row, ['id', 'url', 'enabled', 'etag']), ['a', 'https://example.com/f', true, '']);
+});
+
+test('buildFeedRow: 行は常に11列で、enabled 列 (E列) は入力によらず TRUE 固定', () => {
+  const row = buildFeedRow({ id: 'a', title: 'A', url: 'https://example.com/f', category: '', enabled: false, isPrivate: false }, null);
+  const values = feedRowValues(row);
+  assert.equal(values.length, 11);
+  assert.equal(values[4], true);
 });
 
 test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
@@ -299,11 +307,12 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
   }, 7);
   assert.deepEqual(shaped, {
     id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', fetchUrl: 'https://a.ze.gs/x.freddie.xml', category: 'private',
-    enabled: true, isPrivate: true,
+    isPrivate: true,
     lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
-  assert.equal(feedToApiShape({ id: 'x' }).enabled, false);
+  // enabled は廃止: 行に値があっても API 形式には出さない。
+  assert.ok(!('enabled' in feedToApiShape({ id: 'x', enabled: 'FALSE' })));
 });
 
 test('countUnreadByFeed: 状態なしと未読を数え、既読は数えない', () => {
@@ -468,7 +477,7 @@ test('youtubeChannelIdFromUrl: videos.xml の URL から channel_id を抜く', 
   assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/feeds/videos.xml?user=someone'), '');
 });
 
-test('selectFetchTargets: 有効な YouTube フィードだけを巡回対象にする', () => {
+test('selectFetchTargets: YouTube フィードだけを巡回対象にする (enabled は見ない)', () => {
   const yt = (id, enabled) => ({
     id,
     url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A',
@@ -477,13 +486,15 @@ test('selectFetchTargets: 有効な YouTube フィードだけを巡回対象に
   const feeds = [
     yt('yt-on', true),
     yt('yt-str', 'TRUE'),
+    // enabled が false でも対象になる (有効/無効は廃止)。
     yt('yt-off', false),
+    yt('yt-none', undefined),
     { id: 'rss-on', url: 'https://example.com/feed.xml', enabled: true },
     { id: 'priv-on', url: 'https://a.ze.gs/x.freddie.xml', enabled: true },
     { id: '', url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', enabled: true },
     { id: 'yt-nourl', url: '', enabled: true },
   ];
-  assert.deepEqual(selectFetchTargets(feeds).map((f) => f.id), ['yt-on', 'yt-str']);
+  assert.deepEqual(selectFetchTargets(feeds).map((f) => f.id), ['yt-on', 'yt-str', 'yt-off', 'yt-none']);
   assert.deepEqual(selectFetchTargets([]), []);
   assert.deepEqual(selectFetchTargets(null), []);
   assert.deepEqual(selectFetchTargets(undefined), []);
@@ -618,7 +629,7 @@ test('feedToApiShape: fetchUrl が付く (YouTube は注入したベース URL �
   assert.equal(normal.fetchUrl, 'https://zenn.dev/feed');
 });
 
-test('buildListPayload: フィードに enabled が付き、無効フィードは false になる', () => {
+test('buildListPayload: フィードに enabled は付かない (廃止)', () => {
   // GAS グローバルの最小スタブ (シートは行列だけを持つフェイク)。
   const tables = {
     feeds: [
@@ -652,10 +663,9 @@ test('buildListPayload: フィードに enabled が付き、無効フィード�
     assert.equal(payload.ok, true);
     const byId = {};
     payload.feeds.forEach((f) => { byId[f.id] = f; });
-    // クライアントは f.enabled !== false で取得対象から外すため、
-    // 無効フィードには enabled:false が明示されなければならない。
-    assert.equal(byId['zenn'].enabled, true);
-    assert.equal(byId['yt-off'].enabled, false);
+    // enabled は廃止: シートに false の行があってもペイロードには出さない。
+    assert.ok(!('enabled' in byId['zenn']));
+    assert.ok(!('enabled' in byId['yt-off']));
     assert.equal(byId['zenn'].unreadCount, 1);
     // 既読マージは残る (初回取り込みが id と isRead だけを使う)。
     assert.deepEqual(payload.articles.map((a) => [a.id, a.isRead]), [['a1', true], ['a2', false]]);
@@ -1026,10 +1036,10 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
     // YouTube は RSS 出力 URL、通常フィードは自 URL が fetchUrl になる
     assert.equal(byId['yt-x'].fetchUrl, 'https://example.com/exec?rss=yt-x');
     assert.equal(byId['zenn'].fetchUrl, 'https://zenn.dev/feed');
-    assert.equal(byId['zenn'].enabled, false);
+    assert.ok(!('enabled' in byId['zenn']));
     assert.equal(byId['yt-x'].unreadCount, 0);
-    // フィードのキー集合は slim 化後 (PR #16) の形に固定する
-    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'enabled', 'fetchUrl', 'id', 'isPrivate', 'title', 'unreadCount', 'url']);
+    // フィードのキー集合は slim 化後 (PR #16) の形から enabled を除いた形に固定する
+    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'isPrivate', 'title', 'unreadCount', 'url']);
     // 状態マージ: states の is_read が isRead に反映される
     assert.equal(payload.articles[0].isRead, true);
   } finally { restore(); }
@@ -1430,7 +1440,7 @@ test('handleSaveFeed: slug ID の既存行は URL 一致で更新され、ID と
   } finally { restore(); }
 });
 
-test('handleSaveFeed: id 指定の更新 (カテゴリ・有効化) は従来どおり行を書き換える', () => {
+test('handleSaveFeed: id 指定の更新は行を書き換え、enabled は入力によらず TRUE で書く', () => {
   const { ss, restore } = saveFeedEnv([
     ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'TRUE', 'FALSE', '', '', '', '', ''],
   ]);
@@ -1441,7 +1451,8 @@ test('handleSaveFeed: id 指定の更新 (カテゴリ・有効化) は従来ど
     const rows = ss.sheets['feeds'].rows;
     assert.equal(rows.length, 2);
     assert.equal(rows[1][3], 'blog');
-    assert.equal(rows[1][4], false);
+    // enabled は廃止: false を送っても列には TRUE 固定で書かれる。
+    assert.equal(rows[1][4], true);
   } finally { restore(); }
 });
 

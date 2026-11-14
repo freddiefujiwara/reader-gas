@@ -18,6 +18,8 @@
 // v3 フェーズ1: フィードIDは URL のハッシュ (feedIdFromUrl) で決め、タイトルは
 // 自動取得のみとする (YouTube は登録時に空で受け、fetchFeeds が補完する)。
 // 既存シートの ID 付け替えは後続フェーズで行うため、当面は slug ID の行も混在する。
+// 有効/無効 (enabled) は廃止した: 巡回・一覧・保存のどこでも参照せず、
+// 行を書くときは列が残る間だけ TRUE 固定で書く (列自体の撤去は後続フェーズ)。
 
 const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
@@ -587,10 +589,11 @@ function appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt) 
 }
 
 // サーバー側で巡回する対象を選ぶ。v2 では RSS フィードの巡回は
-// クライアント側で行うため、対象は有効な YouTube フィードだけになる。
+// クライアント側で行うため、対象は YouTube フィードだけになる。
 // 非 YouTube フィードは行の更新も含めて一切触らない。
+// 有効/無効の概念は廃止したため、enabled 列は対象判定に使わない。
 function selectFetchTargets(feeds) {
-  return (feeds || []).filter((f) => f && f.id && f.url && isTruthy(f.enabled) && youtubeChannelIdFromUrl(f.url));
+  return (feeds || []).filter((f) => f && f.id && f.url && youtubeChannelIdFromUrl(f.url));
 }
 
 function fetchFeeds() {
@@ -723,7 +726,6 @@ function buildListPayload(body) {
       url: String(f.url || ''),
       fetchUrl: buildFetchUrl(f, serviceUrl),
       category: String(f.category || ''),
-      enabled: isTruthy(f.enabled),
       isPrivate: isTruthy(f.is_private),
       unreadCount: unreadByFeed[f.id] || 0,
     })),
@@ -775,7 +777,9 @@ function parseFeedUrl(rawUrl) {
 }
 
 // Validates/normalizes a feed input object.
-// Returns { ok:true, feed:{id,title,url,category,enabled,isPrivate} } or { ok:false, message }.
+// Returns { ok:true, feed:{id,title,url,category,isPrivate} } or { ok:false, message }.
+// enabled は廃止したため入力にあっても無視し、正規化結果にも含めない
+// (行への書き込み時に buildFeedRow が TRUE 固定で埋める)。
 // NOTE: isPrivate は入力値では決めず、URL のホストが a.ze.gs そのもののときだけ
 // true に強制する。現在はホスト由来のマーカーとしてだけ使い、トークンは関与しない。
 // id は任意: 指定があれば形式だけを検証する。追加時の実 ID は URL のハッシュで
@@ -802,7 +806,6 @@ function validateFeedInput(input) {
       title,
       url: parsed.url,
       category,
-      enabled: toFeedBool(input.enabled, true),
       isPrivate: parsed.host === PRIVATE_FEED_HOST,
     },
   };
@@ -820,7 +823,9 @@ function buildFeedRow(feed, existing) {
     title: feed.title,
     url: feed.url,
     category: feed.category,
-    enabled: feed.enabled,
+    // 有効/無効は廃止。列自体を落とす後続フェーズまでは、入力や既存行の
+    // 値によらず TRUE 固定で書く。
+    enabled: true,
     is_private: feed.isPrivate,
     etag: keepCache ? String(prev.etag || '') : '',
     last_modified: keepCache ? String(prev.last_modified || '') : '',
@@ -868,7 +873,6 @@ function feedToApiShape(feedObj, unreadCount, serviceUrl) {
     url: String(f.url || ''),
     fetchUrl: buildFetchUrl(f, base),
     category: String(f.category || ''),
-    enabled: isTruthy(f.enabled),
     isPrivate: isTruthy(priv),
     lastStatus: String(status || ''),
     lastError: String(error || ''),
