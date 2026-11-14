@@ -18,15 +18,15 @@
 // v3 フェーズ1: フィードIDは URL のハッシュ (feedIdFromUrl) で決め、タイトルは
 // 自動取得のみとする (YouTube は登録時に空で受け、fetchFeeds が補完する)。
 // 既存シートの ID 付け替えは後続フェーズで行うため、当面は slug ID の行も混在する。
-// 有効/無効 (enabled) は廃止した: 巡回・一覧・保存のどこでも参照せず、
-// 行を書くときは列が残る間だけ TRUE 固定で書く (列自体の撤去は後続フェーズ)。
+// 有効/無効 (enabled) は廃止し、feeds タブの列自体も撤去した (全10列)。
+// 巡回・一覧・保存のどこでも参照しない。
 
 const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
 const OWNER_SHEET_NAME = 'owner_sessions';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SESSION_HEADERS = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
-const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'enabled', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
+const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
 const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
 const STATES_HEADERS = ['article_id', 'is_read', 'is_starred', 'read_at', 'starred_at', 'updated_at'];
 const RETENTION_DAYS = 60;
@@ -591,7 +591,7 @@ function appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt) 
 // サーバー側で巡回する対象を選ぶ。v2 では RSS フィードの巡回は
 // クライアント側で行うため、対象は YouTube フィードだけになる。
 // 非 YouTube フィードは行の更新も含めて一切触らない。
-// 有効/無効の概念は廃止したため、enabled 列は対象判定に使わない。
+// 有効/無効の概念は廃止したため、対象は YouTube フィードかどうかだけで決まる。
 function selectFetchTargets(feeds) {
   return (feeds || []).filter((f) => f && f.id && f.url && youtubeChannelIdFromUrl(f.url));
 }
@@ -739,18 +739,6 @@ function buildListPayload(body) {
 const FEED_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const PRIVATE_FEED_HOST = 'a.ze.gs';
 
-function toFeedBool(value, fallback) {
-  if (value === undefined || value === null || value === '') return fallback;
-  if (value === true || value === 1) return true;
-  if (value === false || value === 0) return false;
-  if (typeof value === 'string') {
-    const v = value.trim().toUpperCase();
-    if (v === 'TRUE' || v === '1') return true;
-    if (v === 'FALSE' || v === '0') return false;
-  }
-  return fallback;
-}
-
 // Pure-JS https URL check (Apps Script には URL コンストラクタが無いため正規表現で分解する)。
 // Returns { ok:true, url, host } or { ok:false, message }.
 function parseFeedUrl(rawUrl) {
@@ -778,8 +766,7 @@ function parseFeedUrl(rawUrl) {
 
 // Validates/normalizes a feed input object.
 // Returns { ok:true, feed:{id,title,url,category,isPrivate} } or { ok:false, message }.
-// enabled は廃止したため入力にあっても無視し、正規化結果にも含めない
-// (行への書き込み時に buildFeedRow が TRUE 固定で埋める)。
+// enabled は廃止したため入力にあっても無視し、正規化結果にも含めない。
 // NOTE: isPrivate は入力値では決めず、URL のホストが a.ze.gs そのもののときだけ
 // true に強制する。現在はホスト由来のマーカーとしてだけ使い、トークンは関与しない。
 // id は任意: 指定があれば形式だけを検証する。追加時の実 ID は URL のハッシュで
@@ -823,9 +810,6 @@ function buildFeedRow(feed, existing) {
     title: feed.title,
     url: feed.url,
     category: feed.category,
-    // 有効/無効は廃止。列自体を落とす後続フェーズまでは、入力や既存行の
-    // 値によらず TRUE 固定で書く。
-    enabled: true,
     is_private: feed.isPrivate,
     etag: keepCache ? String(prev.etag || '') : '',
     last_modified: keepCache ? String(prev.last_modified || '') : '',
@@ -1083,4 +1067,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
