@@ -27,7 +27,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 | `exchange_share` | `shareToken` | 一時アクセスリンクを検証し、読み取り専用セッションを発行 |
 | `list` | `sessionToken`, `limit?` (最大500) | 記事一覧 (既読マージ済み・新しい順)＋フィード一覧 (未読数付き)。v2 では既読状態の初回取り込みにだけ使う |
 | `listFeeds` | `sessionToken` (owner) | フィード管理用一覧 (全件、最終取得・未読数付き)。読み取り専用セッションは拒否 |
-| `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category,isPrivate}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消す。YouTube はチャンネルページ URL (`/channel/UC...`・`/@handle`) や旧来の videos.xml 形でも登録でき、保存時は `/channel/UC...` 形に寄せる (ハンドルは Data API で解決し、タイトルも補完する) |
+| `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category,isPrivate}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消す。YouTube はチャンネルページ URL (`/channel/UC...`・`/@handle`) で登録でき、保存時は `/channel/UC...` 形に寄せる (ハンドルは Data API で解決し、タイトルも補完する) |
 | `deleteFeed` | `sessionToken` (owner), `feedId` | フィード行と、その記事・状態をまとめて削除。未知のIDは `{ok:false, error:"not_found"}` |
 | `reorderFeeds` | `sessionToken` (owner), `feedIds:[...]` | フィードの並び順を変更 (表示順＝feedsシートの行順なので、行を並び替えて一括で書き戻す)。現在の全フィードIDと集合が一致しない・重複する場合は `{ok:false, error:"invalid", message}` |
 
