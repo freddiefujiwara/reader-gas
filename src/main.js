@@ -3,7 +3,7 @@
 // スプレッドシートIDはスクリプトプロパティ SPREADSHEET_ID から読む (コードに直書きしない)。
 // 毎時トリガー fetchFeeds が18フィードを巡回して articles へ追記し、
 // フロントは doPost の list / mark / markAllRead で既読・スターを同期する。
-// フィード管理 (listFeeds / saveFeed / deleteFeed) はオーナー専用とし、
+// フィード管理 (listFeeds / saveFeed / deleteFeed / reorderFeeds) はオーナー専用とし、
 // is_private は URL のホストが a.ze.gs のときだけ立てる (トークン漏洩防止)。
 // 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、
 // オーナー本人 (ALLOWED_EMAIL) にだけ30日セッションを発行する。
@@ -468,6 +468,55 @@ function deleteRowsById(ss, sheetName, keyHeader, ids) {
   // 残す行だけを一括で書き戻す。
   sheet.clearContents();
   sheet.getRange(1, 1, remaining.length, remaining[0].length).setValues(remaining);
+}
+
+// Rearranges the data rows of a sheet-values array to follow feedIds order.
+// The header row stays first and row contents are never touched. feedIds is
+// expected to be a validated permutation of the sheet ids; defensively, rows
+// not named in feedIds are appended in their original order so that no row is
+// ever dropped or duplicated.
+function reorderRowsByIds(values, idIdx, feedIds) {
+  if (!values || !values.length) return values;
+  const rowIndexById = {};
+  for (let i = 1; i < values.length; i++) {
+    rowIndexById[String(values[i][idIdx])] = i;
+  }
+  const used = {};
+  const reordered = [values[0]];
+  (feedIds || []).forEach((id) => {
+    const idx = rowIndexById[String(id)];
+    if (idx !== undefined && !used[idx]) {
+      used[idx] = true;
+      reordered.push(values[idx]);
+    }
+  });
+  for (let i = 1; i < values.length; i++) {
+    if (!used[i]) reordered.push(values[i]);
+  }
+  return reordered;
+}
+
+// Validates a reorderFeeds request: feedIds must be an array of unique id
+// strings whose set exactly equals the current feed ids in the sheet.
+function validateFeedOrder(feedIds, currentIds) {
+  if (!Array.isArray(feedIds)) return { ok: false, message: 'feedIds must be an array' };
+  const seen = {};
+  for (let i = 0; i < feedIds.length; i++) {
+    const id = feedIds[i];
+    if (typeof id !== 'string' || !id) return { ok: false, message: 'feedIds must contain feed id strings' };
+    if (seen[id]) return { ok: false, message: 'feedIds contains a duplicate id: ' + id };
+    seen[id] = true;
+  }
+  const current = currentIds || [];
+  if (feedIds.length !== current.length) {
+    return { ok: false, message: 'feedIds must list every current feed id exactly once' };
+  }
+  const currentSet = {};
+  current.forEach((id) => { currentSet[String(id)] = true; });
+  for (let i = 0; i < feedIds.length; i++) {
+    if (!currentSet[feedIds[i]]) return { ok: false, message: 'unknown feed id: ' + feedIds[i] };
+  }
+  return { ok: true };
 }
 
 // --- Auth (tweet-gas pattern, simplified for reader) ---
@@ -980,6 +1029,35 @@ function handleDeleteFeed(body) {
   return { ok: true };
 }
 
+// Display order = feeds sheet row order (both list and listFeeds follow it),
+// so reordering means rewriting the feeds rows in the requested order.
+function handleReorderFeeds(body) {
+  const sheet = openDataSpreadsheet().getSheetByName('feeds');
+  const values = sheet ? sheet.getDataRange().getValues() : [];
+  const headers = values.length ? values[0] : FEEDS_HEADERS;
+  const idIdx = headers.indexOf('id');
+  if (idIdx < 0) return { ok: false, error: 'invalid', message: 'feeds sheet has no id column' };
+  const currentIds = [];
+  for (let i = 1; i < values.length; i++) {
+    const id = String(values[i][idIdx] || '');
+    if (id) currentIds.push(id);
+  }
+  const check = validateFeedOrder(body ? body.feedIds : null, currentIds);
+  if (!check.ok) return { ok: false, error: 'invalid', message: check.message };
+  if (!sheet || values.length < 2) return { ok: true };
+  const reordered = reorderRowsByIds(values, idIdx, body.feedIds);
+  // 並びが変わらない場合は書き戻しを省く (行参照の同一性で判定できる)。
+  let changed = false;
+  for (let i = 0; i < values.length; i++) {
+    if (reordered[i] !== values[i]) { changed = true; break; }
+  }
+  if (changed) {
+    sheet.clearContents();
+    sheet.getRange(1, 1, reordered.length, reordered[0].length).setValues(reordered);
+  }
+  return { ok: true };
+}
+
 // --- Web App entry points ---
 
 function jsonOutput(obj) {
@@ -1030,6 +1108,10 @@ function doPost(e) {
       if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
       return jsonOutput(handleDeleteFeed(body));
     }
+    if (action === 'reorderFeeds') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(handleReorderFeeds(body));
+    }
     if (action === 'list') {
       return jsonOutput(buildListPayload(body));
     }
@@ -1046,4 +1128,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
