@@ -2,7 +2,7 @@ id,title,url,category,enabled,is_private,etag,last_modified,last_fetched_at,last
 hatena-hotentry,はてなブックマーク人気エントリー,https://b.hatena.ne.jp/hotentry.rss,news,TRUE,FALSE,,,,,
 cyberagent,CyberAgent Developers Blog,https://developers.cyberagent.co.jp/blog/feed/,tech,TRUE,FALSE,,,,,
 mercari,Mercari Engineering Blog,https://engineering.mercari.com/blog/feed.xml,tech,TRUE,FALSE,,,,,
-cnet-japan,CNET Japan,https://japan.cnet.com/rss/index.rdf,tech,TRUE,FALSE,,,,,
+cnet-japan,CNET Japan,https://feeds.japan.cnet.com/rss/cnet/all.rdf,tech,TRUE,FALSE,,,,,
 yahoo-news,Yahoo!ニュース トピックス,https://news.yahoo.co.jp/rss/topics/top-picks.xml,news,TRUE,FALSE,,,,,
 itmedia,ITmedia,https://rss.itmedia.co.jp/rss/2.0/itmedia_all.xml,tech,TRUE,FALSE,,,,,
 nhk,NHKニュース,https://www3.nhk.or.jp/rss/news/cat0.xml,news,TRUE,FALSE,,,,,
