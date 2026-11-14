@@ -732,23 +732,34 @@ function selectFetchTargets(feeds) {
 // yt-audio を叩くと ze 側のキューに積まれ、ze のバッチが音声ストリーム
 // URL を抽出して audio-urls.json として公開する (非同期)。
 // ?rss= はその JSON の新鮮なエントリを enclosure として配信する。
-// 発火対象は各 YouTube フィードの最新10本で、新着かどうかは問わない
-// (ze 側が抽出済みのものは重複排除するため、毎時叩き直しても安い)。
+// 発火対象は各 YouTube フィードの「公開から30日以内」の動画のうち
+// 最新10本で、新着かどうかは問わない (ze 側が抽出済みのものは
+// 重複排除するため、毎時叩き直しても安い)。更新の止まった
+// チャンネルは最新動画でも30日を超えていれば何も発火しない。
 // 失敗しても巡回自体は失敗にしない (fire-and-forget)。
 
 const YT_AUDIO_TRIGGER_BASE_URL = 'https://a.ze.gs/yt-audio/';
 const YT_AUDIO_TRIGGER_PER_FEED = 10;
 const YT_AUDIO_TRIGGER_MAX_PER_RUN = 250;
+const YT_AUDIO_TRIGGER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
-// 発火対象を選ぶ純関数: フィードごとに公開日時の新しい順に最大
-// YT_AUDIO_TRIGGER_PER_FEED 本を選び、動画IDで重複を除いて並べる。
+// 発火対象を選ぶ純関数: フィードごとに、まず公開日時が読めて
+// 30日以内 (ちょうど30日前を含む) の動画だけに絞り、その中で
+// 新しい順に最大 YT_AUDIO_TRIGGER_PER_FEED 本を選び、動画IDで
+// 重複を除いて並べる。公開日時が読めない動画は安全側で対象外。
 // 上限件数の適用は発火側 (fireYouTubeAudioTriggers) で行う。
+// nowMs はテスト用の差し込み口 (省略時は現在時刻)。
 // feedVideos はフィードごとの { videoId, publishedAt } の配列の配列。
-function planYouTubeAudioTriggers(feedVideos) {
+function planYouTubeAudioTriggers(feedVideos, nowMs) {
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const seen = {};
   const ids = [];
   (feedVideos || []).forEach((videos) => {
-    const sorted = (videos || []).slice().sort((a, b) => {
+    const fresh = (videos || []).filter((v) => {
+      const ts = Date.parse((v && v.publishedAt) || '');
+      return !isNaN(ts) && now - ts <= YT_AUDIO_TRIGGER_MAX_AGE_MS;
+    });
+    const sorted = fresh.slice().sort((a, b) => {
       const tb = Date.parse((b && b.publishedAt) || '') || 0;
       const ta = Date.parse((a && a.publishedAt) || '') || 0;
       return tb - ta;
@@ -778,12 +789,12 @@ function fireYouTubeAudioTrigger(videoId, token) {
 // 残りはログに残して省く。fireTrigger はテスト用の差し込み口
 // (省略時は fireYouTubeAudioTrigger)。時間ベーストリガーから呼ばれる
 // fetchFeeds 経由ではイベントオブジェクトが渡ってくるため、関数で
-// なければ既定実装に落とす。
-function fireYouTubeAudioTriggers(feedVideos, fireTrigger) {
+// なければ既定実装に落とす。nowMs は30日判定用のテスト差し込み口。
+function fireYouTubeAudioTriggers(feedVideos, fireTrigger, nowMs) {
   const token = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
   if (!token) return 0;
   const fire = typeof fireTrigger === 'function' ? fireTrigger : fireYouTubeAudioTrigger;
-  const planned = planYouTubeAudioTriggers(feedVideos);
+  const planned = planYouTubeAudioTriggers(feedVideos, nowMs);
   const targets = planned.slice(0, YT_AUDIO_TRIGGER_MAX_PER_RUN);
   if (planned.length > targets.length) {
     console.log('yt-audio: triggers capped at ' + targets.length + ' of ' + planned.length + ' videos');
@@ -873,8 +884,9 @@ function fetchFeeds(fireTrigger) {
       });
     }
   });
-  // 各フィードの最新10本の音声抽出を ze へ依頼する (記事の保存が
-  // 済んでから発火する)。トリガーの成否は巡回結果に影響させない。
+  // 各フィードの公開30日以内の最新10本の音声抽出を ze へ依頼する
+  // (記事の保存が済んでから発火する)。トリガーの成否は巡回結果に
+  // 影響させない。
   try {
     fireYouTubeAudioTriggers(feedVideos, fireTrigger);
   } catch (e) {
