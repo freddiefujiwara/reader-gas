@@ -17,6 +17,7 @@ import {
   prunePlan,
   filterArticles,
   feedIdsForCategory,
+  selectFetchTargets,
   youtubeChannelIdFromUrl,
   youtubeUploadsPlaylistId,
   parseYouTubePlaylistItems,
@@ -580,6 +581,27 @@ test('youtubeChannelIdFromUrl: videos.xml の URL から channel_id を抜く', 
   );
   assert.equal(youtubeChannelIdFromUrl('https://example.com/feed.xml'), '');
   assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/feeds/videos.xml?user=someone'), '');
+});
+
+test('selectFetchTargets: 有効な YouTube フィードだけを巡回対象にする', () => {
+  const yt = (id, enabled) => ({
+    id,
+    url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A',
+    enabled,
+  });
+  const feeds = [
+    yt('yt-on', true),
+    yt('yt-str', 'TRUE'),
+    yt('yt-off', false),
+    { id: 'rss-on', url: 'https://example.com/feed.xml', enabled: true },
+    { id: 'priv-on', url: 'https://a.ze.gs/x.freddie.xml', enabled: true },
+    { id: '', url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', enabled: true },
+    { id: 'yt-nourl', url: '', enabled: true },
+  ];
+  assert.deepEqual(selectFetchTargets(feeds).map((f) => f.id), ['yt-on', 'yt-str']);
+  assert.deepEqual(selectFetchTargets([]), []);
+  assert.deepEqual(selectFetchTargets(null), []);
+  assert.deepEqual(selectFetchTargets(undefined), []);
 });
 
 test('youtubeUploadsPlaylistId: UC の先頭を UU に替える', () => {
