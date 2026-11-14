@@ -29,6 +29,11 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 | `list` | `sessionToken`, `feedId?`, `filter=all\|unread\|starred`, `limit?`, `offset?` | 記事一覧 (状態マージ済み・新しい順)＋フィード一覧 (未読数付き) |
 | `mark` | `sessionToken` (owner), `articleId`, `isRead?`, `isStarred?` | 既読・スターの付け外し。読み取り専用セッションは拒否 |
 | `markAllRead` | `sessionToken` (owner), `feedId?` | まとめて既読化。読み取り専用セッションは拒否 |
+| `listFeeds` | `sessionToken` (owner) | フィード管理用一覧 (無効フィードも含む全件、状態・最終取得・未読数付き)。読み取り専用セッションは拒否 |
+| `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category,enabled,isPrivate}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消して全件再取得させる |
+| `deleteFeed` | `sessionToken` (owner), `feedId` | フィード行と、その記事・状態をまとめて削除。未知のIDは `{ok:false, error:"not_found"}` |
+
+フィード管理のセキュリティ規則: `isPrivate` は入力値では決めず、URLのホストが `a.ze.gs` そのもののときだけ `true` に強制する (`A_ZE_GS_TOKEN` を第三者ホストへ送らないため)。
 
 `doGet` は `{ok:true, service:"reader-gas"}` のヘルスチェックのみ。
 

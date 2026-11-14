@@ -16,6 +16,13 @@ import {
   isSessionExpired,
   prunePlan,
   filterArticles,
+  toFeedBool,
+  parseFeedUrl,
+  validateFeedInput,
+  buildFeedRow,
+  feedRowValues,
+  feedToApiShape,
+  countUnreadByFeed,
 } from '../src/main.js';
 
 test('rowsToObjects: ヘッダーをキーにし空行を飛ばす', () => {
@@ -226,4 +233,143 @@ test('filterArticles: フィルタと新しい順ソート', () => {
   assert.deepEqual(filterArticles(articles, { filter: 'unread' }).map((a) => a.id), ['3', '2']);
   assert.deepEqual(filterArticles(articles, { filter: 'starred' }).map((a) => a.id), ['2']);
   assert.deepEqual(filterArticles(articles, { feedId: 'zenn' }).map((a) => a.id), ['3', '1']);
+});
+
+test('toFeedBool: 真偽値と文字列形式、未指定はフォールバック', () => {
+  assert.equal(toFeedBool(true, false), true);
+  assert.equal(toFeedBool(false, true), false);
+  assert.equal(toFeedBool('TRUE', false), true);
+  assert.equal(toFeedBool('FALSE', true), false);
+  assert.equal(toFeedBool('true', false), true);
+  assert.equal(toFeedBool(undefined, true), true);
+  assert.equal(toFeedBool(null, false), false);
+  assert.equal(toFeedBool('', true), true);
+});
+
+test('parseFeedUrl: https のみ許可しホストを返す', () => {
+  assert.deepEqual(parseFeedUrl('https://zenn.dev/feed'), { ok: true, url: 'https://zenn.dev/feed', host: 'zenn.dev' });
+  assert.equal(parseFeedUrl('https://a.ze.gs:443/mfcf.xml').host, 'a.ze.gs');
+  assert.equal(parseFeedUrl('http://example.com/feed').ok, false);
+  assert.equal(parseFeedUrl('ftp://example.com/feed').ok, false);
+  assert.equal(parseFeedUrl('not a url').ok, false);
+  assert.equal(parseFeedUrl('https://').ok, false);
+  assert.equal(parseFeedUrl('https://exa mple.com/feed').ok, false);
+  assert.equal(parseFeedUrl('').ok, false);
+  assert.equal(parseFeedUrl('https://example.com/feed').ok, true);
+});
+
+test('validateFeedInput: 正常系は正規化し、既定値を補う', () => {
+  const r = validateFeedInput({ id: 'zenn', title: '  Zenn  ', url: 'https://zenn.dev/feed' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.feed, {
+    id: 'zenn',
+    title: 'Zenn',
+    url: 'https://zenn.dev/feed',
+    category: '',
+    enabled: true,
+    isPrivate: false,
+  });
+  const r2 = validateFeedInput({ id: 'nhk', title: 'NHK', url: 'https://www3.nhk.or.jp/rss/news/cat0.xml', category: ' news ', enabled: 'FALSE', isPrivate: false });
+  assert.equal(r2.feed.category, 'news');
+  assert.equal(r2.feed.enabled, false);
+});
+
+test('validateFeedInput: 不正な入力は ok:false と理由を返す', () => {
+  const base = { id: 'ok-id', title: 'Title', url: 'https://example.com/feed' };
+  // id (slug)
+  assert.equal(validateFeedInput({ ...base, id: '' }).ok, false);
+  assert.equal(validateFeedInput({ ...base, id: 'Bad Slug' }).ok, false);
+  assert.equal(validateFeedInput({ ...base, id: '-leading-hyphen' }).ok, false);
+  assert.equal(validateFeedInput({ ...base, id: 'under_score' }).ok, false);
+  assert.equal(validateFeedInput({ ...base, id: 'a'.repeat(65) }).ok, false);
+  assert.equal(validateFeedInput({ ...base, id: 'a'.repeat(64) }).ok, true);
+  // title
+  assert.equal(validateFeedInput({ ...base, title: '' }).ok, false);
+  assert.equal(validateFeedInput({ ...base, title: '   ' }).ok, false);
+  // url
+  assert.equal(validateFeedInput({ ...base, url: '' }).ok, false);
+  assert.equal(validateFeedInput({ ...base, url: 'http://example.com/feed' }).ok, false);
+  assert.match(validateFeedInput({ ...base, url: 'http://example.com/feed' }).message, /https/);
+  assert.equal(validateFeedInput({ ...base, url: 'example.com/feed' }).ok, false);
+  // feed 自体が無い
+  assert.equal(validateFeedInput(null).ok, false);
+  assert.equal(validateFeedInput(undefined).ok, false);
+});
+
+test('validateFeedInput: isPrivate は a.ze.gs のときだけ強制的に true、それ以外は常に false', () => {
+  // 自前ホスト: 入力が false でも true になる
+  const priv = validateFeedInput({ id: 'mfcf', title: 'MF', url: 'https://a.ze.gs/mfcf.xml', isPrivate: false });
+  assert.equal(priv.ok, true);
+  assert.equal(priv.feed.isPrivate, true);
+  // 第三者ホスト: 入力が true でも false になる (トークン漏洩防止)
+  const pub = validateFeedInput({ id: 'evil', title: 'Evil', url: 'https://example.com/feed', isPrivate: true });
+  assert.equal(pub.ok, true);
+  assert.equal(pub.feed.isPrivate, false);
+  // サブドメインや類似ホストは対象外
+  assert.equal(validateFeedInput({ id: 'sub', title: 'S', url: 'https://x.a.ze.gs/feed', isPrivate: true }).feed.isPrivate, false);
+  assert.equal(validateFeedInput({ id: 'look', title: 'L', url: 'https://a.ze.gs.example.com/feed', isPrivate: true }).feed.isPrivate, false);
+});
+
+test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変更で etag/last_modified だけ消える', () => {
+  const feed = { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech', enabled: true, isPrivate: false };
+  const created = buildFeedRow(feed, null);
+  assert.deepEqual(created, {
+    id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech',
+    enabled: true, is_private: false,
+    etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '',
+  });
+  const existing = {
+    id: 'zenn', title: 'Old', url: 'https://zenn.dev/feed', category: '',
+    enabled: 'TRUE', is_private: 'FALSE',
+    etag: '"abc"', last_modified: 'Wed, 01 Jan 2026 00:00:00 GMT',
+    last_fetched_at: '2026-11-14T00:00:00.000Z', last_status: '200', last_error: '',
+  };
+  const updated = buildFeedRow({ ...feed, title: 'Zenn 2' }, existing);
+  assert.equal(updated.title, 'Zenn 2');
+  assert.equal(updated.etag, '"abc"');
+  assert.equal(updated.last_modified, 'Wed, 01 Jan 2026 00:00:00 GMT');
+  assert.equal(updated.last_fetched_at, '2026-11-14T00:00:00.000Z');
+  assert.equal(updated.last_status, '200');
+  const moved = buildFeedRow({ ...feed, url: 'https://zenn.dev/rss' }, existing);
+  assert.equal(moved.etag, '');
+  assert.equal(moved.last_modified, '');
+  assert.equal(moved.last_fetched_at, '2026-11-14T00:00:00.000Z');
+  assert.equal(moved.last_status, '200');
+});
+
+test('feedRowValues: ヘッダー順に並べ、未知ヘッダーは空文字', () => {
+  const row = buildFeedRow({ id: 'a', title: 'A', url: 'https://example.com/f', category: '', enabled: false, isPrivate: false }, null);
+  assert.deepEqual(feedRowValues(row, ['id', 'url', 'enabled', 'etag']), ['a', 'https://example.com/f', false, '']);
+});
+
+test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
+  const shaped = feedToApiShape({
+    id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', category: 'private',
+    enabled: 'TRUE', is_private: 'TRUE',
+    last_status: '200', last_error: '', last_fetched_at: new Date('2026-11-14T00:15:30.088Z'),
+  }, 7);
+  assert.deepEqual(shaped, {
+    id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', category: 'private',
+    enabled: true, isPrivate: true,
+    lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
+  });
+  assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
+  assert.equal(feedToApiShape({ id: 'x' }).enabled, false);
+});
+
+test('countUnreadByFeed: 状態なしと未読を数え、既読は数えない', () => {
+  const articles = [
+    { id: 'a1', feed_id: 'zenn' },
+    { id: 'a2', feed_id: 'zenn' },
+    { id: 'a3', feed_id: 'zenn' },
+    { id: 'b1', feed_id: 'nhk' },
+    { id: 'b2', feed_id: 'nhk' },
+  ];
+  const states = [
+    { article_id: 'a1', is_read: true, is_starred: false },
+    { article_id: 'a2', is_read: 'FALSE', is_starred: false },
+    { article_id: 'b1', is_read: 'TRUE', is_starred: false },
+  ];
+  assert.deepEqual(countUnreadByFeed(articles, states), { zenn: 2, nhk: 1 });
+  assert.deepEqual(countUnreadByFeed([], []), {});
 });
