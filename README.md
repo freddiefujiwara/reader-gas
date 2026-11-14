@@ -3,6 +3,7 @@
 Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web App)。
 
 - 毎時トリガー `fetchFeeds` が YouTube フィードだけを Data API 経由で巡回し、新着記事を `articles` シートへ追記する (通常の RSS フィードは v2 でクライアント側が取得する)
+- YouTube の音声は ogp と同じ非同期の形で扱う: 毎時巡回で各フィードの最新10本ぶん、a.ze.gs の `yt-audio` コマンドへ音声ストリーム URL の抽出を依頼し、ze 側が抽出結果を `https://a.ze.gs/audio-urls.json` (動画ID → `{url, ts}`) として公開する。RSS 出力 (`?rss=`) はその JSON を読み、抽出から5時間以内のエントリがあるアイテムにだけ enclosure として付ける (音声ファイル自体はどこにも置かない)
 - フロントは `doPost` の JSON API でフィード一覧と記事 (既読状態の初回取り込み用) を読み、フィード管理を行う
 - 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、オーナー本人にだけセッションを発行する
 
@@ -45,6 +46,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 |---|---|---|
 | `SPREADSHEET_ID` | 必須 | 本番シート `reader` (ステージングは `reader-staging`) のID |
 | `YOUTUBE_API_KEY` | YouTube用 | YouTube Data API v3 のキー。YouTube フィードの取り込みに必須 |
+| `A_ZE_GS_TOKEN` | 音声用 | a.ze.gs のコマンド用トークン (`X-Api-Token`)。毎時巡回で音声抽出 (`yt-audio`) を依頼するときに使う。未設定なら依頼だけを省く |
 | `GOOGLE_CLIENT_ID` | 任意 | 設定すると IDトークンの `aud` をピン留めする (tweet-gas と同じ) |
 | `SHARE_TOKEN_HASH` / `SHARE_EXPIRES_AT` | 既存リンク用 | 一時アクセスリンクのハッシュと期限。`exchange_share` が読む。発行手段 (`issue_share`) は廃止したため、既存リンクは期限まで有効だが新規発行はできない |
 
