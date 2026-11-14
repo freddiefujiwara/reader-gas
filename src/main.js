@@ -3,6 +3,8 @@
 // スプレッドシートIDはスクリプトプロパティ SPREADSHEET_ID から読む (コードに直書きしない)。
 // 毎時トリガー fetchFeeds が18フィードを巡回して articles へ追記し、
 // フロントは doPost の list / mark / markAllRead で既読・スターを同期する。
+// フィード管理 (listFeeds / saveFeed / deleteFeed) はオーナー専用とし、
+// is_private は URL のホストが a.ze.gs のときだけ立てる (トークン漏洩防止)。
 // 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、
 // オーナー本人 (ALLOWED_EMAIL) にだけ30日セッションを発行する。
 // セッションは owner_sessions タブにトークンの SHA-256 ハッシュだけを保存し、
@@ -768,6 +770,203 @@ function handleMarkAllRead(body) {
   return { ok: true, marked: count };
 }
 
+// --- Feed management (owner only) ---
+// フィードの追加・編集・削除をフロントの管理画面から行うためのAPI。
+// 純関数のバリデーション/整形を Node テスト対象にし、シート操作は薄く保つ。
+
+const FEED_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const PRIVATE_FEED_HOST = 'a.ze.gs';
+
+function toFeedBool(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  if (typeof value === 'string') {
+    const v = value.trim().toUpperCase();
+    if (v === 'TRUE' || v === '1') return true;
+    if (v === 'FALSE' || v === '0') return false;
+  }
+  return fallback;
+}
+
+// Pure-JS https URL check (Apps Script には URL コンストラクタが無いため正規表現で分解する)。
+// Returns { ok:true, url, host } or { ok:false, message }.
+function parseFeedUrl(rawUrl) {
+  const url = String(rawUrl === undefined || rawUrl === null ? '' : rawUrl).trim();
+  if (!url) return { ok: false, message: 'url is required' };
+  if (/\s/.test(url)) return { ok: false, message: 'url is invalid' };
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]+)([\s\S]*)$/.exec(url);
+  if (!m) return { ok: false, message: 'url is invalid' };
+  if (m[1].toLowerCase() !== 'https') return { ok: false, message: 'url must use https' };
+  let authority = m[2];
+  const at = authority.lastIndexOf('@');
+  if (at >= 0) authority = authority.slice(at + 1);
+  let host = authority;
+  const colon = authority.lastIndexOf(':');
+  if (colon >= 0) {
+    host = authority.slice(0, colon);
+    if (!/^\d+$/.test(authority.slice(colon + 1))) return { ok: false, message: 'url is invalid' };
+  }
+  host = host.toLowerCase();
+  const labels = host.split('.');
+  const hostOk = host.length > 0 && labels.every((l) => /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(l));
+  if (!hostOk) return { ok: false, message: 'url is invalid' };
+  return { ok: true, url, host };
+}
+
+// Validates/normalizes a feed input object.
+// Returns { ok:true, feed:{id,title,url,category,enabled,isPrivate} } or { ok:false, message }.
+// SECURITY: isPrivate は A_ZE_GS_TOKEN ヘッダーの送信先を決めるため、入力値では決めず
+// URL のホストが a.ze.gs そのもののときだけ true に強制する (トークンの外部漏洩防止)。
+function validateFeedInput(input) {
+  if (!input || typeof input !== 'object') return { ok: false, message: 'feed is required' };
+  const id = String(input.id === undefined || input.id === null ? '' : input.id).trim();
+  if (!id) return { ok: false, message: 'id is required' };
+  if (!FEED_ID_PATTERN.test(id)) return { ok: false, message: 'id must be a slug (lowercase letters, digits, hyphens)' };
+  const title = String(input.title === undefined || input.title === null ? '' : input.title).trim();
+  if (!title) return { ok: false, message: 'title is required' };
+  const parsed = parseFeedUrl(input.url);
+  if (!parsed.ok) return { ok: false, message: parsed.message };
+  let category = '';
+  if (input.category !== undefined && input.category !== null) {
+    if (typeof input.category !== 'string') return { ok: false, message: 'category must be a string' };
+    category = input.category.trim();
+  }
+  return {
+    ok: true,
+    feed: {
+      id,
+      title,
+      url: parsed.url,
+      category,
+      enabled: toFeedBool(input.enabled, true),
+      isPrivate: parsed.host === PRIVATE_FEED_HOST,
+    },
+  };
+}
+
+// Builds the feeds-tab row object (snake_case keys) for a normalized feed.
+// On update, etag/last_modified/last_fetched_at/last_status/last_error are preserved,
+// except that a URL change clears etag/last_modified so the next fetch is a full fetch.
+function buildFeedRow(feed, existing) {
+  const prev = existing || null;
+  const urlChanged = !!prev && String(prev.url || '') !== feed.url;
+  const keepCache = !!prev && !urlChanged;
+  return {
+    id: feed.id,
+    title: feed.title,
+    url: feed.url,
+    category: feed.category,
+    enabled: feed.enabled,
+    is_private: feed.isPrivate,
+    etag: keepCache ? String(prev.etag || '') : '',
+    last_modified: keepCache ? String(prev.last_modified || '') : '',
+    last_fetched_at: prev ? cellIso(prev.last_fetched_at) : '',
+    last_status: prev ? String(prev.last_status || '') : '',
+    last_error: prev ? String(prev.last_error || '') : '',
+  };
+}
+
+function feedRowValues(rowObj, headers) {
+  return (headers || FEEDS_HEADERS).map((h) => (rowObj[h] === undefined ? '' : rowObj[h]));
+}
+
+// Shapes a feeds-tab object (or a buildFeedRow result) into the API feed item.
+function feedToApiShape(feedObj, unreadCount) {
+  const f = feedObj || {};
+  const priv = f.is_private !== undefined ? f.is_private : f.isPrivate;
+  const fetched = f.last_fetched_at !== undefined ? f.last_fetched_at : f.lastFetchedAt;
+  const status = f.last_status !== undefined ? f.last_status : f.lastStatus;
+  const error = f.last_error !== undefined ? f.last_error : f.lastError;
+  return {
+    id: String(f.id || ''),
+    title: String(f.title || ''),
+    url: String(f.url || ''),
+    category: String(f.category || ''),
+    enabled: isTruthy(f.enabled),
+    isPrivate: isTruthy(priv),
+    lastStatus: String(status || ''),
+    lastError: String(error || ''),
+    lastFetchedAt: cellIso(fetched),
+    unreadCount: unreadCount || 0,
+  };
+}
+
+// Unread = articles without a read state (no state row, or is_read falsy).
+function countUnreadByFeed(articles, states) {
+  const readById = {};
+  (states || []).forEach((s) => { readById[s.article_id] = isTruthy(s.is_read); });
+  const counts = {};
+  (articles || []).forEach((a) => {
+    const feedId = a.feed_id !== undefined ? a.feed_id : a.feedId;
+    if (!feedId) return;
+    if (!readById[a.id]) counts[feedId] = (counts[feedId] || 0) + 1;
+  });
+  return counts;
+}
+
+function buildListFeedsPayload() {
+  const ss = openDataSpreadsheet();
+  const feeds = readSheetAsObjects(ss, 'feeds');
+  const unreadByFeed = countUnreadByFeed(readSheetAsObjects(ss, 'articles'), readSheetAsObjects(ss, 'states'));
+  return {
+    ok: true,
+    feeds: feeds.filter((f) => f.id).map((f) => feedToApiShape(f, unreadByFeed[f.id] || 0)),
+  };
+}
+
+function handleSaveFeed(body) {
+  const result = validateFeedInput(body ? body.feed : null);
+  if (!result.ok) return { ok: false, error: 'invalid', message: result.message };
+  const feed = result.feed;
+  const ss = openDataSpreadsheet();
+  const sheet = getSheetOrCreate(ss, 'feeds', FEEDS_HEADERS);
+  const values = sheet.getDataRange().getValues();
+  const headers = values.length ? values[0] : FEEDS_HEADERS;
+  const idIdx = headers.indexOf('id');
+  let existing = null;
+  let rowNum = -1;
+  if (idIdx >= 0) {
+    for (let i = 1; i < values.length; i++) {
+      if (String(values[i][idIdx]) !== feed.id) continue;
+      existing = {};
+      headers.forEach((h, idx) => { existing[h] = values[i][idx]; });
+      rowNum = i + 1;
+      break;
+    }
+  }
+  const rowObj = buildFeedRow(feed, existing);
+  const rowValues = feedRowValues(rowObj, headers);
+  if (rowNum > 0) sheet.getRange(rowNum, 1, 1, headers.length).setValues([rowValues]);
+  else sheet.appendRow(rowValues);
+  const unreadByFeed = countUnreadByFeed(readSheetAsObjects(ss, 'articles'), readSheetAsObjects(ss, 'states'));
+  return { ok: true, feed: feedToApiShape(rowObj, existing ? (unreadByFeed[feed.id] || 0) : 0) };
+}
+
+function handleDeleteFeed(body) {
+  const feedId = String((body && (body.feedId || body.feed_id)) || '');
+  const ss = openDataSpreadsheet();
+  const sheet = ss.getSheetByName('feeds');
+  if (!sheet) return { ok: false, error: 'not_found' };
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { ok: false, error: 'not_found' };
+  const headers = values[0];
+  const idIdx = headers.indexOf('id');
+  if (idIdx < 0) return { ok: false, error: 'not_found' };
+  let rowNum = -1;
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][idIdx]) === feedId) { rowNum = i + 1; break; }
+  }
+  if (rowNum < 0) return { ok: false, error: 'not_found' };
+  const articleIds = readSheetAsObjects(ss, 'articles')
+    .filter((a) => String(a.feed_id) === feedId)
+    .map((a) => String(a.id));
+  deleteRowsById(ss, 'states', 'article_id', articleIds);
+  deleteRowsById(ss, 'articles', 'feed_id', [feedId]);
+  sheet.deleteRow(rowNum);
+  return { ok: true };
+}
+
 // --- Web App entry points ---
 
 function jsonOutput(obj) {
@@ -806,6 +1005,18 @@ function doPost(e) {
       const link = issueShareLink();
       return jsonOutput({ ok: true, shareToken: link.shareToken, expiresAt: link.expiresAt });
     }
+    if (action === 'listFeeds') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(buildListFeedsPayload());
+    }
+    if (action === 'saveFeed') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(handleSaveFeed(body));
+    }
+    if (action === 'deleteFeed') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(handleDeleteFeed(body));
+    }
     if (action === 'list') {
       return jsonOutput(buildListPayload(body));
     }
@@ -822,4 +1033,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed };
