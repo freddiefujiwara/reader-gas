@@ -24,6 +24,8 @@ import {
   feedToApiShape,
   countUnreadByFeed,
   remainingRowsAfterDelete,
+  reorderRowsByIds,
+  validateFeedOrder,
 } from '../src/main.js';
 
 test('rowsToObjects: ヘッダーをキーにし空行を飛ばす', () => {
@@ -440,4 +442,73 @@ test('remainingRowsAfterDelete: keyIdx で指定した列で照合する', () =>
     ['zenn', 'a1'],
     ['zenn', 'a3'],
   ]);
+});
+
+test('reorderRowsByIds: feedIds の順に行を並び替え、ヘッダーは先頭のまま', () => {
+  const values = [
+    ['id', 'title'],
+    ['a', 'A'],
+    ['b', 'B'],
+    ['c', 'C'],
+  ];
+  assert.deepEqual(reorderRowsByIds(values, 0, ['c', 'a', 'b']), [
+    ['id', 'title'],
+    ['c', 'C'],
+    ['a', 'A'],
+    ['b', 'B'],
+  ]);
+});
+
+test('reorderRowsByIds: 全件の順列では全行が1回ずつ残り、行の中身は無変更', () => {
+  const values = [
+    ['id', 'title', 'url', 'enabled'],
+    ['a', 'A', 'https://a.example/feed', true],
+    ['b', 'B', 'https://b.example/feed', false],
+    ['c', 'C', 'https://c.example/feed', true],
+    ['d', 'D', 'https://d.example/feed', false],
+  ];
+  const result = reorderRowsByIds(values, 0, ['d', 'c', 'b', 'a']);
+  assert.deepEqual(result, [
+    ['id', 'title', 'url', 'enabled'],
+    ['d', 'D', 'https://d.example/feed', false],
+    ['c', 'C', 'https://c.example/feed', true],
+    ['b', 'B', 'https://b.example/feed', false],
+    ['a', 'A', 'https://a.example/feed', true],
+  ]);
+  // 行そのものは同じ参照 (列の欠落・重複・書き換えがない)
+  assert.equal(result[1], values[4]);
+  assert.equal(result[4], values[1]);
+});
+
+test('reorderRowsByIds: 同じ順序なら入力と同一内容 (no-op)、idIdx の列で照合する', () => {
+  const values = [
+    ['title', 'id'],
+    ['A', 'a'],
+    ['B', 'b'],
+  ];
+  assert.deepEqual(reorderRowsByIds(values, 1, ['a', 'b']), values);
+  assert.deepEqual(reorderRowsByIds(values, 1, ['b', 'a']), [
+    ['title', 'id'],
+    ['B', 'b'],
+    ['A', 'a'],
+  ]);
+});
+
+test('validateFeedOrder: 現在の全IDと集合が一致する順列だけを通す', () => {
+  const current = ['a', 'b', 'c'];
+  assert.deepEqual(validateFeedOrder(['c', 'a', 'b'], current), { ok: true });
+  assert.deepEqual(validateFeedOrder(['a', 'b', 'c'], current), { ok: true });
+  assert.deepEqual(validateFeedOrder([], []), { ok: true });
+  // 配列でない・未指定
+  assert.equal(validateFeedOrder(null, current).ok, false);
+  assert.equal(validateFeedOrder('a,b,c', current).ok, false);
+  // 重複
+  assert.equal(validateFeedOrder(['a', 'a', 'b'], current).ok, false);
+  // 欠け・余分・未知のID
+  assert.equal(validateFeedOrder(['a', 'b'], current).ok, false);
+  assert.equal(validateFeedOrder(['a', 'b', 'c', 'd'], current).ok, false);
+  assert.equal(validateFeedOrder(['a', 'b', 'zzz'], current).ok, false);
+  // 文字列でない要素・空文字
+  assert.equal(validateFeedOrder(['a', 'b', 3], current).ok, false);
+  assert.equal(validateFeedOrder(['a', 'b', ''], current).ok, false);
 });
