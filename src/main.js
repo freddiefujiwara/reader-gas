@@ -469,7 +469,9 @@ function prunePlan(articles, states, nowIso, options) {
     if (starred) return;
     const eligible = !st || isTruthy(st.is_read);
     if (!eligible) return;
-    const t = Date.parse(cellIso(a.published_at) || cellIso(a.fetched_at) || '') || 0;
+    // 経過日数は「取り込んだ日」から数える (公開日が古い動画などを
+    // 取り込んだ瞬間に消してしまわないため)。
+    const t = Date.parse(cellIso(a.fetched_at) || cellIso(a.published_at) || '') || 0;
     const tooOld = t > 0 && now - t > retentionMs;
     const beyondCap = !keepRank[a.id];
     if (tooOld || beyondCap) deleteArticleIds.push(a.id);

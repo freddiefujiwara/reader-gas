@@ -220,6 +220,18 @@ test('prunePlan: 古い既読は削除、未読とスターは保持、孤児sta
   assert.ok(!plan.deleteStateIds.includes('old-starred'));
 });
 
+test('prunePlan: 公開日が古くても取り込みが新しい未読は保持する', () => {
+  const now = '2026-11-14T00:00:00.000Z';
+  const articles = [
+    // YouTube の過去動画のようなケース: 公開は数年前、取り込みは最近。
+    { id: 'yt-old-video', published_at: '2022-06-01T00:00:00.000Z', fetched_at: '2026-11-14T00:00:00.000Z' },
+    // 取り込み自体も古い未読は従来どおり掃除する。
+    { id: 'stale-nostate', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '2026-08-01T00:00:00.000Z' },
+  ];
+  const plan = prunePlan(articles, [], now);
+  assert.deepEqual(plan.deleteArticleIds, ['stale-nostate']);
+});
+
 test('prunePlan: 上限を超えた既読は新しい順を残して削除', () => {
   const now = '2026-11-14T00:00:00.000Z';
   const articles = [
