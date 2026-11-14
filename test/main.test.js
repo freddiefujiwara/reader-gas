@@ -28,6 +28,7 @@ import {
   feedRowValues,
   feedToApiShape,
   countUnreadByFeed,
+  countStarredByFeed,
   remainingRowsAfterDelete,
   reorderRowsByIds,
   validateFeedOrder,
@@ -359,7 +360,7 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
   assert.deepEqual(shaped, {
     id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', category: 'private',
     enabled: true, isPrivate: true,
-    lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
+    lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7, starredCount: 0,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
   assert.equal(feedToApiShape({ id: 'x' }).enabled, false);
@@ -380,6 +381,21 @@ test('countUnreadByFeed: 状態なしと未読を数え、既読は数えない'
   ];
   assert.deepEqual(countUnreadByFeed(articles, states), { zenn: 2, nhk: 1 });
   assert.deepEqual(countUnreadByFeed([], []), {});
+});
+
+test('countStarredByFeed: スター付きだけを数える', () => {
+  const articles = [
+    { id: 'a1', feed_id: 'zenn' },
+    { id: 'a2', feed_id: 'zenn' },
+    { id: 'b1', feed_id: 'nhk' },
+  ];
+  const states = [
+    { article_id: 'a1', is_read: true, is_starred: true },
+    { article_id: 'a2', is_read: false, is_starred: 'FALSE' },
+    { article_id: 'b1', is_read: false, is_starred: 'TRUE' },
+  ];
+  assert.deepEqual(countStarredByFeed(articles, states), { zenn: 1, nhk: 1 });
+  assert.deepEqual(countStarredByFeed([], []), {});
 });
 
 test('remainingRowsAfterDelete: 一致した行だけを取り除き、ヘッダーは残す', () => {
