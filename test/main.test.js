@@ -16,6 +16,7 @@ import {
   isSessionExpired,
   prunePlan,
   filterArticles,
+  feedIdsForCategory,
   toFeedBool,
   parseFeedUrl,
   validateFeedInput,
@@ -511,4 +512,26 @@ test('validateFeedOrder: 現在の全IDと集合が一致する順列だけを�
   // 文字列でない要素・空文字
   assert.equal(validateFeedOrder(['a', 'b', 3], current).ok, false);
   assert.equal(validateFeedOrder(['a', 'b', ''], current).ok, false);
+});
+
+test('feedIdsForCategory: カテゴリに属する id を返す', () => {
+  const feeds = [
+    { id: 'a', category: '楽天' },
+    { id: 'b', category: '投資・FIRE' },
+    { id: 'c', category: '楽天' },
+    { id: 'd', category: '' },
+  ];
+  assert.deepEqual(feedIdsForCategory(feeds, '楽天'), ['a', 'c']);
+  assert.deepEqual(feedIdsForCategory(feeds, ''), []);
+  assert.deepEqual(feedIdsForCategory(feeds, '無し'), []);
+});
+
+test('filterArticles: feedIds でカテゴリ単位に絞る', () => {
+  const articles = [
+    { id: '1', feedId: 'a', publishedAt: '2026-01-03T00:00:00.000Z', isRead: false, isStarred: false },
+    { id: '2', feedId: 'b', publishedAt: '2026-01-02T00:00:00.000Z', isRead: false, isStarred: false },
+    { id: '3', feed_id: 'c', publishedAt: '2026-01-01T00:00:00.000Z', isRead: false, isStarred: false },
+  ];
+  assert.deepEqual(filterArticles(articles, { feedIds: ['a', 'c'] }).map((x) => x.id), ['1', '3']);
+  assert.deepEqual(filterArticles(articles, { feedIds: [] }), []);
 });

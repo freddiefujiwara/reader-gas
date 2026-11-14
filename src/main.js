@@ -711,10 +711,25 @@ function setupFetchTrigger() {
 
 // --- Article listing / state changes ---
 
+// カテゴリに属するフィードの id 一覧 (カテゴリ絞り込み用)。
+function feedIdsForCategory(feeds, category) {
+  const target = String(category || '').trim();
+  if (!target) return [];
+  return (feeds || [])
+    .filter((f) => String(f.category || '').trim() === target)
+    .map((f) => String(f.id || ''))
+    .filter((id) => id);
+}
+
 function filterArticles(articles, options) {
   const opts = options || {};
   let out = (articles || []).slice();
   if (opts.feedId) out = out.filter((a) => a.feed_id === opts.feedId || a.feedId === opts.feedId);
+  if (Array.isArray(opts.feedIds)) {
+    const allowed = {};
+    opts.feedIds.forEach((id) => { allowed[id] = true; });
+    out = out.filter((a) => allowed[a.feed_id || a.feedId]);
+  }
   if (opts.filter === 'unread') out = out.filter((a) => !a.isRead);
   if (opts.filter === 'starred') out = out.filter((a) => a.isStarred);
   out.sort((a, b) => {
@@ -753,8 +768,10 @@ function buildListPayload(body) {
   merged.forEach((a) => {
     if (!a.isRead) unreadByFeed[a.feedId] = (unreadByFeed[a.feedId] || 0) + 1;
   });
+  const category = body.category ? String(body.category).trim() : '';
   const filtered = filterArticles(merged, {
     feedId: body.feedId ? String(body.feedId) : '',
+    feedIds: category ? feedIdsForCategory(feeds, category) : null,
     filter: ['unread', 'starred'].indexOf(body.filter) >= 0 ? body.filter : 'all',
   });
   let limit = Number(body.limit || 100);
@@ -826,7 +843,14 @@ function handleMark(body) {
 function handleMarkAllRead(body) {
   const ss = openDataSpreadsheet();
   const feedId = body.feedId ? String(body.feedId) : '';
-  const articles = readSheetAsObjects(ss, 'articles').filter((a) => !feedId || a.feed_id === feedId);
+  const category = body.category ? String(body.category).trim() : '';
+  let categoryIds = null;
+  if (category) {
+    categoryIds = {};
+    feedIdsForCategory(readSheetAsObjects(ss, 'feeds'), category).forEach((id) => { categoryIds[id] = true; });
+  }
+  const articles = readSheetAsObjects(ss, 'articles').filter((a) =>
+    (!feedId || a.feed_id === feedId) && (!categoryIds || categoryIds[a.feed_id]));
   let count = 0;
   articles.forEach((a) => { upsertState(ss, a.id, { isRead: true }); count++; });
   return { ok: true, marked: count };
@@ -1128,4 +1152,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
