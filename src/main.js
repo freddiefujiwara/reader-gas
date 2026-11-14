@@ -20,6 +20,10 @@
 // 既存シートの ID 付け替えは後続フェーズで行うため、当面は slug ID の行も混在する。
 // 有効/無効 (enabled) は廃止し、feeds タブの列自体も撤去した (全10列)。
 // 巡回・一覧・保存のどこでも参照しない。
+// YouTube の保存形はチャンネルページ URL (/channel/UC...) に統一する。
+// videos.xml 形・/@handle 形で登録されても保存時に正規形へ寄せる
+// (handleSaveFeed)。ハンドルは channels.list の forHandle で解決し、
+// タイトルも補完する。既存行の videos.xml 形は別フェーズで移行する。
 
 const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
@@ -229,12 +233,49 @@ function toIsoDate(value) {
 
 // --- YouTube (Data API v3) ---
 // 公式RSS (feeds/videos.xml) が 404 を返すため、YouTube のチャンネルフィードは
-// Data API v3 の uploads プレイリストから取り込む。フィード行の URL は従来どおり
-// videos.xml の形を保ち、ここで channel_id を抜き出して振り分ける。
+// Data API v3 の uploads プレイリストから取り込む。フィード行の保存形は
+// チャンネルページ URL (/channel/UC...) に統一し、旧来の videos.xml 形の行は
+// 移行が済むまで混在する。両形ともここで channel_id を抜き出して振り分ける。
 
+// 保存形 (/channel/UC...) から channel_id を抜く。巡回振り分け・?rss= 出力・
+// buildFetchUrl・タイトル空の例外判定はすべてこの関数経由で判定する。
 function youtubeChannelIdFromUrl(url) {
+  const s = String(url || '');
+  const page = /^https:\/\/(?:www\.)?youtube\.com\/channel\/(UC[\w-]{10,})/.exec(s);
+  if (page) return page[1];
+  // 移行期間中のみ: videos.xml 形式の互換。移行完了後に削除する。
+  return youtubeChannelIdFromLegacyUrl(s);
+}
+
+// 移行期間中のみ: 旧来の videos.xml 形式から channel_id を抜く互換ヘルパー。
+// シート移行が完了したら、この関数と youtubeChannelIdFromUrl 内の
+// フォールバック呼び出しを削除する (それ以外の経路は保存形だけを見る)。
+function youtubeChannelIdFromLegacyUrl(url) {
   const m = /^https:\/\/(?:www\.)?youtube\.com\/feeds\/videos\.xml\?[^#]*\bchannel_id=(UC[\w-]{10,})/.exec(String(url || ''));
   return m ? m[1] : '';
+}
+
+// シートに保存する正規形の YouTube フィード URL (チャンネルページ URL) を
+// チャンネルIDから組み立てる。フィードID (URL のハッシュ) はこの形から
+// 決めるため、登録経路が違っても保存形は必ずこれに寄せる。
+function youtubeFeedUrlFromChannelId(channelId) {
+  return 'https://www.youtube.com/channel/' + String(channelId || '');
+}
+
+// YouTube のチャンネルページ URL を判別する (登録時の入力専用)。
+//   https://www.youtube.com/channel/UC...  -> { kind:'id', channelId }
+//   https://www.youtube.com/@handle        -> { kind:'handle', handle } (先頭の @ は含めない)
+// ハンドルは末尾のパス (/videos 等) や末尾スラッシュを落として正規化する。
+// 旧来の /c/ や /user/ 形式は解決手段が無いため対象外とし、null を返す
+// (呼び出し側では通常の URL 検証に落ちて従来どおり弾かれる)。
+// チャンネルページでも videos.xml でもない URL は null。
+function parseYouTubeChannelUrl(url) {
+  const s = String(url || '').trim();
+  const idMatch = /^https:\/\/(?:www\.)?youtube\.com\/channel\/(UC[\w-]{10,})(?:\/[^?#]*)?(?:[?#][\s\S]*)?$/.exec(s);
+  if (idMatch) return { kind: 'id', channelId: idMatch[1] };
+  const handleMatch = /^https:\/\/(?:www\.)?youtube\.com\/@([A-Za-z0-9._-]+)(?:\/[^?#]*)?(?:[?#][\s\S]*)?$/.exec(s);
+  if (handleMatch) return { kind: 'handle', handle: handleMatch[1] };
+  return null;
 }
 
 // YouTube API のエラー応答から、原因が分かる短い文言だけを取り出す
@@ -292,6 +333,38 @@ function parseYouTubeChannelTitle(jsonText) {
   const items = data && Array.isArray(data.items) ? data.items : [];
   const sn = (items[0] && items[0].snippet) || {};
   return String(sn.title || '').trim();
+}
+
+// channels.list の応答から { channelId, title } を取り出す (登録時の
+// ハンドル解決用)。先頭の item の id と snippet.title を使い、
+// item が無い・id が無い・JSON が壊れている場合は null。
+function parseChannelLookupResponse(jsonText) {
+  let data;
+  try { data = JSON.parse(String(jsonText || '')); } catch (e) { return null; }
+  const items = data && Array.isArray(data.items) ? data.items : [];
+  const first = items[0] || null;
+  const channelId = first ? String(first.id || '').trim() : '';
+  if (!channelId) return null;
+  const sn = (first && first.snippet) || {};
+  return { channelId, title: String(sn.title || '').trim() };
+}
+
+// ハンドルから channels.list?forHandle= でチャンネルを引く (登録時専用)。
+// APIキーが無い・HTTPエラー・該当なし・例外はすべて null (解決失敗) とする。
+// handleSaveFeed からは差し替え可能な resolver として呼ばれる。
+function lookupYouTubeChannelByHandle(handle) {
+  try {
+    const apiKey = PropertiesService.getScriptProperties().getProperty('YOUTUBE_API_KEY');
+    if (!apiKey) return null;
+    const apiUrl = 'https://www.googleapis.com/youtube/v3/channels?part=snippet'
+      + '&forHandle=' + encodeURIComponent('@' + String(handle || ''))
+      + '&key=' + encodeURIComponent(apiKey);
+    const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return null;
+    return parseChannelLookupResponse(res.getContentText());
+  } catch (e) {
+    return null;
+  }
 }
 
 // --- YouTube RSS 出力 (v2: 取得をクライアントへ寄せるための出口) ---
@@ -890,8 +963,37 @@ function buildListFeedsPayload() {
   };
 }
 
-function handleSaveFeed(body) {
-  const result = validateFeedInput(body ? body.feed : null);
+// resolveHandle はテスト用の差し込み口 (省略時は Data API で引く
+// lookupYouTubeChannelByHandle)。ハンドル -> { channelId, title } | null。
+function handleSaveFeed(body, resolveHandle) {
+  const input = body && body.feed && typeof body.feed === 'object' ? { ...body.feed } : (body ? body.feed : null);
+  // YouTube の入力は、検証の前にすべて保存形 (/channel/UC...) へ寄せる。
+  // /channel/ 形と旧来の videos.xml 形は URL から直接 ID を抜けるため
+  // ネットワーク不要。/@handle 形だけ Data API で解決し、失敗したら
+  // 何も書かずに弾く。保存形を一本化することで、どの形で再登録しても
+  // 重複判定が同じ行に当たるようになる。
+  // (videos.xml 形の正規化は youtubeChannelIdFromUrl の移行互換に乗って
+  //  いる。移行完了後に削除する。)
+  const channelRef = input ? parseYouTubeChannelUrl(input.url) : null;
+  const directChannelId = channelRef && channelRef.kind === 'id'
+    ? channelRef.channelId
+    : (!channelRef && input ? youtubeChannelIdFromUrl(input.url) : '');
+  if (channelRef || directChannelId) {
+    let channelId = directChannelId;
+    let resolvedTitle = '';
+    if (channelRef && channelRef.kind === 'handle') {
+      const resolve = resolveHandle || lookupYouTubeChannelByHandle;
+      const found = resolve(channelRef.handle);
+      if (!found || !String(found.channelId || '').trim()) {
+        return { ok: false, error: 'invalid', message: 'YouTube チャンネルが見つかりませんでした' };
+      }
+      channelId = String(found.channelId).trim();
+      resolvedTitle = String(found.title || '').trim();
+    }
+    input.url = youtubeFeedUrlFromChannelId(channelId);
+    if (resolvedTitle && !String(input.title || '').trim()) input.title = resolvedTitle;
+  }
+  const result = validateFeedInput(input);
   if (!result.ok) return { ok: false, error: 'invalid', message: result.message };
   const feed = result.feed;
   const ss = openDataSpreadsheet();
@@ -919,6 +1021,18 @@ function handleSaveFeed(body) {
   if (!existing && urlIdx >= 0) {
     for (let i = 1; i < values.length; i++) {
       if (String(values[i][urlIdx]) === feed.url) { existing = rowAt(i); rowNum = i + 1; break; }
+    }
+  }
+  // 2b) YouTube は、保存形が違う行でもチャンネルIDが一致すれば同じ行の
+  //     更新として扱う (クロスフォームな重複を作らないため)。行の ID は
+  //     維持し、URL は正規形へ書き換わる。旧 videos.xml 形の行との一致は
+  //     移行期間中のみ (youtubeChannelIdFromUrl の互換に依存)。
+  if (!existing && urlIdx >= 0) {
+    const feedChannelId = youtubeChannelIdFromUrl(feed.url);
+    if (feedChannelId) {
+      for (let i = 1; i < values.length; i++) {
+        if (youtubeChannelIdFromUrl(values[i][urlIdx]) === feedChannelId) { existing = rowAt(i); rowNum = i + 1; break; }
+      }
     }
   }
   if (existing) {
@@ -1067,4 +1181,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeChannelIdFromLegacyUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };

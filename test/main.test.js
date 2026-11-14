@@ -21,9 +21,13 @@ import {
   buildListPayload,
   selectFetchTargets,
   youtubeChannelIdFromUrl,
+  youtubeChannelIdFromLegacyUrl,
+  youtubeFeedUrlFromChannelId,
+  parseYouTubeChannelUrl,
   youtubeUploadsPlaylistId,
   parseYouTubePlaylistItems,
   parseYouTubeChannelTitle,
+  parseChannelLookupResponse,
   youtubeApiErrorDetail,
   escapeXml,
   videoIdFromLink,
@@ -462,6 +466,121 @@ test('youtubeChannelIdFromUrl: videos.xml の URL から channel_id を抜く', 
   );
   assert.equal(youtubeChannelIdFromUrl('https://example.com/feed.xml'), '');
   assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/feeds/videos.xml?user=someone'), '');
+});
+
+test('youtubeChannelIdFromUrl: 保存形 (/channel/UC...) からも channel_id を抜く', () => {
+  assert.equal(
+    youtubeChannelIdFromUrl('https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A'),
+    'UCxNfaRC6MbAnwSR1Dqqv69A'
+  );
+  assert.equal(
+    youtubeChannelIdFromUrl('https://youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A/videos'),
+    'UCxNfaRC6MbAnwSR1Dqqv69A'
+  );
+  // ハンドル形式や視聴 URL はチャンネル ID を含まないので対象外。
+  assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/@rakutentech'), '');
+  assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/watch?v=abc123'), '');
+  assert.equal(youtubeChannelIdFromUrl(''), '');
+  assert.equal(youtubeChannelIdFromUrl(null), '');
+});
+
+test('youtubeChannelIdFromLegacyUrl: 移行互換として videos.xml 形だけを見る', () => {
+  assert.equal(
+    youtubeChannelIdFromLegacyUrl('https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A'),
+    'UCxNfaRC6MbAnwSR1Dqqv69A'
+  );
+  assert.equal(youtubeChannelIdFromLegacyUrl('https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A'), '');
+});
+
+test('youtubeFeedUrlFromChannelId: 保存形のチャンネルページ URL を組み立てる', () => {
+  assert.equal(
+    youtubeFeedUrlFromChannelId('UCxNfaRC6MbAnwSR1Dqqv69A'),
+    'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A'
+  );
+  // 組み立てた URL からは youtubeChannelIdFromUrl で ID を取り戻せる。
+  assert.equal(
+    youtubeChannelIdFromUrl(youtubeFeedUrlFromChannelId('UCxNfaRC6MbAnwSR1Dqqv69A')),
+    'UCxNfaRC6MbAnwSR1Dqqv69A'
+  );
+});
+
+test('parseYouTubeChannelUrl: /channel/ 形は kind:id で ID を返す', () => {
+  assert.deepEqual(
+    parseYouTubeChannelUrl('https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A'),
+    { kind: 'id', channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A' }
+  );
+  assert.deepEqual(
+    parseYouTubeChannelUrl('https://youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A'),
+    { kind: 'id', channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A' }
+  );
+  // 末尾のパスやクエリが付いていても ID は同じ。
+  assert.deepEqual(
+    parseYouTubeChannelUrl('https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A/videos'),
+    { kind: 'id', channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A' }
+  );
+  assert.deepEqual(
+    parseYouTubeChannelUrl('https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A?hl=ja'),
+    { kind: 'id', channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A' }
+  );
+});
+
+test('parseYouTubeChannelUrl: /@handle 形は kind:handle で末尾を正規化して返す', () => {
+  assert.deepEqual(
+    parseYouTubeChannelUrl('https://www.youtube.com/@rakutentech'),
+    { kind: 'handle', handle: 'rakutentech' }
+  );
+  // ドット・アンダースコア・ハイフンを含むハンドル、末尾パス・末尾スラッシュ・クエリ。
+  assert.deepEqual(
+    parseYouTubeChannelUrl('https://www.youtube.com/@some.handle_name-1/videos'),
+    { kind: 'handle', handle: 'some.handle_name-1' }
+  );
+  assert.deepEqual(
+    parseYouTubeChannelUrl('https://www.youtube.com/@rakutentech/'),
+    { kind: 'handle', handle: 'rakutentech' }
+  );
+  assert.deepEqual(
+    parseYouTubeChannelUrl('https://youtube.com/@rakutentech?hl=ja'),
+    { kind: 'handle', handle: 'rakutentech' }
+  );
+});
+
+test('parseYouTubeChannelUrl: 対象外の URL は null', () => {
+  // videos.xml 形はチャンネルページではない (互換は youtubeChannelIdFromLegacyUrl 側)。
+  assert.equal(parseYouTubeChannelUrl('https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A'), null);
+  // 旧来の /c/ ・ /user/ 形式は解決手段が無いため対象外。
+  assert.equal(parseYouTubeChannelUrl('https://www.youtube.com/c/SomeChannel'), null);
+  assert.equal(parseYouTubeChannelUrl('https://www.youtube.com/user/SomeUser'), null);
+  assert.equal(parseYouTubeChannelUrl('https://www.youtube.com/watch?v=abc123'), null);
+  assert.equal(parseYouTubeChannelUrl('https://example.com/@rakutentech'), null);
+  assert.equal(parseYouTubeChannelUrl('http://www.youtube.com/@rakutentech'), null);
+  assert.equal(parseYouTubeChannelUrl('https://www.youtube.com/@'), null);
+  assert.equal(parseYouTubeChannelUrl(''), null);
+  assert.equal(parseYouTubeChannelUrl(null), null);
+  assert.equal(parseYouTubeChannelUrl(undefined), null);
+});
+
+test('parseChannelLookupResponse: channels.list 応答から ID とタイトルを抜く', () => {
+  const body = JSON.stringify({
+    items: [{ id: 'UCxNfaRC6MbAnwSR1Dqqv69A', snippet: { title: ' 正式チャンネル名 ' } }],
+  });
+  assert.deepEqual(parseChannelLookupResponse(body), {
+    channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A',
+    title: '正式チャンネル名',
+  });
+  // snippet が無ければタイトルは空で返す。
+  assert.deepEqual(
+    parseChannelLookupResponse(JSON.stringify({ items: [{ id: 'UCxNfaRC6MbAnwSR1Dqqv69A' }] })),
+    { channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A', title: '' }
+  );
+});
+
+test('parseChannelLookupResponse: 該当なし・壊れた応答は null', () => {
+  assert.equal(parseChannelLookupResponse(JSON.stringify({ items: [] })), null);
+  assert.equal(parseChannelLookupResponse(JSON.stringify({})), null);
+  assert.equal(parseChannelLookupResponse(JSON.stringify({ items: [{ snippet: { title: 'x' } }] })), null);
+  assert.equal(parseChannelLookupResponse('not json'), null);
+  assert.equal(parseChannelLookupResponse(''), null);
+  assert.equal(parseChannelLookupResponse(null), null);
 });
 
 test('selectFetchTargets: YouTube フィードだけを巡回対象にする', () => {
@@ -1438,15 +1557,19 @@ test('handleSaveFeed: id 指定の更新は行を書き換え、10列で保存�
 
 test('handleSaveFeed: YouTube はタイトル空で追加でき、通常フィードは弾く', () => {
   const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const canonical = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
   const { ss, restore } = saveFeedEnv([]);
   try {
     const yt = handleSaveFeed({ feed: { url: ytUrl } });
     assert.equal(yt.ok, true);
     assert.equal(yt.feed.title, '');
-    assert.equal(yt.feed.id, feedIdFromUrl(ytUrl));
+    // videos.xml 形で登録しても、保存形 (/channel/) に寄せてから ID を決める。
+    assert.equal(yt.feed.id, feedIdFromUrl(canonical));
+    assert.equal(yt.feed.url, canonical);
     const rows = ss.sheets['feeds'].rows;
     assert.equal(rows.length, 2);
     assert.equal(rows[1][1], '');
+    assert.equal(rows[1][2], canonical);
     const rss = handleSaveFeed({ feed: { url: 'https://example.com/feed' } });
     assert.equal(rss.ok, false);
     assert.equal(ss.sheets['feeds'].rows.length, 2);
@@ -1467,6 +1590,177 @@ test('handleSaveFeed: ハッシュ衝突 (同じ ID・別 URL の行がある) �
     const rows = ss.sheets['feeds'].rows;
     assert.equal(rows.length, 2);
     assert.equal(rows[1][2], 'https://example.com/feed-a');
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: /channel/ 形の登録はそのまま保存形になり、resolver は呼ばない', () => {
+  const canonical = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    let resolverCalls = 0;
+    const resolver = () => { resolverCalls++; return null; };
+    const res = handleSaveFeed({ feed: { url: canonical } }, resolver);
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.id, feedIdFromUrl(canonical));
+    assert.equal(res.feed.url, canonical);
+    assert.equal(resolverCalls, 0);
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][2], canonical);
+    // 末尾パス付きで登録しても裸の保存形に寄せる
+    const res2 = handleSaveFeed({ feed: { url: canonical + '/videos', title: '付け替え' } }, resolver);
+    assert.equal(res2.ok, true);
+    assert.equal(res2.feed.url, canonical);
+    assert.equal(ss.sheets['feeds'].rows.length, 2);
+    assert.equal(resolverCalls, 0);
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: /@handle 形は resolver で解決し、保存形・タイトル・ID を寄せる', () => {
+  const canonical = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    const seenHandles = [];
+    const resolver = (handle) => {
+      seenHandles.push(handle);
+      return { channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A', title: '解決したチャンネル名' };
+    };
+    const res = handleSaveFeed({ feed: { url: 'https://www.youtube.com/@rakutentech/videos', category: 'video' } }, resolver);
+    assert.equal(res.ok, true);
+    // resolver には @ を含まない裸のハンドルが渡る
+    assert.deepEqual(seenHandles, ['rakutentech']);
+    assert.equal(res.feed.id, feedIdFromUrl(canonical));
+    assert.equal(res.feed.url, canonical);
+    // 入力タイトルが空なら、解決したタイトルで補完する
+    assert.equal(res.feed.title, '解決したチャンネル名');
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][1], '解決したチャンネル名');
+    assert.equal(rows[1][2], canonical);
+    assert.equal(rows[1][3], 'video');
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: /@handle 形でも入力タイトルがあればそちらを優先する', () => {
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    const resolver = () => ({ channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A', title: '解決したチャンネル名' });
+    const res = handleSaveFeed({ feed: { url: 'https://www.youtube.com/@rakutentech', title: '自分の付けた名前' } }, resolver);
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.title, '自分の付けた名前');
+    assert.equal(ss.sheets['feeds'].rows[1][1], '自分の付けた名前');
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: /@handle の解決に失敗したら何も書かずに弾く', () => {
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    const res = handleSaveFeed({ feed: { url: 'https://www.youtube.com/@no-such-handle' } }, () => null);
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'invalid');
+    assert.equal(res.message, 'YouTube チャンネルが見つかりませんでした');
+    // channelId が空の解決結果も失敗として扱う
+    const res2 = handleSaveFeed({ feed: { url: 'https://www.youtube.com/@no-such-handle' } }, () => ({ channelId: '', title: 'x' }));
+    assert.equal(res2.ok, false);
+    assert.equal(ss.sheets['feeds'].rows.length, 1);
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: 別形で再登録してもチャンネルIDが一致すれば既存行を更新する (クロスフォーム重複防止)', () => {
+  const legacyUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const canonical = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
+  const legacyId = feedIdFromUrl(legacyUrl);
+  const { ss, restore } = saveFeedEnv([
+    [legacyId, '既存タイトル', legacyUrl, '', 'FALSE', '', '', '', '200', ''],
+  ]);
+  try {
+    // /channel/ 形で再登録: 旧形の行が更新され、行は増えない。URL は保存形へ。
+    const res = handleSaveFeed({ feed: { url: canonical, category: 'video' } });
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.id, legacyId);
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][0], legacyId);
+    assert.equal(rows[1][1], '既存タイトル');
+    assert.equal(rows[1][2], canonical);
+    assert.equal(rows[1][3], 'video');
+    // /@handle 形で再登録しても同じ行に当たる。タイトルは解決した
+    // チャンネル名で補完されてから更新判定に入るため、現在の名前に寄る。
+    const res2 = handleSaveFeed(
+      { feed: { url: 'https://www.youtube.com/@rakutentech' } },
+      () => ({ channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A', title: '解決したチャンネル名' })
+    );
+    assert.equal(res2.ok, true);
+    assert.equal(res2.feed.id, legacyId);
+    assert.equal(ss.sheets['feeds'].rows.length, 2);
+    assert.equal(ss.sheets['feeds'].rows[1][1], '解決したチャンネル名');
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: 既定 resolver は channels.list?forHandle= を引き、保存形で登録する', () => {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW],
+    articles: [ARTICLE_HEADERS_ROW],
+    states: [STATE_HEADERS_ROW],
+  });
+  const fetchedUrls = [];
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key' }).service,
+    UrlFetchApp: {
+      fetch: (url) => {
+        fetchedUrls.push(url);
+        return {
+          getResponseCode: () => 200,
+          getContentText: () => JSON.stringify({
+            items: [{ id: 'UCxNfaRC6MbAnwSR1Dqqv69A', snippet: { title: 'API のチャンネル名' } }],
+          }),
+        };
+      },
+    },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const res = handleSaveFeed({ feed: { url: 'https://www.youtube.com/@rakutentech' } });
+    assert.equal(res.ok, true);
+    assert.equal(fetchedUrls.length, 1);
+    assert.match(fetchedUrls[0], /\/youtube\/v3\/channels\?part=snippet/);
+    assert.ok(fetchedUrls[0].includes('forHandle=%40rakutentech'));
+    assert.equal(res.feed.url, 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A');
+    assert.equal(res.feed.title, 'API のチャンネル名');
+    assert.equal(ss.sheets['feeds'].rows.length, 2);
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: 既定 resolver は APIキーが無い・該当が無い場合に登録を弾く', () => {
+  // APIキー未設定 (saveFeedEnv のプロパティには YOUTUBE_API_KEY が無い)
+  const noKey = saveFeedEnv([]);
+  try {
+    const res = handleSaveFeed({ feed: { url: 'https://www.youtube.com/@rakutentech' } });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'invalid');
+    assert.equal(res.message, 'YouTube チャンネルが見つかりませんでした');
+    assert.equal(noKey.ss.sheets['feeds'].rows.length, 1);
+  } finally { noKey.restore(); }
+  // キーはあるが channels.list が空を返す
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW],
+    articles: [ARTICLE_HEADERS_ROW],
+    states: [STATE_HEADERS_ROW],
+  });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key' }).service,
+    UrlFetchApp: {
+      fetch: () => ({ getResponseCode: () => 200, getContentText: () => JSON.stringify({ items: [] }) }),
+    },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const res = handleSaveFeed({ feed: { url: 'https://www.youtube.com/@no-such-handle' } });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'invalid');
+    assert.equal(ss.sheets['feeds'].rows.length, 1);
   } finally { restore(); }
 });
 
