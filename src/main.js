@@ -853,8 +853,10 @@ function buildListPayload(body) {
     };
   });
   const unreadByFeed = {};
+  const starredByFeed = {};
   merged.forEach((a) => {
     if (!a.isRead) unreadByFeed[a.feedId] = (unreadByFeed[a.feedId] || 0) + 1;
+    if (a.isStarred) starredByFeed[a.feedId] = (starredByFeed[a.feedId] || 0) + 1;
   });
   const category = body.category ? String(body.category).trim() : '';
   const filtered = filterArticles(merged, {
@@ -878,6 +880,7 @@ function buildListPayload(body) {
       category: String(f.category || ''),
       isPrivate: isTruthy(f.is_private),
       unreadCount: unreadByFeed[f.id] || 0,
+      starredCount: starredByFeed[f.id] || 0,
     })),
     generatedAt: new Date().toISOString(),
   };
@@ -1046,7 +1049,7 @@ function feedRowValues(rowObj, headers) {
 }
 
 // Shapes a feeds-tab object (or a buildFeedRow result) into the API feed item.
-function feedToApiShape(feedObj, unreadCount) {
+function feedToApiShape(feedObj, unreadCount, starredCount) {
   const f = feedObj || {};
   const priv = f.is_private !== undefined ? f.is_private : f.isPrivate;
   const fetched = f.last_fetched_at !== undefined ? f.last_fetched_at : f.lastFetchedAt;
@@ -1063,6 +1066,7 @@ function feedToApiShape(feedObj, unreadCount) {
     lastError: String(error || ''),
     lastFetchedAt: cellIso(fetched),
     unreadCount: unreadCount || 0,
+    starredCount: starredCount || 0,
   };
 }
 
@@ -1079,13 +1083,30 @@ function countUnreadByFeed(articles, states) {
   return counts;
 }
 
+// Starred = articles whose state row has is_starred truthy.
+function countStarredByFeed(articles, states) {
+  const starredById = {};
+  (states || []).forEach((s) => { starredById[s.article_id] = isTruthy(s.is_starred); });
+  const counts = {};
+  (articles || []).forEach((a) => {
+    if (!a || !a.id) return;
+    const feedId = a.feed_id !== undefined ? a.feed_id : a.feedId;
+    if (!feedId) return;
+    if (starredById[a.id]) counts[feedId] = (counts[feedId] || 0) + 1;
+  });
+  return counts;
+}
+
 function buildListFeedsPayload() {
   const ss = openDataSpreadsheet();
   const feeds = readSheetAsObjects(ss, 'feeds');
-  const unreadByFeed = countUnreadByFeed(readSheetAsObjects(ss, 'articles'), readSheetAsObjects(ss, 'states'));
+  const articleRows = readSheetAsObjects(ss, 'articles');
+  const stateRows = readSheetAsObjects(ss, 'states');
+  const unreadByFeed = countUnreadByFeed(articleRows, stateRows);
+  const starredByFeed = countStarredByFeed(articleRows, stateRows);
   return {
     ok: true,
-    feeds: feeds.filter((f) => f.id).map((f) => feedToApiShape(f, unreadByFeed[f.id] || 0)),
+    feeds: feeds.filter((f) => f.id).map((f) => feedToApiShape(f, unreadByFeed[f.id] || 0, starredByFeed[f.id] || 0)),
   };
 }
 
@@ -1240,4 +1261,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, countStarredByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
