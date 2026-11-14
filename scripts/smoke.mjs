@@ -48,7 +48,7 @@ function parseJson(text) {
 {
   const { text } = await getText(EXEC_URL + '?rss=' + YT_FEED_ID);
   check('?rss=' + YT_FEED_ID + ' が XML で始まる', text.startsWith('<?xml'), text.slice(0, 80));
-  check('RSS 2.0 である', text.includes('<rss version="2.0">'));
+  check('RSS 2.0 である', text.includes('<rss version="2.0"'));
   const items = text.match(/<item>/g) || [];
   check('item が1件以上ある', items.length >= 1, 'items=' + items.length);
   const guid = /<guid[^>]*>([^<]+)<\/guid>/.exec(text);
