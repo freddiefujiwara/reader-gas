@@ -23,6 +23,7 @@ import {
   feedRowValues,
   feedToApiShape,
   countUnreadByFeed,
+  remainingRowsAfterDelete,
 } from '../src/main.js';
 
 test('rowsToObjects: ヘッダーをキーにし空行を飛ばす', () => {
@@ -372,4 +373,71 @@ test('countUnreadByFeed: 状態なしと未読を数え、既読は数えない'
   ];
   assert.deepEqual(countUnreadByFeed(articles, states), { zenn: 2, nhk: 1 });
   assert.deepEqual(countUnreadByFeed([], []), {});
+});
+
+test('remainingRowsAfterDelete: 一致した行だけを取り除き、ヘッダーは残す', () => {
+  const values = [
+    ['id', 'title'],
+    ['a', 'A'],
+    ['b', 'B'],
+    ['c', 'C'],
+  ];
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, ['b']), [
+    ['id', 'title'],
+    ['a', 'A'],
+    ['c', 'C'],
+  ]);
+  // 複数 id
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, ['a', 'c']), [
+    ['id', 'title'],
+    ['b', 'B'],
+  ]);
+  // 全行削除でもヘッダーは残る
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, ['a', 'b', 'c']), [['id', 'title']]);
+});
+
+test('remainingRowsAfterDelete: id は String() で比較する（数値セル・数値 id）', () => {
+  const values = [
+    ['id', 'title'],
+    [123, 'A'],
+    ['456', 'B'],
+  ];
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, ['123']), [
+    ['id', 'title'],
+    ['456', 'B'],
+  ]);
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, [456]), [
+    ['id', 'title'],
+    [123, 'A'],
+  ]);
+});
+
+test('remainingRowsAfterDelete: 一致なし・空 ids では元の行をそのまま返す', () => {
+  const values = [
+    ['id', 'title'],
+    ['a', 'A'],
+    ['b', 'B'],
+  ];
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, ['zzz']), values);
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, []), values);
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, null), values);
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, undefined), values);
+});
+
+test('remainingRowsAfterDelete: keyIdx で指定した列で照合する', () => {
+  const values = [
+    ['feed_id', 'id'],
+    ['zenn', 'a1'],
+    ['nhk', 'a2'],
+    ['zenn', 'a3'],
+  ];
+  assert.deepEqual(remainingRowsAfterDelete(values, 0, ['zenn']), [
+    ['feed_id', 'id'],
+    ['nhk', 'a2'],
+  ]);
+  assert.deepEqual(remainingRowsAfterDelete(values, 1, ['a2']), [
+    ['feed_id', 'id'],
+    ['zenn', 'a1'],
+    ['zenn', 'a3'],
+  ]);
 });

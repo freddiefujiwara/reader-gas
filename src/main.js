@@ -439,6 +439,21 @@ function pruneArticles() {
   return plan;
 }
 
+function remainingRowsAfterDelete(values, keyIdx, ids) {
+  if (!values || !values.length) return values;
+  const remaining = [values[0]];
+  if (!ids || !ids.length) {
+    for (let i = 1; i < values.length; i++) remaining.push(values[i]);
+    return remaining;
+  }
+  const target = {};
+  ids.forEach((id) => { target[String(id)] = true; });
+  for (let i = 1; i < values.length; i++) {
+    if (!target[String(values[i][keyIdx])]) remaining.push(values[i]);
+  }
+  return remaining;
+}
+
 function deleteRowsById(ss, sheetName, keyHeader, ids) {
   if (!ids || !ids.length) return;
   const sheet = ss.getSheetByName(sheetName);
@@ -447,14 +462,12 @@ function deleteRowsById(ss, sheetName, keyHeader, ids) {
   if (values.length < 2) return;
   const keyIdx = values[0].indexOf(keyHeader);
   if (keyIdx < 0) return;
-  const target = {};
-  ids.forEach((id) => { target[String(id)] = true; });
-  const rowsDesc = [];
-  for (let i = 1; i < values.length; i++) {
-    if (target[String(values[i][keyIdx])]) rowsDesc.push(i + 1);
-  }
-  rowsDesc.sort((a, b) => b - a);
-  rowsDesc.forEach((rowNum) => sheet.deleteRow(rowNum));
+  const remaining = remainingRowsAfterDelete(values, keyIdx, ids);
+  if (remaining.length === values.length) return;
+  // deleteRow を行ごとに呼ぶと数十〜数百回になると極端に遅いため、
+  // 残す行だけを一括で書き戻す。
+  sheet.clearContents();
+  sheet.getRange(1, 1, remaining.length, remaining[0].length).setValues(remaining);
 }
 
 // --- Auth (tweet-gas pattern, simplified for reader) ---
@@ -1033,4 +1046,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete };
