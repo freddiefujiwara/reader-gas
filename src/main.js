@@ -379,6 +379,69 @@ function parseYouTubePlaylistItems(jsonText, feed) {
   return entries;
 }
 
+// --- YouTube RSS 出力 (v2: 取得をクライアントへ寄せるための出口) ---
+// YouTube フィードの記事を RSS 2.0 で返す。クライアントはこの URL を
+// 通常のフィード URL と同じ経路で取得する (YouTube 専用の形式は作らない)。
+// guid は動画IDにし、記事IDの互換 (feed_id + guid) を保つ。
+
+function escapeXml(s) {
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function videoIdFromLink(link) {
+  const m = /[?&]v=([A-Za-z0-9_-]{6,})/.exec(String(link || ''));
+  return m ? m[1] : '';
+}
+
+function toRfc822(isoString) {
+  const t = Date.parse(cellIso(isoString) || String(isoString || ''));
+  if (Number.isNaN(t)) return '';
+  return new Date(t).toUTCString();
+}
+
+const RSS_MAX_ITEMS = 50;
+
+// articleRows は articles タブの行オブジェクト (ARTICLES_HEADERS のキー)。
+// published_at (無ければ fetched_at) の新しい順に最大 RSS_MAX_ITEMS 件。
+function buildRssXml(feed, articleRows) {
+  const f = feed || {};
+  const title = String(f.title || '');
+  const channelId = youtubeChannelIdFromUrl(f.url);
+  const sorted = (articleRows || []).slice().sort((a, b) => {
+    const ta = Date.parse(cellIso(a.published_at) || cellIso(a.fetched_at) || '') || 0;
+    const tb = Date.parse(cellIso(b.published_at) || cellIso(b.fetched_at) || '') || 0;
+    return tb - ta;
+  }).slice(0, RSS_MAX_ITEMS);
+  const lines = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<rss version="2.0">',
+    '  <channel>',
+    '    <title>' + escapeXml(title) + '</title>',
+    '    <link>' + escapeXml('https://www.youtube.com/channel/' + channelId) + '</link>',
+    '    <description>' + escapeXml(title) + '</description>',
+  ];
+  sorted.forEach((a) => {
+    const link = String(a.link || '');
+    const pubDate = toRfc822(cellIso(a.published_at) || cellIso(a.fetched_at));
+    lines.push('    <item>');
+    lines.push('      <title>' + escapeXml(a.title) + '</title>');
+    lines.push('      <link>' + escapeXml(link) + '</link>');
+    lines.push('      <guid isPermaLink="false">' + escapeXml(videoIdFromLink(link)) + '</guid>');
+    if (pubDate) lines.push('      <pubDate>' + pubDate + '</pubDate>');
+    lines.push('      <description>' + escapeXml(a.summary) + '</description>');
+    lines.push('      <author>' + escapeXml(title) + '</author>');
+    lines.push('    </item>');
+  });
+  lines.push('  </channel>');
+  lines.push('</rss>');
+  return lines.join('\n');
+}
+
 function parseFeed(xmlText, feed) {
   const feedId = feed && feed.id ? String(feed.id) : '';
   const root = parseXml(xmlText);
@@ -871,6 +934,7 @@ function buildListPayload(body) {
   limit = Math.min(limit, 500);
   let offset = Number(body.offset || 0);
   if (!Number.isFinite(offset) || offset < 0) offset = 0;
+  const serviceUrl = getServiceUrl();
   return {
     ok: true,
     articles: filtered.slice(offset, offset + limit),
@@ -879,6 +943,7 @@ function buildListPayload(body) {
       id: f.id,
       title: String(f.title || ''),
       url: String(f.url || ''),
+      fetchUrl: buildFetchUrl(f, serviceUrl),
       category: String(f.category || ''),
       isPrivate: isTruthy(f.is_private),
       unreadCount: unreadByFeed[f.id] || 0,
@@ -1050,9 +1115,30 @@ function feedRowValues(rowObj, headers) {
   return (headers || FEEDS_HEADERS).map((h) => (rowObj[h] === undefined ? '' : rowObj[h]));
 }
 
+// Web App の公開 URL (RSS 出力の fetchUrl 組み立て用)。Apps Script 以外の
+// 環境 (Node テスト) では空文字を返す。
+function getServiceUrl() {
+  if (typeof ScriptApp === 'undefined' || !ScriptApp.getService) return '';
+  try { return String(ScriptApp.getService().getUrl() || ''); } catch (e) { return ''; }
+}
+
+// クライアントが実際に取得する URL。YouTube フィードは reader-gas の RSS
+// 出力 (?rss=<feedId>) を指し、それ以外はフィードの URL そのまま。
+function buildFetchUrl(feed, serviceUrl) {
+  const f = feed || {};
+  const url = String(f.url || '');
+  const id = String(f.id || '');
+  const base = String(serviceUrl || '');
+  if (id && base && youtubeChannelIdFromUrl(url)) {
+    return base + '?rss=' + encodeURIComponent(id);
+  }
+  return url;
+}
+
 // Shapes a feeds-tab object (or a buildFeedRow result) into the API feed item.
-function feedToApiShape(feedObj, unreadCount, starredCount) {
+function feedToApiShape(feedObj, unreadCount, starredCount, serviceUrl) {
   const f = feedObj || {};
+  const base = serviceUrl !== undefined ? String(serviceUrl || '') : getServiceUrl();
   const priv = f.is_private !== undefined ? f.is_private : f.isPrivate;
   const fetched = f.last_fetched_at !== undefined ? f.last_fetched_at : f.lastFetchedAt;
   const status = f.last_status !== undefined ? f.last_status : f.lastStatus;
@@ -1061,6 +1147,7 @@ function feedToApiShape(feedObj, unreadCount, starredCount) {
     id: String(f.id || ''),
     title: String(f.title || ''),
     url: String(f.url || ''),
+    fetchUrl: buildFetchUrl(f, base),
     category: String(f.category || ''),
     enabled: isTruthy(f.enabled),
     isPrivate: isTruthy(priv),
@@ -1200,6 +1287,17 @@ function jsonOutput(obj) {
 }
 
 function doGet(e) {
+  const rssFeedId = e && e.parameter ? String(e.parameter.rss || '') : '';
+  if (rssFeedId) {
+    const ss = openDataSpreadsheet();
+    const feed = readSheetAsObjects(ss, 'feeds').filter((f) => String(f.id) === rssFeedId)[0] || null;
+    if (!feed || !youtubeChannelIdFromUrl(feed.url)) {
+      return jsonOutput({ ok: false, error: 'feed_not_found' });
+    }
+    const rows = readSheetAsObjects(ss, 'articles').filter((a) => String(a.feed_id) === rssFeedId);
+    // MIME は付けない (取得側はプロキシ経由で本文だけを読むため)。
+    return ContentService.createTextOutput(buildRssXml(feed, rows));
+  }
   return jsonOutput({ ok: true, service: 'reader-gas' });
 }
 
@@ -1263,4 +1361,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, countStarredByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, youtubeApiErrorDetail, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, countStarredByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
