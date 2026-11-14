@@ -17,6 +17,9 @@ import {
   prunePlan,
   filterArticles,
   feedIdsForCategory,
+  youtubeChannelIdFromUrl,
+  youtubeUploadsPlaylistId,
+  parseYouTubePlaylistItems,
   toFeedBool,
   parseFeedUrl,
   validateFeedInput,
@@ -534,4 +537,35 @@ test('filterArticles: feedIds でカテゴリ単位に絞る', () => {
   ];
   assert.deepEqual(filterArticles(articles, { feedIds: ['a', 'c'] }).map((x) => x.id), ['1', '3']);
   assert.deepEqual(filterArticles(articles, { feedIds: [] }), []);
+});
+
+test('youtubeChannelIdFromUrl: videos.xml の URL から channel_id を抜く', () => {
+  assert.equal(
+    youtubeChannelIdFromUrl('https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A'),
+    'UCxNfaRC6MbAnwSR1Dqqv69A'
+  );
+  assert.equal(youtubeChannelIdFromUrl('https://example.com/feed.xml'), '');
+  assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/feeds/videos.xml?user=someone'), '');
+});
+
+test('youtubeUploadsPlaylistId: UC の先頭を UU に替える', () => {
+  assert.equal(youtubeUploadsPlaylistId('UCxNfaRC6MbAnwSR1Dqqv69A'), 'UUxNfaRC6MbAnwSR1Dqqv69A');
+  assert.equal(youtubeUploadsPlaylistId(''), '');
+});
+
+test('parseYouTubePlaylistItems: playlistItems 応答を記事エントリへ正規化し、削除動画を除く', () => {
+  const json = JSON.stringify({
+    items: [
+      { snippet: { title: '動画A', description: '説明A', publishedAt: '2026-11-13T00:00:00Z', channelTitle: 'ch', resourceId: { videoId: 'vidA' } } },
+      { snippet: { title: 'Deleted video', publishedAt: '2026-11-12T00:00:00Z', channelTitle: 'ch', resourceId: { videoId: 'vidB' } } },
+      { snippet: { title: '動画C', publishedAt: '2026-11-11T00:00:00Z', channelTitle: 'ch', resourceId: {} } },
+    ],
+  });
+  const entries = parseYouTubePlaylistItems(json, { id: 'yt-x' });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].guid, 'vidA');
+  assert.equal(entries[0].link, 'https://www.youtube.com/watch?v=vidA');
+  assert.equal(entries[0].title, '動画A');
+  assert.equal(entries[0].feedId, 'yt-x');
+  assert.deepEqual(parseYouTubePlaylistItems('not json', { id: 'yt-x' }), []);
 });

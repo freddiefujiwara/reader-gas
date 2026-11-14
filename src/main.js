@@ -322,6 +322,47 @@ function toIsoDate(value) {
   return new Date(t).toISOString();
 }
 
+// --- YouTube (Data API v3) ---
+// 公式RSS (feeds/videos.xml) が 404 を返すため、YouTube のチャンネルフィードは
+// Data API v3 の uploads プレイリストから取り込む。フィード行の URL は従来どおり
+// videos.xml の形を保ち、ここで channel_id を抜き出して振り分ける。
+
+function youtubeChannelIdFromUrl(url) {
+  const m = /^https:\/\/(?:www\.)?youtube\.com\/feeds\/videos\.xml\?[^#]*\bchannel_id=(UC[\w-]{10,})/.exec(String(url || ''));
+  return m ? m[1] : '';
+}
+
+function youtubeUploadsPlaylistId(channelId) {
+  const id = String(channelId || '');
+  return id.startsWith('UC') ? 'UU' + id.slice(2) : '';
+}
+
+// playlistItems の応答 JSON を parseFeed と同形のエントリ配列へ正規化する。
+// 削除・非公開動画 (タイトルが Deleted video / Private video) は取り込まない。
+function parseYouTubePlaylistItems(jsonText, feed) {
+  const feedId = feed && feed.id ? String(feed.id) : '';
+  let data;
+  try { data = JSON.parse(String(jsonText || '')); } catch (e) { return []; }
+  const items = data && Array.isArray(data.items) ? data.items : [];
+  const entries = [];
+  items.forEach((item) => {
+    const sn = (item && item.snippet) || {};
+    const videoId = sn.resourceId && sn.resourceId.videoId ? String(sn.resourceId.videoId) : '';
+    const title = String(sn.title || '').trim();
+    if (!videoId || !title || title === 'Deleted video' || title === 'Private video') return;
+    entries.push({
+      guid: videoId,
+      title,
+      link: 'https://www.youtube.com/watch?v=' + videoId,
+      publishedAt: toIsoDate(sn.publishedAt),
+      summary: summarize(sn.description || ''),
+      author: String(sn.channelTitle || '').trim(),
+      feedId,
+    });
+  });
+  return entries;
+}
+
 function parseFeed(xmlText, feed) {
   const feedId = feed && feed.id ? String(feed.id) : '';
   const root = parseXml(xmlText);
@@ -630,6 +671,19 @@ function updateFeedRow(sheet, headers, rowNum, patch) {
   });
 }
 
+// 正規化済みエントリを articles へ未登録分だけ追加し、追加件数を返す。
+function appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt) {
+  let added = 0;
+  (entries || []).forEach((entry) => {
+    const id = articleId(feed.id, entry.guid || entry.link);
+    if (existingIds[id]) return;
+    existingIds[id] = true;
+    articlesSheet.appendRow([id, feed.id, entry.title, entry.link, entry.publishedAt, fetchedAt, entry.summary, entry.author]);
+    added++;
+  });
+  return added;
+}
+
 function fetchFeeds() {
   const ss = openDataSpreadsheet();
   const feedsSheet = getSheetOrCreate(ss, 'feeds', FEEDS_HEADERS);
@@ -646,7 +700,9 @@ function fetchFeeds() {
     headers.forEach((h, idx) => { obj[h] = feedValues[i][idx]; });
     if (obj.id) rowNumById[obj.id] = i + 1;
   }
-  const enabledFeeds = feeds.filter((f) => f.id && f.url && isTruthy(f.enabled));
+  const allEnabledFeeds = feeds.filter((f) => f.id && f.url && isTruthy(f.enabled));
+  const enabledFeeds = allEnabledFeeds.filter((f) => !youtubeChannelIdFromUrl(f.url));
+  const youtubeFeeds = allEnabledFeeds.filter((f) => youtubeChannelIdFromUrl(f.url));
   const apiToken = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
   const requests = enabledFeeds.map((feed) => {
     const reqHeaders = {};
@@ -673,15 +729,7 @@ function fetchFeeds() {
       if (code !== 200) throw new Error('HTTP ' + code);
       const resHeaders = typeof res.getHeaders === 'function' ? res.getHeaders() : {};
       const entries = parseFeed(res.getContentText(), feed);
-      let added = 0;
-      entries.forEach((entry) => {
-        const id = articleId(feed.id, entry.guid || entry.link);
-        if (existingIds[id]) return;
-        existingIds[id] = true;
-        articlesSheet.appendRow([id, feed.id, entry.title, entry.link, entry.publishedAt, fetchedAt, entry.summary, entry.author]);
-        added++;
-      });
-      addedTotal += added;
+      addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt);
       updateFeedRow(feedsSheet, headers, rowNum, {
         last_fetched_at: fetchedAt,
         last_status: '200',
@@ -698,8 +746,32 @@ function fetchFeeds() {
       });
     }
   });
+  // YouTube フィードは公式APIから取り込む (RSS は 404 のため)。
+  const youtubeApiKey = PropertiesService.getScriptProperties().getProperty('YOUTUBE_API_KEY');
+  youtubeFeeds.forEach((feed) => {
+    const rowNum = rowNumById[feed.id];
+    try {
+      if (!youtubeApiKey) throw new Error('YOUTUBE_API_KEY is not set');
+      const playlistId = youtubeUploadsPlaylistId(youtubeChannelIdFromUrl(feed.url));
+      const apiUrl = 'https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=20'
+        + '&playlistId=' + encodeURIComponent(playlistId)
+        + '&key=' + encodeURIComponent(youtubeApiKey);
+      const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
+      const code = res.getResponseCode();
+      if (code !== 200) throw new Error('YouTube API HTTP ' + code);
+      const entries = parseYouTubePlaylistItems(res.getContentText(), feed);
+      addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt);
+      updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '200', last_error: '' });
+    } catch (err) {
+      updateFeedRow(feedsSheet, headers, rowNum, {
+        last_fetched_at: fetchedAt,
+        last_status: 'error',
+        last_error: String((err && err.message) || err).slice(0, 500),
+      });
+    }
+  });
   pruneArticles();
-  return { ok: true, fetched: enabledFeeds.length, added: addedTotal };
+  return { ok: true, fetched: allEnabledFeeds.length, added: addedTotal };
 }
 
 function setupFetchTrigger() {
@@ -1152,4 +1224,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
+export { rowsToObjects, parseFeed, articleId, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, parseXml, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, feedIdsForCategory, youtubeChannelIdFromUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, toFeedBool, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder };
