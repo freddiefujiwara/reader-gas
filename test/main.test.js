@@ -20,6 +20,7 @@ import {
   youtubeChannelIdFromUrl,
   youtubeUploadsPlaylistId,
   parseYouTubePlaylistItems,
+  youtubeApiErrorDetail,
   toFeedBool,
   parseFeedUrl,
   validateFeedInput,
@@ -568,4 +569,11 @@ test('parseYouTubePlaylistItems: playlistItems 応答を記事エントリへ正
   assert.equal(entries[0].title, '動画A');
   assert.equal(entries[0].feedId, 'yt-x');
   assert.deepEqual(parseYouTubePlaylistItems('not json', { id: 'yt-x' }), []);
+});
+
+test('youtubeApiErrorDetail: エラー応答から原因だけを抜く', () => {
+  const body = JSON.stringify({ error: { code: 400, message: 'API key not valid. Please pass a valid API key.', errors: [{ reason: 'keyInvalid' }] } });
+  assert.equal(youtubeApiErrorDetail(body), ' - API key not valid. Please pass a valid API key.');
+  assert.equal(youtubeApiErrorDetail('not json'), '');
+  assert.equal(youtubeApiErrorDetail('{}'), '');
 });
