@@ -1851,7 +1851,7 @@ test('fetchFeeds: タイトルが入っていれば channels.list を呼ばず�
 // ============================================================
 // 音声ストリーム URL の配布 (ogp 方式): ze が公開する
 // audio-urls.json の新鮮なエントリだけを ?rss= の enclosure にし、
-// 毎時巡回では各フィードの最新10本ぶん抽出トリガーを発火する。
+// 毎時巡回では各フィードの最新3本ぶん抽出トリガーを発火する。
 // ============================================================
 
 test('parseAudioUrlsMap: 形の合うエントリだけを残し、不正な入力は空マップ', () => {
@@ -2002,12 +2002,12 @@ function fetchAudioEnv({ props = {}, feedsRows, articlesRows = [], responder }) 
   return { ss, restore };
 }
 
-test('planYouTubeAudioTriggers: フィードごとに新しい順の最大10本を選び、重複を除く', () => {
+test('planYouTubeAudioTriggers: フィードごとに新しい順の最大3本を選び、重複を除く', () => {
   const mk = (prefix, days) => days.map((d) => ({
     videoId: prefix + String(d).padStart(2, '0'),
     publishedAt: '2026-11-' + String(d).padStart(2, '0') + 'T00:00:00.000Z',
   }));
-  // フィードA: 12本 (古い順に渡しても新しい10本だけが選ばれる)
+  // フィードA: 12本 (古い順に渡しても新しい3本だけが選ばれる)
   const feedA = mk('vidA', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
   // フィードB: A と重なる1本 + 独自2本 + 空ID
   const feedB = [
@@ -2017,10 +2017,10 @@ test('planYouTubeAudioTriggers: フィードごとに新しい順の最大10本�
     { videoId: '', publishedAt: '2026-11-03T00:00:00.000Z' },
   ];
   const plan = planYouTubeAudioTriggers([feedA, feedB], Date.parse('2026-11-15T00:00:00.000Z'));
-  assert.equal(plan.length, 12); // A の10本 + B の独自2本 (重複と空IDは除く)
+  assert.equal(plan.length, 5); // A の3本 + B の独自2本 (重複と空IDは除く)
   assert.equal(plan[0], 'vidA12');
-  assert.equal(plan[9], 'vidA03');
-  assert.deepEqual(plan.slice(10), ['vidB02', 'vidB01']);
+  assert.equal(plan[2], 'vidA10');
+  assert.deepEqual(plan.slice(3), ['vidB02', 'vidB01']);
   assert.deepEqual(planYouTubeAudioTriggers([]), []);
   assert.deepEqual(planYouTubeAudioTriggers(null), []);
   assert.deepEqual(planYouTubeAudioTriggers([null, []]), []);
@@ -2039,9 +2039,9 @@ test('planYouTubeAudioTriggers: 公開30日以内の動画だけが対象 (境�
   assert.deepEqual(planYouTubeAudioTriggers(videos, now), ['vidFresh001', 'vidEdge0001']);
 });
 
-test('planYouTubeAudioTriggers: 最新10本に入っていても30日超の動画は選ばない', () => {
+test('planYouTubeAudioTriggers: 30日超の動画は最新3本の選定でも選ばない', () => {
   const now = Date.parse('2026-11-15T00:00:00.000Z');
-  // 12本中9本が30日以内、3本が30日超 → 選ばれるのは9本だけ
+  // 12本中9本が30日以内、3本が30日超 → 30日以内の新しい順3本だけ
   const feed = [];
   for (let d = 7; d <= 15; d++) {
     feed.push({ videoId: 'vidIn' + String(d).padStart(2, '0'), publishedAt: '2026-11-' + String(d).padStart(2, '0') + 'T00:00:00.000Z' });
@@ -2050,8 +2050,7 @@ test('planYouTubeAudioTriggers: 最新10本に入っていても30日超の動�
     feed.push({ videoId: 'vidOut0' + i, publishedAt: date + 'T00:00:00.000Z' });
   });
   const plan = planYouTubeAudioTriggers([feed], now);
-  assert.equal(plan.length, 9);
-  assert.ok(plan.every((id) => id.startsWith('vidIn')));
+  assert.deepEqual(plan, ['vidIn15', 'vidIn14', 'vidIn13']);
 });
 
 test('planYouTubeAudioTriggers: 更新の止まったチャンネル (全て30日超) は何も選ばない', () => {
@@ -2074,7 +2073,7 @@ test('planYouTubeAudioTriggers: 公開日時が読めない動画は対象外', 
   assert.deepEqual(planYouTubeAudioTriggers(videos, now), ['vidOk000001']);
 });
 
-test('planYouTubeAudioTriggers: 常時対応チャンネルは30日超・10本超・日時不明でも全件選ぶ', () => {
+test('planYouTubeAudioTriggers: 常時対応チャンネルは30日超・3本超・日時不明でも全件選ぶ', () => {
   const now = Date.parse('2026-11-15T00:00:00.000Z');
   const special = [];
   for (let i = 1; i <= 15; i++) {
@@ -2108,7 +2107,7 @@ test('planYouTubeAudioTriggers: 常時対応と通常フィードが混ざって
   assert.deepEqual(planYouTubeAudioTriggers([special, normal], now), ['vidSOld0001', 'vidNNew0001']);
 });
 
-test('fetchFeeds: 抽出トリガーは各フィードの最新10本に発火する', () => {
+test('fetchFeeds: 抽出トリガーは各フィードの最新3本に発火する', () => {
   const items = [];
   for (let i = 1; i <= 12; i++) {
     items.push(['vidT' + String(i).padStart(5, '0'), '2026-11-' + String(i).padStart(2, '0') + 'T00:00:00Z']);
@@ -2124,9 +2123,9 @@ test('fetchFeeds: 抽出トリガーは各フィードの最新10本に発火す
     const result = fetchFeeds((videoId, token) => { calls.push([videoId, token]); });
     assert.equal(result.ok, true);
     assert.equal(result.added, 12);
-    assert.equal(calls.length, 10);
+    assert.equal(calls.length, 3);
     assert.equal(calls[0][0], 'vidT00012');
-    assert.ok(!calls.some(([id]) => id === 'vidT00001' || id === 'vidT00002'));
+    assert.ok(!calls.some(([id]) => id === 'vidT00009' || id === 'vidT00001'));
     assert.ok(calls.every(([, token]) => token === 'fake-ze-token'));
   } finally { restore(); }
 });
@@ -2221,7 +2220,7 @@ test('fetchFeeds: 常時対応チャンネルは30日超でも取得できた全
     const result = fetchFeeds((videoId) => { calls.push(videoId); });
     assert.equal(result.ok, true);
     assert.equal(result.added, 12);
-    assert.equal(calls.length, 12); // 10本上限も30日制限も付けない
+    assert.equal(calls.length, 12); // 3本上限も30日制限も付けない
   } finally { restore(); }
 });
 
@@ -2284,12 +2283,12 @@ test('fetchFeeds: 既定の抽出トリガーは a.ze.gs/yt-audio/<videoId> を�
   } finally { restore(); }
 });
 
-test('fireYouTubeAudioTriggers: 1回の巡回で最大280件まで (全体キャップ)', () => {
+test('fireYouTubeAudioTriggers: 1回の巡回で最大100件まで (全体キャップ)', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
   });
   const feedVideos = [];
-  for (let f = 0; f < 30; f++) {
+  for (let f = 0; f < 40; f++) {
     const videos = [];
     for (let i = 0; i < 10; i++) {
       videos.push({ videoId: 'vid' + f + '_' + i, publishedAt: '2026-11-14T00:00:00.000Z' });
@@ -2298,13 +2297,14 @@ test('fireYouTubeAudioTriggers: 1回の巡回で最大280件まで (全体キャ
   }
   let count = 0;
   try {
+    // 計画は 40フィード×3本 = 120件 → キャップで100件に絞られる
     const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, Date.parse('2026-11-15T00:00:00.000Z'));
-    assert.equal(fired, 280);
-    assert.equal(count, 280);
+    assert.equal(fired, 100);
+    assert.equal(count, 100);
   } finally { restore(); }
 });
 
-test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全体キャップ280件で収まる', () => {
+test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全体キャップ100件で収まる', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
   });
@@ -2324,10 +2324,10 @@ test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全
   }
   let count = 0;
   try {
-    // 計画は 20 + 270 = 290件 → キャップで280件に絞られる
+    // 計画は 20 + 27フィード×3本 = 101件 → キャップで100件に絞られる
     const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, now);
-    assert.equal(fired, 280);
-    assert.equal(count, 280);
+    assert.equal(fired, 100);
+    assert.equal(count, 100);
   } finally { restore(); }
 });
 

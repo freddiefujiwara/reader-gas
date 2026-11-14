@@ -733,19 +733,19 @@ function selectFetchTargets(feeds) {
 // URL を抽出して audio-urls.json として公開する (非同期)。
 // ?rss= はその JSON の新鮮なエントリを enclosure として配信する。
 // 発火対象は各 YouTube フィードの「公開から30日以内」の動画のうち
-// 最新10本で、新着かどうかは問わない (ze 側が抽出済みのものは
+// 最新3本で、新着かどうかは問わない (ze 側が抽出済みのものは
 // 重複排除するため、毎時叩き直しても安い)。更新の止まった
 // チャンネルは最新動画でも30日を超えていれば何も発火しない。
 // 例外は YT_AUDIO_ALWAYS_CHANNEL_ID のチャンネルだけで、こちらは
-// 30日制限も最新10本の上限も付けず、取得できた動画を毎時すべて
+// 30日制限も最新3本の上限も付けず、取得できた動画を毎時すべて
 // 依頼し直して常時再生可能な状態を保つ (下の定数のコメント参照)。
 // 失敗しても巡回自体は失敗にしない (fire-and-forget)。
 
 const YT_AUDIO_TRIGGER_BASE_URL = 'https://a.ze.gs/yt-audio/';
-const YT_AUDIO_TRIGGER_PER_FEED = 10;
-// 全体キャップ。通常分 (最大23フィード×10本=230) と常時対応分
-// (最大20本) が同時でも収まるよう、合計の上限に余裕を持たせた値。
-const YT_AUDIO_TRIGGER_MAX_PER_RUN = 280;
+const YT_AUDIO_TRIGGER_PER_FEED = 3;
+// 全体キャップ。通常分 (最大23フィード×3本=69) と常時対応分
+// (最大20本) の合計89本に余裕を持たせた値。
+const YT_AUDIO_TRIGGER_MAX_PER_RUN = 100;
 const YT_AUDIO_TRIGGER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // 常時対応チャンネル (本人のチャンネル「藤原史和 川口を歩くQAエンジニア」)。
 // reader-gas が毎時、このチャンネルの動画をすべて yt-audio のキューへ
@@ -782,7 +782,9 @@ function planYouTubeAudioTriggers(feedVideos, nowMs) {
       return;
     }
     const fresh = list.filter((v) => {
-      const ts = Date.parse((v && v.publishedAt) || '');
+      // 動画IDの無いものは件数上限の枠も使わないよう、最初に除く。
+      if (!v || !String(v.videoId || '')) return false;
+      const ts = Date.parse(v.publishedAt || '');
       return !isNaN(ts) && now - ts <= YT_AUDIO_TRIGGER_MAX_AGE_MS;
     });
     const sorted = fresh.slice().sort((a, b) => {
@@ -911,7 +913,7 @@ function fetchFeeds(fireTrigger) {
       });
     }
   });
-  // 各フィードの公開30日以内の最新10本 (常時対応チャンネルは全件) の
+  // 各フィードの公開30日以内の最新3本 (常時対応チャンネルは全件) の
   // 音声抽出を ze へ依頼する (記事の保存が済んでから発火する)。
   // トリガーの成否は巡回結果に影響させない。
   try {
