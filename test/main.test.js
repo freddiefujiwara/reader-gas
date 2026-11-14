@@ -21,7 +21,6 @@ import {
   buildListPayload,
   selectFetchTargets,
   youtubeChannelIdFromUrl,
-  youtubeChannelIdFromLegacyUrl,
   youtubeFeedUrlFromChannelId,
   parseYouTubeChannelUrl,
   youtubeUploadsPlaylistId,
@@ -459,16 +458,7 @@ test('validateFeedOrder: 現在の全IDと集合が一致する順列だけを�
   assert.equal(validateFeedOrder(['a', 'b', ''], current).ok, false);
 });
 
-test('youtubeChannelIdFromUrl: videos.xml の URL から channel_id を抜く', () => {
-  assert.equal(
-    youtubeChannelIdFromUrl('https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A'),
-    'UCxNfaRC6MbAnwSR1Dqqv69A'
-  );
-  assert.equal(youtubeChannelIdFromUrl('https://example.com/feed.xml'), '');
-  assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/feeds/videos.xml?user=someone'), '');
-});
-
-test('youtubeChannelIdFromUrl: 保存形 (/channel/UC...) からも channel_id を抜く', () => {
+test('youtubeChannelIdFromUrl: 保存形 (/channel/UC...) から channel_id を抜く', () => {
   assert.equal(
     youtubeChannelIdFromUrl('https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A'),
     'UCxNfaRC6MbAnwSR1Dqqv69A'
@@ -480,16 +470,11 @@ test('youtubeChannelIdFromUrl: 保存形 (/channel/UC...) からも channel_id �
   // ハンドル形式や視聴 URL はチャンネル ID を含まないので対象外。
   assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/@rakutentech'), '');
   assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/watch?v=abc123'), '');
+  // 旧来の videos.xml 形は移行済みで互換を持たないため対象外。
+  assert.equal(youtubeChannelIdFromUrl('https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A'), '');
+  assert.equal(youtubeChannelIdFromUrl('https://example.com/feed.xml'), '');
   assert.equal(youtubeChannelIdFromUrl(''), '');
   assert.equal(youtubeChannelIdFromUrl(null), '');
-});
-
-test('youtubeChannelIdFromLegacyUrl: 移行互換として videos.xml 形だけを見る', () => {
-  assert.equal(
-    youtubeChannelIdFromLegacyUrl('https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A'),
-    'UCxNfaRC6MbAnwSR1Dqqv69A'
-  );
-  assert.equal(youtubeChannelIdFromLegacyUrl('https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A'), '');
 });
 
 test('youtubeFeedUrlFromChannelId: 保存形のチャンネルページ URL を組み立てる', () => {
@@ -545,7 +530,7 @@ test('parseYouTubeChannelUrl: /@handle 形は kind:handle で末尾を正規化�
 });
 
 test('parseYouTubeChannelUrl: 対象外の URL は null', () => {
-  // videos.xml 形はチャンネルページではない (互換は youtubeChannelIdFromLegacyUrl 側)。
+  // videos.xml 形はチャンネルページではない。
   assert.equal(parseYouTubeChannelUrl('https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A'), null);
   // 旧来の /c/ ・ /user/ 形式は解決手段が無いため対象外。
   assert.equal(parseYouTubeChannelUrl('https://www.youtube.com/c/SomeChannel'), null);
@@ -586,14 +571,14 @@ test('parseChannelLookupResponse: 該当なし・壊れた応答は null', () =>
 test('selectFetchTargets: YouTube フィードだけを巡回対象にする', () => {
   const yt = (id) => ({
     id,
-    url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A',
+    url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A',
   });
   const feeds = [
     yt('yt-a'),
     yt('yt-b'),
     { id: 'rss-on', url: 'https://example.com/feed.xml' },
     { id: 'priv-on', url: 'https://a.ze.gs/x.freddie.xml' },
-    { id: '', url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A' },
+    { id: '', url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A' },
     { id: 'yt-nourl', url: '' },
   ];
   assert.deepEqual(selectFetchTargets(feeds).map((f) => f.id), ['yt-a', 'yt-b']);
@@ -656,7 +641,7 @@ test('toRfc822: ISO を RFC-822 (GMT) へ変換する。不正は空文字', () 
 const YT_FEED_FOR_RSS = {
   id: 'yt-sample',
   title: 'Sample & Channel',
-  url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A',
+  url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A',
 };
 
 function ytArticleRow(publishedAt, videoId, title, summary) {
@@ -713,7 +698,7 @@ test('buildRssXml: published_at が無ければ fetched_at で並べ、pubDate �
 
 test('buildFetchUrl: YouTube は RSS 出力 URL、それ以外はフィード URL そのまま', () => {
   const base = 'https://script.google.com/macros/s/AKfycTEST/exec';
-  const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const ytUrl = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
   assert.equal(buildFetchUrl({ id: 'yt-sample', url: ytUrl }, base), base + '?rss=yt-sample');
   assert.equal(buildFetchUrl({ id: 'zenn', url: 'https://zenn.dev/feed' }, base), 'https://zenn.dev/feed');
   // ベース URL が取れない環境ではフィード URL にフォールバックする
@@ -723,7 +708,7 @@ test('buildFetchUrl: YouTube は RSS 出力 URL、それ以外はフィード UR
 test('feedToApiShape: fetchUrl が付く (YouTube は注入したベース URL で組み立てる)', () => {
   const base = 'https://script.google.com/macros/s/AKfycTEST/exec';
   const yt = feedToApiShape(
-    { id: 'yt-sample', title: 'YT', url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A' },
+    { id: 'yt-sample', title: 'YT', url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A' },
     0, base
   );
   assert.equal(yt.fetchUrl, base + '?rss=yt-sample');
@@ -737,7 +722,7 @@ test('buildListPayload: フィードに enabled は付かない (廃止)', () =>
     feeds: [
       ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'],
       ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', false, '', '', '', '', ''],
-      ['yt-off', 'YT off', 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', '', false, '', '', '', '', ''],
+      ['yt-off', 'YT off', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', false, '', '', '', '', ''],
     ],
     articles: [
       ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'],
@@ -977,7 +962,7 @@ test('appendNewEntries: 既存と同一バッチ内の重複を抑止し、列�
 function rssTestSpreadsheet() {
   return new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-rakutentech', '楽天テック', 'https://www.youtube.com/feeds/videos.xml?channel_id=UC0SZCr0g1dOpKAfAZoQjIHw', '', 'FALSE', '', '', '', '200', ''],
+      ['yt-rakutentech', '楽天テック', 'https://www.youtube.com/channel/UC0SZCr0g1dOpKAfAZoQjIHw', '', 'FALSE', '', '', '', '200', ''],
       ['nhk', 'NHK ニュース', 'https://www3.nhk.or.jp/rss/news/cat0.xml', '', 'FALSE', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW,
@@ -1117,7 +1102,7 @@ test('buildListPayload: limit は 500 にクランプされ、不正値は既定
 test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim のまま (キー集合を固定)', () => {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-x', 'YT', 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
+      ['yt-x', 'YT', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
       ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'FALSE', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW,
@@ -1150,7 +1135,7 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
 test('handleDeleteFeed: states → articles → feeds の順にカスケード削除する', () => {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-a', 'A チャンネル', 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
+      ['yt-a', 'A チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
       ['zenn', 'Zenn', 'https://zenn.dev/feed', '', 'FALSE', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW,
@@ -1201,7 +1186,7 @@ test('handleDeleteFeed: 未知の ID は not_found で、行は変わらない',
 function fetchTestEnv({ apiKey, responder }) {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-x', 'YT チャンネル', 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
+      ['yt-x', 'YT チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW],
     // states は fetchFeeds が getSheetOrCreate で作る
@@ -1452,17 +1437,19 @@ test('validateFeedInput: id は任意で、空なら未指定として通る', (
 });
 
 test('validateFeedInput: YouTube 疑似フィードだけタイトル空を許可する', () => {
-  const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const ytUrl = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
   const yt = validateFeedInput({ title: '', url: ytUrl });
   assert.equal(yt.ok, true);
   assert.equal(yt.feed.title, '');
   // www 無し・タイトル未指定でも同じ
-  const ytBare = validateFeedInput({ url: 'https://youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A' });
+  const ytBare = validateFeedInput({ url: 'https://youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A' });
   assert.equal(ytBare.ok, true);
   // タイトルがあれば通常どおり保持される
   assert.equal(validateFeedInput({ title: 'My Ch', url: ytUrl }).feed.title, 'My Ch');
-  // channel_id の無い YouTube URL と通常フィードは従来どおりタイトル必須
-  assert.equal(validateFeedInput({ title: '', url: 'https://www.youtube.com/feeds/videos.xml?user=someone' }).ok, false);
+  // 旧来の videos.xml 形は通常の URL として扱うためタイトル必須。
+  // チャンネル ID を含まない YouTube URL と通常フィードも従来どおりタイトル必須
+  assert.equal(validateFeedInput({ title: '', url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A' }).ok, false);
+  assert.equal(validateFeedInput({ title: '', url: 'https://www.youtube.com/watch?v=abc123' }).ok, false);
   assert.equal(validateFeedInput({ title: '', url: 'https://example.com/feed' }).ok, false);
 });
 
@@ -1520,7 +1507,7 @@ test('handleSaveFeed: 同じ URL の再追加は行を増やさず、その行�
 });
 
 test('handleSaveFeed: slug ID の既存行は URL 一致で更新され、ID とタイトルを維持する', () => {
-  const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const ytUrl = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
   const { ss, restore } = saveFeedEnv([
     ['yt-legacy', '補完済みタイトル', ytUrl, '', 'FALSE', '', '', '', '200', ''],
   ]);
@@ -1556,14 +1543,13 @@ test('handleSaveFeed: id 指定の更新は行を書き換え、10列で保存�
 });
 
 test('handleSaveFeed: YouTube はタイトル空で追加でき、通常フィードは弾く', () => {
-  const ytUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
   const canonical = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
   const { ss, restore } = saveFeedEnv([]);
   try {
-    const yt = handleSaveFeed({ feed: { url: ytUrl } });
+    const yt = handleSaveFeed({ feed: { url: canonical } });
     assert.equal(yt.ok, true);
     assert.equal(yt.feed.title, '');
-    // videos.xml 形で登録しても、保存形 (/channel/) に寄せてから ID を決める。
+    // 保存形 (/channel/) のまま ID を決める。
     assert.equal(yt.feed.id, feedIdFromUrl(canonical));
     assert.equal(yt.feed.url, canonical);
     const rows = ss.sheets['feeds'].rows;
@@ -1573,6 +1559,23 @@ test('handleSaveFeed: YouTube はタイトル空で追加でき、通常フィ�
     const rss = handleSaveFeed({ feed: { url: 'https://example.com/feed' } });
     assert.equal(rss.ok, false);
     assert.equal(ss.sheets['feeds'].rows.length, 2);
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: videos.xml 形は通常の URL として保存され、YouTube 扱いにならない', () => {
+  const legacyUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    // 互換を削除したため、正規形へは寄せず、入力 URL のまま保存する。
+    const res = handleSaveFeed({ feed: { title: '普通のフィード', url: legacyUrl } });
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.id, feedIdFromUrl(legacyUrl));
+    assert.equal(res.feed.url, legacyUrl);
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][2], legacyUrl);
+    // 巡回対象 (YouTube) にもならない。
+    assert.deepEqual(selectFetchTargets([{ id: res.feed.id, url: legacyUrl }]), []);
   } finally { restore(); }
 });
 
@@ -1667,20 +1670,19 @@ test('handleSaveFeed: /@handle の解決に失敗したら何も書かずに弾�
 });
 
 test('handleSaveFeed: 別形で再登録してもチャンネルIDが一致すれば既存行を更新する (クロスフォーム重複防止)', () => {
-  const legacyUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A';
   const canonical = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
-  const legacyId = feedIdFromUrl(legacyUrl);
+  const canonicalId = feedIdFromUrl(canonical);
   const { ss, restore } = saveFeedEnv([
-    [legacyId, '既存タイトル', legacyUrl, '', 'FALSE', '', '', '', '200', ''],
+    [canonicalId, '既存タイトル', canonical, '', 'FALSE', '', '', '', '200', ''],
   ]);
   try {
-    // /channel/ 形で再登録: 旧形の行が更新され、行は増えない。URL は保存形へ。
-    const res = handleSaveFeed({ feed: { url: canonical, category: 'video' } });
+    // /channel/ 形 (末尾パス付き) で再登録: 既存行が更新され、行は増えない。
+    const res = handleSaveFeed({ feed: { url: canonical + '/videos', category: 'video' } });
     assert.equal(res.ok, true);
-    assert.equal(res.feed.id, legacyId);
+    assert.equal(res.feed.id, canonicalId);
     const rows = ss.sheets['feeds'].rows;
     assert.equal(rows.length, 2);
-    assert.equal(rows[1][0], legacyId);
+    assert.equal(rows[1][0], canonicalId);
     assert.equal(rows[1][1], '既存タイトル');
     assert.equal(rows[1][2], canonical);
     assert.equal(rows[1][3], 'video');
@@ -1691,7 +1693,7 @@ test('handleSaveFeed: 別形で再登録してもチャンネルIDが一致す�
       () => ({ channelId: 'UCxNfaRC6MbAnwSR1Dqqv69A', title: '解決したチャンネル名' })
     );
     assert.equal(res2.ok, true);
-    assert.equal(res2.feed.id, legacyId);
+    assert.equal(res2.feed.id, canonicalId);
     assert.equal(ss.sheets['feeds'].rows.length, 2);
     assert.equal(ss.sheets['feeds'].rows[1][1], '解決したチャンネル名');
   } finally { restore(); }
@@ -1768,7 +1770,7 @@ test('handleSaveFeed: 既定 resolver は APIキーが無い・該当が無い�
 function fetchTitleEnv({ feedTitle, responder }) {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-x', feedTitle, 'https://www.youtube.com/feeds/videos.xml?channel_id=UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
+      ['yt-x', feedTitle, 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW],
   });
