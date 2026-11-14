@@ -361,17 +361,21 @@ function lookupYouTubeChannelByHandle(handle) {
 // --- YouTube 音声ストリーム URL の配布 (ogp 方式) ---
 // 音声ファイルはどこにも置かない。reader-gas が毎時巡回で yt-audio
 // トリガー (後述) を叩くと、ze 側のバッチがストリーム URL を非同期に
-// 抽出し、a.ze.gs/audio-urls.json に videoId -> { url, ts } の形で
-// 公開する。?rss= の出力ではこの JSON を読み、抽出から5時間以内の
-// エントリがあるアイテムにだけ、その URL を enclosure として付ける
-// (ストリーム URL は短命なので、古いエントリには付けない)。
+// 抽出し、a.ze.gs/audio-urls.json に videoId -> { url, ts, dur } の形で
+// 公開する (dur は実尺・秒で、エントリによっては無い)。?rss= の出力では
+// この JSON を読み、抽出から5時間以内のエントリがあるアイテムにだけ、
+// その URL を enclosure として付ける (ストリーム URL は短命なので、
+// 古いエントリには付けない)。dur があれば itunes:duration としても
+// 付ける (理由は buildRssXml のコメント参照)。
 
 const AUDIO_URLS_JSON_URL = 'https://a.ze.gs/audio-urls.json';
 const AUDIO_URL_FRESH_MS = 5 * 60 * 60 * 1000;
 
-// audio-urls.json の本文を videoId -> { url, ts } のマップとして読む
-// (純関数)。JSON でない・オブジェクトでない場合は空マップにする。
+// audio-urls.json の本文を videoId -> { url, ts, dur? } のマップとして
+// 読む (純関数)。JSON でない・オブジェクトでない場合は空マップにする。
 // 値の形が想定と違うエントリは落とす。ts は抽出時刻 (epoch 秒)。
+// dur は実尺 (秒) で、正の数値として読めるときだけ保持する
+// (読めないエントリも enclosure 自体は従来どおり付ける)。
 function parseAudioUrlsMap(jsonText) {
   let data;
   try { data = JSON.parse(String(jsonText || '')); } catch (e) { return {}; }
@@ -383,7 +387,10 @@ function parseAudioUrlsMap(jsonText) {
     const url = String(entry.url || '');
     const ts = Number(entry.ts);
     if (!url || !Number.isFinite(ts)) return;
-    map[videoId] = { url, ts };
+    const parsed = { url, ts };
+    const dur = Number(entry.dur);
+    if (Number.isFinite(dur) && dur > 0) parsed.dur = dur;
+    map[videoId] = parsed;
   });
   return map;
 }
@@ -407,14 +414,22 @@ function fetchAudioUrlsMap() {
   }
 }
 
+// マップに新鮮な (抽出から5時間以内) エントリがあればそのエントリを
+// 返し、無ければ null。nowMs はテスト用の差し込み口。
+function freshAudioEntry(audioUrls, videoId, nowMs) {
+  const entry = (audioUrls || {})[String(videoId || '')];
+  if (!entry) return null;
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  if (now - entry.ts * 1000 > AUDIO_URL_FRESH_MS) return null;
+  if (!String(entry.url || '')) return null;
+  return entry;
+}
+
 // マップに新鮮な (抽出から5時間以内) エントリがあればその URL を
 // 返し、無ければ空文字。nowMs はテスト用の差し込み口。
 function freshAudioUrl(audioUrls, videoId, nowMs) {
-  const entry = (audioUrls || {})[String(videoId || '')];
-  if (!entry) return '';
-  const now = typeof nowMs === 'number' ? nowMs : Date.now();
-  if (now - entry.ts * 1000 > AUDIO_URL_FRESH_MS) return '';
-  return String(entry.url || '');
+  const entry = freshAudioEntry(audioUrls, videoId, nowMs);
+  return entry ? String(entry.url || '') : '';
 }
 
 // --- YouTube RSS 出力 (v2: 取得をクライアントへ寄せるための出口) ---
@@ -446,7 +461,7 @@ const RSS_MAX_ITEMS = 50;
 
 // articleRows は articles タブの行オブジェクト (ARTICLES_HEADERS のキー)。
 // published_at (無ければ fetched_at) の新しい順に最大 RSS_MAX_ITEMS 件。
-// audioUrls は audio-urls.json のマップ (videoId -> { url, ts })。
+// audioUrls は audio-urls.json のマップ (videoId -> { url, ts, dur? })。
 // 省略時・該当エントリが古い/無いアイテムには enclosure を付けない。
 function buildRssXml(feed, articleRows, audioUrls) {
   const f = feed || {};
@@ -459,7 +474,7 @@ function buildRssXml(feed, articleRows, audioUrls) {
   }).slice(0, RSS_MAX_ITEMS);
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
-    '<rss version="2.0">',
+    '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">',
     '  <channel>',
     '    <title>' + escapeXml(title) + '</title>',
     '    <link>' + escapeXml('https://www.youtube.com/channel/' + channelId) + '</link>',
@@ -474,9 +489,20 @@ function buildRssXml(feed, articleRows, audioUrls) {
     lines.push('      <link>' + escapeXml(link) + '</link>');
     lines.push('      <guid isPermaLink="false">' + escapeXml(videoId) + '</guid>');
     // 音声ストリーム URL の enclosure。新鮮なエントリがあるときだけ付ける。
-    const audioUrl = freshAudioUrl(audioUrls, videoId);
+    const audioEntry = freshAudioEntry(audioUrls, videoId);
+    const audioUrl = audioEntry ? String(audioEntry.url || '') : '';
     if (audioUrl) {
       lines.push('      <enclosure url="' + escapeXml(audioUrl) + '" type="audio/x-m4a" length="0"/>');
+      // 実尺の passthrough: このストリームは断片化 MP4 (fMP4) で、長さ
+      // 情報が init セグメントと断片の両方に入るため、プレイヤー
+      // (特に iOS) が長さを二重に数えて実尺のちょうど2倍を表示して
+      // しまう。エントリに実尺 (dur・秒) があれば整数秒に丸めて
+      // itunes:duration として付け、クライアントが表示・シークの
+      // 正として使えるようにする。dur の無いエントリには付けない。
+      const dur = Number(audioEntry.dur);
+      if (Number.isFinite(dur) && dur > 0) {
+        lines.push('      <itunes:duration>' + Math.round(dur) + '</itunes:duration>');
+      }
     }
     if (pubDate) lines.push('      <pubDate>' + pubDate + '</pubDate>');
     lines.push('      <description>' + escapeXml(a.summary) + '</description>');

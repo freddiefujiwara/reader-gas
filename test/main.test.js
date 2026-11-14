@@ -663,7 +663,7 @@ test('buildRssXml: チャンネル情報とアイテムを RSS 2.0 で出す', (
     ytArticleRow('2026-11-14T01:00:00.000Z', 'vidNew22222', '新しい <動画> & テスト', 'new summary'),
   ]);
   assert.ok(xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>'));
-  assert.ok(xml.includes('<rss version="2.0">'));
+  assert.ok(xml.includes('<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">'));
   // チャンネル: タイトルはエスケープされ、リンクはチャンネルページ
   assert.ok(xml.includes('<title>Sample &amp; Channel</title>'));
   assert.ok(xml.includes('<link>https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A</link>'));
@@ -983,7 +983,7 @@ test('doGet: ?rss= は対象フィードの記事だけを RSS で返す', () =>
   try {
     const xml = doGet({ parameter: { rss: 'yt-rakutentech' } }).getContent();
     assert.ok(xml.startsWith('<?xml'));
-    assert.ok(xml.includes('<rss version="2.0">'));
+    assert.ok(xml.includes('<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">'));
     assert.equal((xml.match(/<item>/g) || []).length, 2);
     assert.ok(xml.includes('動画その1'));
     assert.ok(xml.includes('動画その2'));
@@ -1858,12 +1858,22 @@ test('parseAudioUrlsMap: 形の合うエントリだけを残し、不正な入�
   const nowSec = Math.floor(Date.now() / 1000);
   const map = parseAudioUrlsMap(JSON.stringify({
     vidGood1111: { url: 'https://stream.example.com/a', ts: nowSec },
+    vidDur11111: { url: 'https://stream.example.com/e', ts: nowSec, dur: 104.234 },
+    vidBadDur11: { url: 'https://stream.example.com/f', ts: nowSec, dur: 'abc' },
+    vidZeroDur1: { url: 'https://stream.example.com/g', ts: nowSec, dur: 0 },
     vidNoUrl111: { ts: nowSec },
     vidNoTs1111: { url: 'https://stream.example.com/b' },
     vidBadTs111: { url: 'https://stream.example.com/c', ts: 'abc' },
     vidScalar11: 'https://stream.example.com/d',
   }));
-  assert.deepEqual(map, { vidGood1111: { url: 'https://stream.example.com/a', ts: nowSec } });
+  // dur は正の数値のときだけ保持し、読めない・0 の dur は落とす
+  // (エントリ自体は残り、enclosure は従来どおり付く)
+  assert.deepEqual(map, {
+    vidGood1111: { url: 'https://stream.example.com/a', ts: nowSec },
+    vidDur11111: { url: 'https://stream.example.com/e', ts: nowSec, dur: 104.234 },
+    vidBadDur11: { url: 'https://stream.example.com/f', ts: nowSec },
+    vidZeroDur1: { url: 'https://stream.example.com/g', ts: nowSec },
+  });
   assert.deepEqual(parseAudioUrlsMap('not json'), {});
   assert.deepEqual(parseAudioUrlsMap(''), {});
   assert.deepEqual(parseAudioUrlsMap('[1,2]'), {});
@@ -1902,9 +1912,47 @@ test('buildRssXml: 新鮮なエントリがあるアイテムにだけ enclosure
   // URL は XML エスケープしてそのまま入る (& → &amp;)
   assert.ok(xml.includes('<enclosure url="https://stream.example.com/play?vid=1&amp;sig=abc" type="audio/x-m4a" length="0"/>'));
   assert.equal((xml.match(/<enclosure /g) || []).length, 1);
+  // dur の無いエントリには itunes:duration を付けない
+  assert.ok(!xml.includes('<itunes:duration>'));
   // マップを渡さなければ enclosure は付かない (従来どおり)
   const plain = buildRssXml(YT_FEED_FOR_RSS, rows);
   assert.ok(!plain.includes('<enclosure'));
+});
+
+test('buildRssXml: enclosure に dur があれば実尺を itunes:duration (整数秒) で付ける', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = [
+    ytArticleRow('2026-11-14T01:00:00.000Z', 'vidDurA1111', '実尺つき動画', ''),
+    ytArticleRow('2026-11-13T01:00:00.000Z', 'vidDurB1111', '切り上げ対象の動画', ''),
+    ytArticleRow('2026-11-12T01:00:00.000Z', 'vidNoDur111', '実尺なし動画', ''),
+    ytArticleRow('2026-11-11T01:00:00.000Z', 'vidMissing1', 'エントリ無し動画', ''),
+  ];
+  const audioUrls = {
+    vidDurA1111: { url: 'https://stream.example.com/a', ts: nowSec - 60, dur: 104.234 },
+    vidDurB1111: { url: 'https://stream.example.com/b', ts: nowSec - 60, dur: 104.6 },
+    vidNoDur111: { url: 'https://stream.example.com/c', ts: nowSec - 60 },
+  };
+  const xml = buildRssXml(YT_FEED_FOR_RSS, rows, audioUrls);
+  assert.equal((xml.match(/<enclosure /g) || []).length, 3);
+  // dur は四捨五入した整数秒で出す (104.234 → 104、104.6 → 105)
+  assert.ok(xml.includes('<itunes:duration>104</itunes:duration>'));
+  assert.ok(xml.includes('<itunes:duration>105</itunes:duration>'));
+  assert.equal((xml.match(/<itunes:duration>/g) || []).length, 2);
+  // itunes:duration は対応するアイテムの enclosure の直後にだけ出る
+  const itemOf = (title) => {
+    const start = xml.indexOf('<title>' + title + '</title>');
+    assert.ok(start >= 0, title);
+    return xml.slice(xml.lastIndexOf('<item>', start), xml.indexOf('</item>', start));
+  };
+  assert.ok(itemOf('実尺つき動画').includes('<enclosure '));
+  assert.ok(itemOf('実尺つき動画').includes('<itunes:duration>104</itunes:duration>'));
+  assert.ok(itemOf('切り上げ対象の動画').includes('<itunes:duration>105</itunes:duration>'));
+  // enclosure があっても dur が無ければ付けない、enclosure 自体が
+  // 無いアイテムにも付けない (それ以外は従来どおり)
+  assert.ok(itemOf('実尺なし動画').includes('<enclosure '));
+  assert.ok(!itemOf('実尺なし動画').includes('<itunes:duration>'));
+  assert.ok(!itemOf('エントリ無し動画').includes('<enclosure'));
+  assert.ok(!itemOf('エントリ無し動画').includes('<itunes:duration>'));
 });
 
 test('fetchAudioUrlsMap: HTTPエラーや例外は空マップ (RSS は enclosure 無しで続く)', () => {
@@ -1935,7 +1983,7 @@ function audioRssSpreadsheet(videoId) {
 
 test('doGet: ?rss= は audio-urls.json の新鮮なエントリを enclosure として配信する', () => {
   const nowSec = Math.floor(Date.now() / 1000);
-  const mapJson = JSON.stringify({ vidAudio111: { url: 'https://stream.example.com/vidAudio111', ts: nowSec - 60 } });
+  const mapJson = JSON.stringify({ vidAudio111: { url: 'https://stream.example.com/vidAudio111', ts: nowSec - 60, dur: 2297.4 } });
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => audioRssSpreadsheet('vidAudio111') },
     PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
@@ -1951,6 +1999,8 @@ test('doGet: ?rss= は audio-urls.json の新鮮なエントリを enclosure と
   try {
     const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
     assert.ok(xml.includes('<enclosure url="https://stream.example.com/vidAudio111" type="audio/x-m4a" length="0"/>'));
+    // dur (2297.4) は整数秒に丸めて itunes:duration としても配信する
+    assert.ok(xml.includes('<itunes:duration>2297</itunes:duration>'));
   } finally { restore(); }
 });
 
