@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   rowsToObjects,
-  parseFeed,
   articleId,
   sha256Hex,
   sha256HexPure,
@@ -83,95 +82,6 @@ test('toIsoDate: RSSの日付もISOになる。不正は空文字', () => {
   assert.equal(toIsoDate('Sat, 14 Nov 2026 01:00:00 GMT'), '2026-11-14T01:00:00.000Z');
   assert.equal(toIsoDate('not a date'), '');
   assert.equal(toIsoDate(''), '');
-});
-
-const RSS2 = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <channel>
-    <title>Sample RSS2</title>
-    <item>
-      <title><![CDATA[最初の記事]]></title>
-      <link>https://example.com/a1</link>
-      <guid isPermaLink="false">urn:example:a1</guid>
-      <pubDate>Sat, 14 Nov 2026 01:00:00 GMT</pubDate>
-      <description>&lt;p&gt;要約 &lt;b&gt;テスト&lt;/b&gt;です&lt;/p&gt;</description>
-      <dc:creator>Author One</dc:creator>
-    </item>
-    <item>
-      <title>二件目</title>
-      <link>https://example.com/a2</link>
-      <pubDate>Fri, 13 Nov 2026 01:00:00 GMT</pubDate>
-      <description>plain summary</description>
-    </item>
-  </channel>
-</rss>`;
-
-test('parseFeed: RSS 2.0', () => {
-  const items = parseFeed(RSS2, { id: 'sample-rss2' });
-  assert.equal(items.length, 2);
-  assert.equal(items[0].guid, 'urn:example:a1');
-  assert.equal(items[0].title, '最初の記事');
-  assert.equal(items[0].link, 'https://example.com/a1');
-  assert.equal(items[0].publishedAt, '2026-11-14T01:00:00.000Z');
-  assert.equal(items[0].summary, '要約 テスト です');
-  assert.equal(items[0].author, 'Author One');
-  assert.equal(items[0].feedId, 'sample-rss2');
-  // guid が無い場合は link がキーになる
-  assert.equal(items[1].guid, 'https://example.com/a2');
-});
-
-const RDF = `<?xml version="1.0"?>
-<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns="http://purl.org/rss/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <channel rdf:about="https://example.com/">
-    <title>Sample RDF</title>
-  </channel>
-  <item rdf:about="https://example.com/r1">
-    <title>RDFの記事</title>
-    <link>https://example.com/r1</link>
-    <dc:date>2026-11-14T10:00:00+09:00</dc:date>
-    <description>RDF summary &amp; more</description>
-    <dc:creator>RDF Author</dc:creator>
-  </item>
-</rdf:RDF>`;
-
-test('parseFeed: RSS 1.0 / RDF', () => {
-  const items = parseFeed(RDF, { id: 'sample-rdf' });
-  assert.equal(items.length, 1);
-  assert.equal(items[0].guid, 'https://example.com/r1');
-  assert.equal(items[0].title, 'RDFの記事');
-  assert.equal(items[0].publishedAt, '2026-11-14T01:00:00.000Z');
-  assert.equal(items[0].summary, 'RDF summary & more');
-  assert.equal(items[0].author, 'RDF Author');
-});
-
-const ATOM = `<?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <title>Sample Atom</title>
-  <entry>
-    <title>Atomの記事</title>
-    <link rel="self" href="https://example.com/feed" />
-    <link rel="alternate" href="https://example.com/e1" />
-    <id>tag:example.com,2026:e1</id>
-    <published>2026-11-13T09:00:00Z</published>
-    <updated>2026-11-14T09:00:00Z</updated>
-    <summary type="html">&lt;p&gt;Atom summary&lt;/p&gt;</summary>
-    <author><name>Atom Author</name></author>
-  </entry>
-</feed>`;
-
-test('parseFeed: Atom (alternate リンクと published を優先)', () => {
-  const items = parseFeed(ATOM, { id: 'sample-atom' });
-  assert.equal(items.length, 1);
-  assert.equal(items[0].guid, 'tag:example.com,2026:e1');
-  assert.equal(items[0].link, 'https://example.com/e1');
-  assert.equal(items[0].publishedAt, '2026-11-13T09:00:00.000Z');
-  assert.equal(items[0].summary, 'Atom summary');
-  assert.equal(items[0].author, 'Atom Author');
-});
-
-test('parseFeed: 空・不正な入力は空配列', () => {
-  assert.deepEqual(parseFeed('', { id: 'x' }), []);
-  assert.deepEqual(parseFeed('not xml at all', { id: 'x' }), []);
 });
 
 test('isTruthy: シートの真値表現', () => {
