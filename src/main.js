@@ -365,8 +365,10 @@ function lookupYouTubeChannelByHandle(handle) {
 // 公開する (dur は実尺・秒で、エントリによっては無い)。?rss= の出力では
 // この JSON を読み、抽出から5時間以内のエントリがあるアイテムにだけ、
 // その URL を enclosure として付ける (ストリーム URL は短命なので、
-// 古いエントリには付けない)。dur があれば itunes:duration としても
-// 付ける (理由は buildRssXml のコメント参照)。
+// 古いエントリには付けない)。中継の合言葉 (YT_PLAY_TOKEN) があれば
+// enclosure は中継 URL になる (ytPlayUrl のコメント参照)。dur が
+// あれば itunes:duration としても付ける (理由は buildRssXml の
+// コメント参照)。
 
 const AUDIO_URLS_JSON_URL = 'https://a.ze.gs/audio-urls.json';
 const AUDIO_URL_FRESH_MS = 5 * 60 * 60 * 1000;
@@ -432,6 +434,29 @@ function freshAudioUrl(audioUrls, videoId, nowMs) {
   return entry ? String(entry.url || '') : '';
 }
 
+// --- YouTube 音声の中継 URL (yt-play) ---
+// 抽出済みストリーム URL (googlevideo) は通常の GET が約31KB/秒まで
+// 絞られるため、長編動画では再生開始まで約40秒かかる問題がある。
+// その対策として ze には中継 (yt-play) があり、Range 取得で
+// ストリームを引き直してそのまま流す (ファイルは置かない)。
+// スクリプトプロパティ YT_PLAY_TOKEN (中継の合言葉) が設定されて
+// いれば、?rss= の enclosure は直接 URL ではなく中継 URL
+// (https://a.ze.gs/yt-play/<token>/<videoId>) にする。中継側も
+// audio-urls.json の鮮度をもとに実 URL を解決する前提のため、
+// enclosure を付ける条件 (抽出から5時間以内のエントリがあること)
+// は従来どおり。プロパティ未設定・空なら従来の直接 URL のまま。
+
+const YT_PLAY_BASE_URL = 'https://a.ze.gs/yt-play/';
+
+// 中継 URL の組み立て (純関数)。token が空、または videoId が
+// 無ければ空文字 (= 中継しない) を返す。
+function ytPlayUrl(token, videoId) {
+  const t = String(token || '').trim();
+  const id = String(videoId || '');
+  if (!t || !id) return '';
+  return YT_PLAY_BASE_URL + encodeURIComponent(t) + '/' + encodeURIComponent(id);
+}
+
 // --- YouTube RSS 出力 (v2: 取得をクライアントへ寄せるための出口) ---
 // YouTube フィードの記事を RSS 2.0 で返す。クライアントはこの URL を
 // 通常のフィード URL と同じ経路で取得する (YouTube 専用の形式は作らない)。
@@ -463,7 +488,9 @@ const RSS_MAX_ITEMS = 50;
 // published_at (無ければ fetched_at) の新しい順に最大 RSS_MAX_ITEMS 件。
 // audioUrls は audio-urls.json のマップ (videoId -> { url, ts, dur? })。
 // 省略時・該当エントリが古い/無いアイテムには enclosure を付けない。
-function buildRssXml(feed, articleRows, audioUrls) {
+// ytPlayToken (中継の合言葉) があれば、enclosure の URL は直接の
+// ストリーム URL ではなく中継 URL になる (ytPlayUrl 参照)。
+function buildRssXml(feed, articleRows, audioUrls, ytPlayToken) {
   const f = feed || {};
   const title = String(f.title || '');
   const channelId = youtubeChannelIdFromUrl(f.url);
@@ -489,8 +516,10 @@ function buildRssXml(feed, articleRows, audioUrls) {
     lines.push('      <link>' + escapeXml(link) + '</link>');
     lines.push('      <guid isPermaLink="false">' + escapeXml(videoId) + '</guid>');
     // 音声ストリーム URL の enclosure。新鮮なエントリがあるときだけ付ける。
+    // 中継の合言葉があれば、直接 URL ではなく中継 URL を出す。
     const audioEntry = freshAudioEntry(audioUrls, videoId);
-    const audioUrl = audioEntry ? String(audioEntry.url || '') : '';
+    const directUrl = audioEntry ? String(audioEntry.url || '') : '';
+    const audioUrl = (directUrl && ytPlayUrl(ytPlayToken, videoId)) || directUrl;
     if (audioUrl) {
       lines.push('      <enclosure url="' + escapeXml(audioUrl) + '" type="audio/x-m4a" length="0"/>');
       // 実尺の passthrough: このストリームは断片化 MP4 (fMP4) で、長さ
@@ -1336,7 +1365,9 @@ function doGet(e) {
     }
     const rows = readSheetAsObjects(ss, 'articles').filter((a) => String(a.feed_id) === rssFeedId);
     // MIME は付けない (取得側はプロキシ経由で本文だけを読むため)。
-    return ContentService.createTextOutput(buildRssXml(feed, rows, fetchAudioUrlsMap()));
+    // YT_PLAY_TOKEN が設定されていれば enclosure は中継 URL になる。
+    const ytPlayToken = PropertiesService.getScriptProperties().getProperty('YT_PLAY_TOKEN');
+    return ContentService.createTextOutput(buildRssXml(feed, rows, fetchAudioUrlsMap(), ytPlayToken));
   }
   return jsonOutput({ ok: true, service: 'reader-gas' });
 }
@@ -1388,4 +1419,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, freshAudioUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, freshAudioUrl, ytPlayUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
