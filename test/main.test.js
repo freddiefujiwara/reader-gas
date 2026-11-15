@@ -57,6 +57,10 @@ import {
   issueSession,
   validateSession,
   validateShareToken,
+  shareLinkStatus,
+  issueShareLink,
+  getShareLinkStatus,
+  revokeShareLink,
   handleSaveFeed,
   handleDeleteFeed,
   doGet,
@@ -847,6 +851,7 @@ function fakePropertiesService(initial = {}) {
       getScriptProperties: () => ({
         getProperty: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
         setProperty: (k, v) => { store[k] = String(v); },
+        deleteProperty: (k) => { delete store[k]; },
       }),
     },
   };
@@ -1049,6 +1054,113 @@ test('validateShareToken: 未設定・期限切れ・不一致は false、一致
       assert.equal(validateShareToken(token), expected, JSON.stringify(props) + ' token=' + token);
     } finally { restore(); }
   }
+});
+
+test('shareLinkStatus: レコード無し・期限切れは inactive、有効なものだけ active', () => {
+  const now = new Date().toISOString();
+  const future = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+  const past = new Date(Date.now() - 1000).toISOString();
+  assert.deepEqual(shareLinkStatus(null, null, now), { active: false, expiresAt: null });
+  assert.deepEqual(shareLinkStatus('hash', null, now), { active: false, expiresAt: null });
+  assert.deepEqual(shareLinkStatus(null, future, now), { active: false, expiresAt: null });
+  assert.deepEqual(shareLinkStatus('hash', past, now), { active: false, expiresAt: null });
+  assert.deepEqual(shareLinkStatus('hash', future, now), { active: true, expiresAt: future });
+});
+
+test('issueShareLink: ハッシュだけを保存し、発行したトークンで検証が通る', () => {
+  const fake = fakePropertiesService({});
+  const restore = installGasGlobals({ PropertiesService: fake.service, Utilities: fakeUtilities });
+  try {
+    const issued = issueShareLink();
+    assert.equal(issued.ok, true);
+    // トークンは URL-safe で32文字以上
+    assert.match(issued.token, /^[A-Za-z0-9_-]{32,}$/);
+    // 期限は発行から約30日
+    const ttlMs = Date.parse(issued.expiresAt) - Date.now();
+    assert.ok(Math.abs(ttlMs - 30 * 24 * 60 * 60 * 1000) < 5000, 'TTL は約30日: ' + ttlMs);
+    // 保存されるのは SHA-256 ハッシュと期限だけ (平文は保存先のどこにも無い)
+    assert.equal(fake.store.SHARE_TOKEN_HASH, sha256HexPure(issued.token));
+    assert.equal(fake.store.SHARE_EXPIRES_AT, issued.expiresAt);
+    assert.ok(!JSON.stringify(fake.store).includes(issued.token));
+    // 発行したトークンで検証が通り、状態も active になる
+    assert.equal(validateShareToken(issued.token), true);
+    assert.deepEqual(getShareLinkStatus(), { ok: true, active: true, expiresAt: issued.expiresAt });
+  } finally { restore(); }
+});
+
+test('issueShareLink: 再発行すると旧トークンは無効になり、新トークンだけが通る', () => {
+  const fake = fakePropertiesService({});
+  const restore = installGasGlobals({ PropertiesService: fake.service, Utilities: fakeUtilities });
+  try {
+    const first = issueShareLink();
+    const second = issueShareLink();
+    assert.notEqual(first.token, second.token);
+    assert.equal(validateShareToken(first.token), false);
+    assert.equal(validateShareToken(second.token), true);
+    assert.equal(getShareLinkStatus().expiresAt, second.expiresAt);
+  } finally { restore(); }
+});
+
+test('getShareLinkStatus / revokeShareLink: 未発行は inactive、無効化後は検証も通らない', () => {
+  const fake = fakePropertiesService({});
+  const restore = installGasGlobals({ PropertiesService: fake.service, Utilities: fakeUtilities });
+  try {
+    assert.deepEqual(getShareLinkStatus(), { ok: true, active: false, expiresAt: null });
+    const issued = issueShareLink();
+    assert.equal(validateShareToken(issued.token), true);
+    assert.deepEqual(revokeShareLink(), { ok: true });
+    // レコード自体が消え、検証も状態確認も無効になる
+    assert.equal(fake.store.SHARE_TOKEN_HASH, undefined);
+    assert.equal(fake.store.SHARE_EXPIRES_AT, undefined);
+    assert.equal(validateShareToken(issued.token), false);
+    assert.deepEqual(getShareLinkStatus(), { ok: true, active: false, expiresAt: null });
+    // 期限切れのレコードが残っていても inactive
+    fake.store.SHARE_TOKEN_HASH = sha256HexPure('expired-share-token');
+    fake.store.SHARE_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
+    assert.deepEqual(getShareLinkStatus(), { ok: true, active: false, expiresAt: null });
+    assert.equal(validateShareToken('expired-share-token'), false);
+  } finally { restore(); }
+});
+
+test('doPost: 共有リンクの発行・交換・無効化はオーナーだけが行える', () => {
+  const ss = new FakeSpreadsheet({});
+  const fake = fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fake.service,
+    ContentService: fakeContentService(),
+    Utilities: fakeUtilities,
+  });
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    const owner = issueSession('owner');
+    const readonly = issueSession('readonly');
+    // セッション無しでは発行・状態確認・無効化のいずれもできない
+    assert.deepEqual(post({ action: 'issueShareLink' }), { ok: false, error: 'unauthorized' });
+    assert.deepEqual(post({ action: 'getShareLinkStatus' }), { ok: false, error: 'unauthorized' });
+    assert.deepEqual(post({ action: 'revokeShareLink' }), { ok: false, error: 'unauthorized' });
+    // 読み取り専用セッションでもできない
+    assert.deepEqual(post({ action: 'issueShareLink', sessionToken: readonly.sessionToken }), { ok: false, error: 'forbidden' });
+    assert.deepEqual(post({ action: 'getShareLinkStatus', sessionToken: readonly.sessionToken }), { ok: false, error: 'forbidden' });
+    assert.deepEqual(post({ action: 'revokeShareLink', sessionToken: readonly.sessionToken }), { ok: false, error: 'forbidden' });
+    // オーナーが発行すると、そのトークンで exchange_share が通る
+    assert.deepEqual(post({ action: 'getShareLinkStatus', sessionToken: owner.sessionToken }), { ok: true, active: false, expiresAt: null });
+    const issued = post({ action: 'issueShareLink', sessionToken: owner.sessionToken });
+    assert.equal(issued.ok, true);
+    assert.match(issued.token, /^[A-Za-z0-9_-]{32,}$/);
+    assert.deepEqual(post({ action: 'getShareLinkStatus', sessionToken: owner.sessionToken }), { ok: true, active: true, expiresAt: issued.expiresAt });
+    const exchanged = post({ action: 'exchange_share', shareToken: issued.token });
+    assert.equal(exchanged.ok, true);
+    assert.equal(exchanged.role, 'readonly');
+    // 再発行すると旧トークンでは交換できない
+    const reissued = post({ action: 'issueShareLink', sessionToken: owner.sessionToken });
+    assert.deepEqual(post({ action: 'exchange_share', shareToken: issued.token }), { ok: false, error: 'unauthorized' });
+    assert.equal(post({ action: 'exchange_share', shareToken: reissued.token }).ok, true);
+    // 無効化すると交換できなくなる
+    assert.deepEqual(post({ action: 'revokeShareLink', sessionToken: owner.sessionToken }), { ok: true });
+    assert.deepEqual(post({ action: 'exchange_share', shareToken: reissued.token }), { ok: false, error: 'unauthorized' });
+    assert.deepEqual(post({ action: 'getShareLinkStatus', sessionToken: owner.sessionToken }), { ok: true, active: false, expiresAt: null });
+  } finally { restore(); }
 });
 
 test('doPost: セッション無しの list は unauthorized、不正な JSON は bad_request', () => {
