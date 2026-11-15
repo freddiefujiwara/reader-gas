@@ -81,10 +81,10 @@ npm run smoke   # 本番 /exec のスモークチェック (下記)
 
 ### デプロイ後のスモークチェック
 
-`npm run smoke` (`scripts/smoke.mjs`) が、デプロイ後の確認を担う。本番の `/exec` を匿名で叩き、ヘルス応答 (`{ok:true, service:"reader-gas"}`)、YouTube フィードの RSS 出力 (`?rss=yt-rakutentech` に item と guid があること)、実在する非 YouTube フィードと未知 ID の `feed_not_found`、セッション無し `list` の `unauthorized` を確認する。1件でも外れたら終了コード 1 で終わる。対象 URL は環境変数 `READER_GAS_EXEC_URL` で差し替えできる (未設定時は本番 URL)。
+`npm run smoke` (`scripts/smoke.mjs`) が、デプロイ後の確認を担う。本番の `/exec` を匿名で叩き、ヘルス応答 (`{ok:true, service:"reader-gas"}`)、YouTube フィードの RSS 出力 (`?rss=85ce0e8df21fc1c6` (rakutentech のハッシュ ID) に item と guid があること)、実在する非 YouTube フィードと未知 ID の `feed_not_found`、セッション無し `list` の `unauthorized` を確認する。1件でも外れたら終了コード 1 で終わる。対象 URL は環境変数 `READER_GAS_EXEC_URL` で差し替えできる (未設定時は本番 URL)。
 
 ## CI
 
 GitHub Secrets: `CLASPRC_JSON`, `SCRIPT_ID`, `DEPLOYMENT_ID`, `STAGING_SCRIPT_ID`, `STAGING_DEPLOYMENT_ID`
 
-ワークフローファイル (`.github/workflows/`) は GitHub MCP では push できないため、このリポジトリには含めていない。既存の -gas リポジトリと同型のワークフローをブラウザで追加すること (ブランチ push でステージングへ、main で本番へデプロイ)。
+ワークフローは `.github/workflows/node.yaml` (他の -gas リポジトリと同型)。GitHub MCP では push できないため、変更が必要なときはブラウザで編集すること。main 以外のブランチへの push でステージングへ、main へのマージで本番へデプロイされる。

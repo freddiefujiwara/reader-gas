@@ -22,7 +22,7 @@
 // 音声抽出トリガー (yt-audio コマンド) を叩くときにだけ読む。
 // v3 フェーズ1: フィードIDは URL のハッシュ (feedIdFromUrl) で決め、タイトルは
 // 自動取得のみとする (YouTube は登録時に空で受け、fetchFeeds が補完する)。
-// 既存シートの ID 付け替えは後続フェーズで行うため、当面は slug ID の行も混在する。
+// 既存シートの ID 付け替え (slug → ハッシュ) は完了済みで、現在の行はすべてハッシュ ID。
 // 有効/無効 (enabled) は廃止し、feeds タブの列自体も撤去した (全10列)。
 // 巡回・一覧・保存のどこでも参照しない。
 // YouTube の保存形はチャンネルページ URL (/channel/UC...) に統一する。
@@ -431,13 +431,6 @@ function freshAudioEntry(audioUrls, videoId, nowMs) {
   if (now - entry.ts * 1000 > AUDIO_URL_FRESH_MS) return null;
   if (!String(entry.url || '')) return null;
   return entry;
-}
-
-// マップに新鮮な (抽出から5時間以内) エントリがあればその URL を
-// 返し、無ければ空文字。nowMs はテスト用の差し込み口。
-function freshAudioUrl(audioUrls, videoId, nowMs) {
-  const entry = freshAudioEntry(audioUrls, videoId, nowMs);
-  return entry ? String(entry.url || '') : '';
 }
 
 // --- YouTube 音声の中継 URL (yt-play) ---
@@ -1676,4 +1669,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, freshAudioUrl, ytPlayUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, doGet, doPost };
