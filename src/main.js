@@ -1,8 +1,9 @@
 // reader-gas: Web版RSSリーダー /reader のバックエンドAPI (Google Apps Script)。
-// 正本は Google Sheets (feeds / articles / states / owner_sessions の4タブ)。
+// 正本は Google Sheets (feeds / articles / owner_sessions の3タブ)。
 // スプレッドシートIDはスクリプトプロパティ SPREADSHEET_ID から読む (コードに直書きしない)。
 // 毎時トリガー fetchFeeds が YouTube フィードだけを巡回して articles へ追記する (v2)。
-// フロントは doPost の list で既読状態を初回だけ取り込み、フィード管理も doPost で行う。
+// 既読状態は v2 から端末ローカル管理のため、サーバー側に states タブは持たない
+// (doPost の list が返す isRead は常に false。フィード管理も doPost で行う)。
 // フィード管理 (listFeeds / saveFeed / deleteFeed / reorderFeeds) はオーナー専用とし、
 // is_private は URL のホストが a.ze.gs のときだけ立てる (トークン漏洩防止)。
 // 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、
@@ -33,7 +34,6 @@ const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SESSION_HEADERS = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
 const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
 const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
-const STATES_HEADERS = ['article_id', 'is_read', 'is_starred', 'read_at', 'starred_at', 'updated_at'];
 const RETENTION_DAYS = 60;
 const MAX_ARTICLES = 5000;
 const SUMMARY_MAX_CHARS = 500;
@@ -544,16 +544,15 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken) {
 }
 
 // --- Retention (pure decision logic) ---
-// Eligible for pruning: no state row, or read.
 // Prune when older than RETENTION_DAYS, or beyond the newest MAX_ARTICLES.
+// 既読は端末ローカル管理のため、サーバー側では既読かどうかで保護しない
+// (v1 の states による未読保護は廃止した)。
 
-function prunePlan(articles, states, nowIso, options) {
+function prunePlan(articles, nowIso, options) {
   const opts = options || {};
   const retentionMs = (opts.retentionDays || RETENTION_DAYS) * 24 * 60 * 60 * 1000;
   const maxArticles = opts.maxArticles || MAX_ARTICLES;
   const now = nowIso ? Date.parse(nowIso) : Date.now();
-  const stateById = {};
-  (states || []).forEach((s) => { stateById[s.article_id] = s; });
   const sorted = (articles || []).slice().sort((a, b) => {
     const ta = Date.parse(cellIso(a.published_at) || cellIso(a.fetched_at) || '') || 0;
     const tb = Date.parse(cellIso(b.published_at) || cellIso(b.fetched_at) || '') || 0;
@@ -563,9 +562,6 @@ function prunePlan(articles, states, nowIso, options) {
   sorted.forEach((a, idx) => { keepRank[a.id] = idx < maxArticles; });
   const deleteArticleIds = [];
   sorted.forEach((a) => {
-    const st = stateById[a.id];
-    const eligible = !st || isTruthy(st.is_read);
-    if (!eligible) return;
     // 経過日数は「取り込んだ日」から数える (公開日が古い動画などを
     // 取り込んだ瞬間に消してしまわないため)。
     const t = Date.parse(cellIso(a.fetched_at) || cellIso(a.published_at) || '') || 0;
@@ -573,24 +569,14 @@ function prunePlan(articles, states, nowIso, options) {
     const beyondCap = !keepRank[a.id];
     if (tooOld || beyondCap) deleteArticleIds.push(a.id);
   });
-  const deleteSet = {};
-  deleteArticleIds.forEach((id) => { deleteSet[id] = true; });
-  const articleSet = {};
-  (articles || []).forEach((a) => { articleSet[a.id] = true; });
-  const deleteStateIds = [];
-  (states || []).forEach((s) => {
-    if (deleteSet[s.article_id] || !articleSet[s.article_id]) deleteStateIds.push(s.article_id);
-  });
-  return { deleteArticleIds, deleteStateIds };
+  return { deleteArticleIds };
 }
 
 function pruneArticles() {
   const ss = openDataSpreadsheet();
   const articles = readSheetAsObjects(ss, 'articles');
-  const states = readSheetAsObjects(ss, 'states');
-  const plan = prunePlan(articles, states, new Date().toISOString());
+  const plan = prunePlan(articles, new Date().toISOString());
   deleteRowsById(ss, 'articles', 'id', plan.deleteArticleIds);
-  deleteRowsById(ss, 'states', 'article_id', plan.deleteStateIds);
   return plan;
 }
 
@@ -900,7 +886,6 @@ function fetchFeeds(fireTrigger) {
   const ss = openDataSpreadsheet();
   const feedsSheet = getSheetOrCreate(ss, 'feeds', FEEDS_HEADERS);
   const articlesSheet = getSheetOrCreate(ss, 'articles', ARTICLES_HEADERS);
-  getSheetOrCreate(ss, 'states', STATES_HEADERS);
   const feedValues = feedsSheet.getDataRange().getValues();
   if (feedValues.length < 2) return { ok: true, fetched: 0 };
   const headers = feedValues[0];
@@ -989,7 +974,7 @@ function setupFetchTrigger() {
 
 // --- Article listing ---
 
-// list 用: 状態マージ済みの記事を新しい順に並べるだけにする
+// list 用: 記事を新しい順に並べるだけにする
 // (フィード/カテゴリ/未読の絞り込みは v2 ではクライアント側で行う)。
 function filterArticles(articles) {
   const out = (articles || []).slice();
@@ -1006,10 +991,7 @@ function buildListPayload(body) {
   const feeds = readSheetAsObjects(ss, 'feeds');
   const feedById = {};
   feeds.forEach((f) => { feedById[f.id] = f; });
-  const stateById = {};
-  readSheetAsObjects(ss, 'states').forEach((s) => { stateById[s.article_id] = s; });
   const merged = readSheetAsObjects(ss, 'articles').map((a) => {
-    const st = stateById[a.id];
     const feed = feedById[a.feed_id];
     return {
       id: a.id,
@@ -1020,7 +1002,9 @@ function buildListPayload(body) {
       publishedAt: cellIso(a.published_at),
       fetchedAt: cellIso(a.fetched_at),
       summary: String(a.summary || ''),
-      isRead: st ? isTruthy(st.is_read) : false,
+      // 既読は端末ローカル管理のため、サーバーは常に未読として返す
+      // (フロントの既読の初回取り込みは「何も取り込まない」形で完了する)。
+      isRead: false,
     };
   });
   const unreadByFeed = {};
@@ -1180,15 +1164,14 @@ function feedToApiShape(feedObj, unreadCount, serviceUrl) {
   };
 }
 
-// Unread = articles without a read state (no state row, or is_read falsy).
-function countUnreadByFeed(articles, states) {
-  const readById = {};
-  (states || []).forEach((s) => { readById[s.article_id] = isTruthy(s.is_read); });
+// サーバー側に既読状態は無い (端末ローカル管理) ため、未読数は記事数として数える。
+// タイムラインはこの値を使わず端末内で数え直す。管理画面の表示用。
+function countUnreadByFeed(articles) {
   const counts = {};
   (articles || []).forEach((a) => {
     const feedId = a.feed_id !== undefined ? a.feed_id : a.feedId;
     if (!feedId) return;
-    if (!readById[a.id]) counts[feedId] = (counts[feedId] || 0) + 1;
+    counts[feedId] = (counts[feedId] || 0) + 1;
   });
   return counts;
 }
@@ -1197,8 +1180,7 @@ function buildListFeedsPayload() {
   const ss = openDataSpreadsheet();
   const feeds = readSheetAsObjects(ss, 'feeds');
   const articleRows = readSheetAsObjects(ss, 'articles');
-  const stateRows = readSheetAsObjects(ss, 'states');
-  const unreadByFeed = countUnreadByFeed(articleRows, stateRows);
+  const unreadByFeed = countUnreadByFeed(articleRows);
   return {
     ok: true,
     feeds: feeds.filter((f) => f.id).map((f) => feedToApiShape(f, unreadByFeed[f.id] || 0)),
@@ -1292,7 +1274,7 @@ function handleSaveFeed(body, resolveHandle) {
   const rowValues = feedRowValues(rowObj, headers);
   if (rowNum > 0) sheet.getRange(rowNum, 1, 1, headers.length).setValues([rowValues]);
   else sheet.appendRow(rowValues);
-  const unreadByFeed = countUnreadByFeed(readSheetAsObjects(ss, 'articles'), readSheetAsObjects(ss, 'states'));
+  const unreadByFeed = countUnreadByFeed(readSheetAsObjects(ss, 'articles'));
   return { ok: true, feed: feedToApiShape(rowObj, existing ? (unreadByFeed[feed.id] || 0) : 0) };
 }
 
@@ -1311,10 +1293,6 @@ function handleDeleteFeed(body) {
     if (String(values[i][idIdx]) === feedId) { rowNum = i + 1; break; }
   }
   if (rowNum < 0) return { ok: false, error: 'not_found' };
-  const articleIds = readSheetAsObjects(ss, 'articles')
-    .filter((a) => String(a.feed_id) === feedId)
-    .map((a) => String(a.id));
-  deleteRowsById(ss, 'states', 'article_id', articleIds);
   deleteRowsById(ss, 'articles', 'feed_id', [feedId]);
   sheet.deleteRow(rowNum);
   return { ok: true };

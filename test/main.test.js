@@ -131,53 +131,39 @@ test('hashesEqual / isSessionExpired', () => {
   assert.equal(isSessionExpired('', '2026-06-01T00:00:00.000Z'), true);
 });
 
-test('prunePlan: 古い既読は削除、未読は保持、孤児stateを掃除', () => {
+test('prunePlan: 保持期間を超えた記事は削除し、新しい記事は保持する', () => {
   const now = '2026-11-14T00:00:00.000Z';
   const articles = [
-    { id: 'old-read', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '' },
-    { id: 'old-unread', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '' },
-    { id: 'old-starred', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '' },
-    { id: 'old-nostate', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '' },
-    { id: 'new-read', published_at: '2026-11-13T00:00:00.000Z', fetched_at: '' },
+    { id: 'old-1', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '' },
+    { id: 'old-2', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '' },
+    { id: 'new-1', published_at: '2026-11-13T00:00:00.000Z', fetched_at: '' },
   ];
-  const states = [
-    { article_id: 'old-read', is_read: true, is_starred: false },
-    { article_id: 'old-unread', is_read: false, is_starred: false },
-    { article_id: 'old-starred', is_read: true, is_starred: true },
-    { article_id: 'new-read', is_read: true, is_starred: false },
-    { article_id: 'ghost', is_read: true, is_starred: false },
-    { article_id: 'ghost-starred', is_read: false, is_starred: true },
-  ];
-  const plan = prunePlan(articles, states, now);
-  assert.deepEqual(plan.deleteArticleIds.sort(), ['old-nostate', 'old-read', 'old-starred']);
-  assert.ok(plan.deleteStateIds.includes('old-read'));
-  assert.ok(plan.deleteStateIds.includes('old-starred'));
-  assert.ok(plan.deleteStateIds.includes('ghost'));
-  assert.ok(plan.deleteStateIds.includes('ghost-starred'));
-  assert.ok(!plan.deleteStateIds.includes('old-unread'));
+  const plan = prunePlan(articles, now);
+  assert.deepEqual(plan.deleteArticleIds.sort(), ['old-1', 'old-2']);
+  // states 廃止に伴い、状態行の削除計画は返さない。
+  assert.ok(!('deleteStateIds' in plan));
 });
 
-test('prunePlan: 公開日が古くても取り込みが新しい未読は保持する', () => {
+test('prunePlan: 公開日が古くても取り込みが新しい記事は保持する', () => {
   const now = '2026-11-14T00:00:00.000Z';
   const articles = [
     // YouTube の過去動画のようなケース: 公開は数年前、取り込みは最近。
     { id: 'yt-old-video', published_at: '2022-06-01T00:00:00.000Z', fetched_at: '2026-11-14T00:00:00.000Z' },
-    // 取り込み自体も古い未読は従来どおり掃除する。
-    { id: 'stale-nostate', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '2026-08-01T00:00:00.000Z' },
+    // 取り込み自体も古い記事は掃除する。
+    { id: 'stale', published_at: '2026-08-01T00:00:00.000Z', fetched_at: '2026-08-01T00:00:00.000Z' },
   ];
-  const plan = prunePlan(articles, [], now);
-  assert.deepEqual(plan.deleteArticleIds, ['stale-nostate']);
+  const plan = prunePlan(articles, now);
+  assert.deepEqual(plan.deleteArticleIds, ['stale']);
 });
 
-test('prunePlan: 上限を超えた既読は新しい順を残して削除', () => {
+test('prunePlan: 上限を超えた記事は新しい順を残して削除', () => {
   const now = '2026-11-14T00:00:00.000Z';
   const articles = [
     { id: 'a1', published_at: '2026-11-11T00:00:00.000Z', fetched_at: '' },
     { id: 'a2', published_at: '2026-11-12T00:00:00.000Z', fetched_at: '' },
     { id: 'a3', published_at: '2026-11-13T00:00:00.000Z', fetched_at: '' },
   ];
-  const states = articles.map((a) => ({ article_id: a.id, is_read: true, is_starred: false }));
-  const plan = prunePlan(articles, states, now, { maxArticles: 2, retentionDays: 3650 });
+  const plan = prunePlan(articles, now, { maxArticles: 2, retentionDays: 3650 });
   assert.deepEqual(plan.deleteArticleIds, ['a1']);
 });
 
@@ -311,7 +297,7 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
   assert.ok(!('enabled' in feedToApiShape({ id: 'x', enabled: 'FALSE' })));
 });
 
-test('countUnreadByFeed: 状態なしと未読を数え、既読は数えない', () => {
+test('countUnreadByFeed: サーバー側に既読状態が無いため記事数をそのまま数える', () => {
   const articles = [
     { id: 'a1', feed_id: 'zenn' },
     { id: 'a2', feed_id: 'zenn' },
@@ -319,13 +305,9 @@ test('countUnreadByFeed: 状態なしと未読を数え、既読は数えない'
     { id: 'b1', feed_id: 'nhk' },
     { id: 'b2', feed_id: 'nhk' },
   ];
-  const states = [
-    { article_id: 'a1', is_read: true, is_starred: false },
-    { article_id: 'a2', is_read: 'FALSE', is_starred: false },
-    { article_id: 'b1', is_read: 'TRUE', is_starred: false },
-  ];
-  assert.deepEqual(countUnreadByFeed(articles, states), { zenn: 2, nhk: 1 });
-  assert.deepEqual(countUnreadByFeed([], []), {});
+  assert.deepEqual(countUnreadByFeed(articles), { zenn: 3, nhk: 2 });
+  assert.deepEqual(countUnreadByFeed([]), {});
+  assert.deepEqual(countUnreadByFeed(null), {});
 });
 
 test('remainingRowsAfterDelete: 一致した行だけを取り除き、ヘッダーは残す', () => {
@@ -735,10 +717,6 @@ test('buildListPayload: フィードに enabled は付かない (廃止)', () =>
       ['a1', 'zenn', '記事1', 'https://example.com/1', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '要約1', '著者1'],
       ['a2', 'zenn', '記事2', 'https://example.com/2', '2026-11-13T00:00:00.000Z', '2026-11-13T01:00:00.000Z', '', ''],
     ],
-    states: [
-      ['article_id', 'is_read', 'is_starred', 'read_at', 'starred_at', 'updated_at'],
-      ['a1', true, false, '2026-11-14T02:00:00.000Z', '', '2026-11-14T02:00:00.000Z'],
-    ],
   };
   const ss = {
     getSheetByName(name) {
@@ -759,9 +737,10 @@ test('buildListPayload: フィードに enabled は付かない (廃止)', () =>
     // enabled は廃止 (列自体も撤去済み): ペイロードには出さない。
     assert.ok(!('enabled' in byId['zenn']));
     assert.ok(!('enabled' in byId['yt-off']));
-    assert.equal(byId['zenn'].unreadCount, 1);
-    // 既読マージは残る (初回取り込みが id と isRead だけを使う)。
-    assert.deepEqual(payload.articles.map((a) => [a.id, a.isRead]), [['a1', true], ['a2', false]]);
+    // 未読数はサーバー側の記事数そのもの (既読は端末ローカル管理)。
+    assert.equal(byId['zenn'].unreadCount, 2);
+    // isRead は常に false (初回取り込みは id と isRead だけを使う形は維持)。
+    assert.deepEqual(payload.articles.map((a) => [a.id, a.isRead]), [['a1', false], ['a2', false]]);
     // v1 の残り (author / isStarred / total / generatedAt / starredCount) は出さない。
     assert.ok(!('author' in payload.articles[0]));
     assert.ok(!('isStarred' in payload.articles[0]));
@@ -787,7 +766,6 @@ test('buildListPayload: フィードに enabled は付かない (廃止)', () =>
 
 const FEED_HEADERS_ROW = ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
 const ARTICLE_HEADERS_ROW = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
-const STATE_HEADERS_ROW = ['article_id', 'is_read', 'is_starred', 'read_at', 'starred_at', 'updated_at'];
 const SESSION_HEADERS_ROW = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
 
 // GAS の computeDigest は符号付きバイト配列を返す。純JS実装の hex から再現する。
@@ -1089,7 +1067,6 @@ test('buildListPayload: limit は 500 にクランプされ、不正値は既定
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW, ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'FALSE', '', '', '', '', '']],
     articles,
-    states: [STATE_HEADERS_ROW],
   });
   const restore = installSpreadsheet(ss);
   try {
@@ -1114,7 +1091,6 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
     articles: [ARTICLE_HEADERS_ROW,
       ['a1', 'yt-x', '動画', 'https://www.youtube.com/watch?v=vidX111111', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '', ''],
     ],
-    states: [STATE_HEADERS_ROW, ['a1', 'TRUE', 'FALSE', '', '', '']],
   });
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => ss },
@@ -1130,15 +1106,15 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
     assert.equal(byId['yt-x'].fetchUrl, 'https://example.com/exec?rss=yt-x');
     assert.equal(byId['zenn'].fetchUrl, 'https://zenn.dev/feed');
     assert.ok(!('enabled' in byId['zenn']));
-    assert.equal(byId['yt-x'].unreadCount, 0);
+    assert.equal(byId['yt-x'].unreadCount, 1);
     // フィードのキー集合は slim 化後 (PR #16) の形から enabled を除いた形に固定する
     assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'isPrivate', 'title', 'unreadCount', 'url']);
-    // 状態マージ: states の is_read が isRead に反映される
-    assert.equal(payload.articles[0].isRead, true);
+    // 既読は端末ローカル管理のため、isRead は常に false
+    assert.equal(payload.articles[0].isRead, false);
   } finally { restore(); }
 });
 
-test('handleDeleteFeed: states → articles → feeds の順にカスケード削除する', () => {
+test('handleDeleteFeed: articles → feeds の順にカスケード削除する', () => {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
       ['yt-a', 'A チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
@@ -1149,26 +1125,19 @@ test('handleDeleteFeed: states → articles → feeds の順にカスケード�
       ['a2', 'yt-a', '記事2', 'https://example.com/2', '', '', '', ''],
       ['b1', 'zenn', '記事B', 'https://example.com/b', '', '', '', ''],
     ],
-    states: [STATE_HEADERS_ROW,
-      ['a1', 'TRUE', 'FALSE', '', '', ''],
-      ['a2', 'FALSE', 'FALSE', '', '', ''],
-      ['b1', 'TRUE', 'FALSE', '', '', ''],
-    ],
   });
-  // 削除の実行順を記録する (states の全件書き戻し → articles の全件書き戻し → feeds の行削除)
+  // 削除の実行順を記録する (articles の全件書き戻し → feeds の行削除)
   const order = [];
   const wrap = (sheet, label, method) => {
     const orig = sheet[method].bind(sheet);
     sheet[method] = (...args) => { order.push(label); return orig(...args); };
   };
-  wrap(ss.sheets['states'], 'states', 'clearContents');
   wrap(ss.sheets['articles'], 'articles', 'clearContents');
   wrap(ss.sheets['feeds'], 'feeds', 'deleteRow');
   const restore = installSpreadsheet(ss);
   try {
     assert.deepEqual(handleDeleteFeed({ feedId: 'yt-a' }), { ok: true });
-    assert.deepEqual(order, ['states', 'articles', 'feeds']);
-    assert.deepEqual(ss.sheets['states'].rows.map((r) => r[0]), ['article_id', 'b1']);
+    assert.deepEqual(order, ['articles', 'feeds']);
     assert.deepEqual(ss.sheets['articles'].rows.map((r) => r[0]), ['id', 'b1']);
     assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'zenn']);
   } finally { restore(); }
@@ -1178,7 +1147,6 @@ test('handleDeleteFeed: 未知の ID は not_found で、行は変わらない',
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW, ['zenn', 'Zenn', 'https://zenn.dev/feed', '', 'FALSE', '', '', '', '', '']],
     articles: [ARTICLE_HEADERS_ROW],
-    states: [STATE_HEADERS_ROW],
   });
   const restore = installSpreadsheet(ss);
   try {
@@ -1195,7 +1163,7 @@ function fetchTestEnv({ apiKey, responder }) {
       ['yt-x', 'YT チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW],
-    // states は fetchFeeds が getSheetOrCreate で作る
+    // states タブは廃止したため、fetchFeeds は作らない (テストで検証する)
   });
   const props = { SPREADSHEET_ID: 'fake-spreadsheet-id' };
   if (apiKey !== undefined) props.YOUTUBE_API_KEY = apiKey;
@@ -1221,6 +1189,8 @@ test('fetchFeeds: YOUTUBE_API_KEY 未設定なら行に error と理由を記録
     assert.equal(row[8], 'error');
     assert.equal(row[9], 'YOUTUBE_API_KEY is not set');
     assert.ok(row[7], 'last_fetched_at も記録される');
+    // states タブは再作成されない (シートごと削除した本番で作り直さないため)
+    assert.equal(ss.sheets['states'], undefined);
   } finally { restore(); }
 });
 
@@ -1374,11 +1344,11 @@ test('prunePlan: ちょうど60日では消えず、61日で消える (境界は
   const now = '2026-11-14T00:00:00.000Z';
   const mk = (fetched) => [{ id: 'a', published_at: '', fetched_at: fetched }];
   // 2026-09-15 → 2026-11-14 はちょうど60日
-  assert.deepEqual(prunePlan(mk('2026-09-15T00:00:00.000Z'), [], now).deleteArticleIds, []);
-  assert.deepEqual(prunePlan(mk('2026-09-14T00:00:00.000Z'), [], now).deleteArticleIds, ['a']);
+  assert.deepEqual(prunePlan(mk('2026-09-15T00:00:00.000Z'), now).deleteArticleIds, []);
+  assert.deepEqual(prunePlan(mk('2026-09-14T00:00:00.000Z'), now).deleteArticleIds, ['a']);
 });
 
-test('prunePlan: 未読 (状態あり・未読) は件数上限を超えても保持される', () => {
+test('prunePlan: 件数上限は既読状態に依らず、新しい順を残して古い順に適用される', () => {
   const now = '2026-11-14T00:00:00.000Z';
   const day = (d) => '2026-11-' + d + 'T00:00:00.000Z';
   const articles = [
@@ -1387,16 +1357,9 @@ test('prunePlan: 未読 (状態あり・未読) は件数上限を超えても�
     { id: 'a2', published_at: day('12'), fetched_at: day('12') },
     { id: 'a1', published_at: day('11'), fetched_at: day('11') },
   ];
-  const states = [
-    { article_id: 'a1', is_read: false },
-    { article_id: 'a2', is_read: true },
-    { article_id: 'a3', is_read: true },
-    { article_id: 'a4', is_read: true },
-  ];
-  const plan = prunePlan(articles, states, now, { maxArticles: 2, retentionDays: 3650 });
-  // 上限2件に対し、既読の a2 だけが落ちる。未読の a1 は上限外でも残る
-  assert.deepEqual(plan.deleteArticleIds, ['a2']);
-  assert.deepEqual(plan.deleteStateIds, ['a2']);
+  const plan = prunePlan(articles, now, { maxArticles: 2, retentionDays: 3650 });
+  // 上限2件に対し、古い a1・a2 が落ちる (v1 の states による未読保護は無い)。
+  assert.deepEqual(plan.deleteArticleIds.sort(), ['a1', 'a2']);
 });
 
 test('prunePlan: 日付の無い記事は上限超過のときだけ消える', () => {
@@ -1405,8 +1368,8 @@ test('prunePlan: 日付の無い記事は上限超過のときだけ消える', 
     { id: 'd1', published_at: '', fetched_at: '' },
     { id: 'd2', published_at: '', fetched_at: '' },
   ];
-  assert.deepEqual(prunePlan(articles, [], now, { maxArticles: 5 }).deleteArticleIds, []);
-  assert.deepEqual(prunePlan(articles, [], now, { maxArticles: 1 }).deleteArticleIds, ['d2']);
+  assert.deepEqual(prunePlan(articles, now, { maxArticles: 5 }).deleteArticleIds, []);
+  assert.deepEqual(prunePlan(articles, now, { maxArticles: 1 }).deleteArticleIds, ['d2']);
 });
 
 test('dist/Code.gs: export 文が残らず、スクリプトとして構文が通る', () => {
@@ -1468,12 +1431,11 @@ test('parseYouTubeChannelTitle: channels.list 応答からチャンネル名を�
   assert.equal(parseYouTubeChannelTitle(''), '');
 });
 
-// handleSaveFeed の合成テスト。feeds / articles / states を持つフェイクを使う。
+// handleSaveFeed の合成テスト。feeds / articles を持つフェイクを使う。
 function saveFeedEnv(feedRows) {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW, ...feedRows],
     articles: [ARTICLE_HEADERS_ROW],
-    states: [STATE_HEADERS_ROW],
   });
   const restore = installSpreadsheet(ss);
   return { ss, restore };
@@ -1709,7 +1671,6 @@ test('handleSaveFeed: 既定 resolver は channels.list?forHandle= を引き、�
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW],
     articles: [ARTICLE_HEADERS_ROW],
-    states: [STATE_HEADERS_ROW],
   });
   const fetchedUrls = [];
   const restore = installGasGlobals({
@@ -1754,7 +1715,6 @@ test('handleSaveFeed: 既定 resolver は APIキーが無い・該当が無い�
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW],
     articles: [ARTICLE_HEADERS_ROW],
-    states: [STATE_HEADERS_ROW],
   });
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => ss },
@@ -2114,7 +2074,6 @@ function fetchAudioEnv({ props = {}, feedsRows, articlesRows = [], responder }) 
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW, ...feedsRows],
     articles: [ARTICLE_HEADERS_ROW, ...articlesRows],
-    // states は fetchFeeds が getSheetOrCreate で作る
   });
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => ss },
