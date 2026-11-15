@@ -3,7 +3,7 @@
 Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web App)。
 
 - 毎時トリガー `fetchFeeds` が YouTube フィードだけを Data API 経由で巡回し、新着記事を `articles` シートへ追記する (通常の RSS フィードは v2 でクライアント側が取得する)
-- YouTube の音声は ogp と同じ非同期の形で扱う: 毎時巡回で各フィードの公開30日以内の最新3本ぶん、a.ze.gs の `yt-audio` コマンドへ音声ストリーム URL の抽出を依頼し (公開日時が読めない動画・30日を超えた動画は依頼しない。更新の止まったチャンネルは最新動画でも30日超なら対象外)、ze 側が抽出結果を `https://a.ze.gs/audio-urls.json` (動画ID → `{url, ts, dur}`、`dur` は実尺・秒で無いエントリもある) として公開する。RSS 出力 (`?rss=`) はその JSON を読み、抽出から5時間以内のエントリがあるアイテムにだけ enclosure として付け、エントリに `dur` があれば整数秒に丸めた `<itunes:duration>` も付ける (音声ファイル自体はどこにも置かない)。スクリプトプロパティ `YT_PLAY_TOKEN` が設定されている場合は、enclosure の URL は抽出済みの直接 URL ではなく、ze の中継 URL (`https://a.ze.gs/yt-play/<token>/<動画ID>`) になる (直接 URL は通常の GET が約31KB/秒まで絞られ、長編動画の再生開始が約40秒かかるため。中継は Range 取得で引き直して流すだけで、ファイルは置かない)。未設定・空なら従来どおり直接 URL のまま。実尺を RSS 側に持たせるのは、この音声ストリームが断片化 MP4 (fMP4) で長さ情報が二重に入るため、プレイヤー (特に iOS) が長さを二重に数えて実尺の2倍を表示してしまうからで、クライアントは `itunes:duration` を表示・シークの正として使う
+- YouTube の音声は ogp と同じ非同期の形で扱う: 毎時巡回で各フィードの公開30日以内の最新3本ぶん、a.ze.gs の `yt-audio` コマンドへ音声ストリーム URL の抽出を依頼し (公開日時が読めない動画・30日を超えた動画は依頼しない。更新の止まったチャンネルは最新動画でも30日超なら対象外)、ze 側が抽出結果を `https://a.ze.gs/audio-urls.json` (動画ID → `{url, ts, dur}`、`dur` は実尺・秒で無いエントリもある) として公開する。RSS 出力 (`?rss=`) はその JSON を読み、抽出から5時間以内のエントリがあるアイテムにだけ enclosure として付け、エントリに `dur` があれば整数秒に丸めた `<itunes:duration>` も付ける (音声ファイル自体はどこにも置かない)。スクリプトプロパティ `YT_PLAY_TOKEN` が設定されている場合は、enclosure の URL は抽出済みの直接 URL ではなく、ze の中継 URL (`https://y.ze.gs/<token>/<動画ID>`) になる (直接 URL は通常の GET が約31KB/秒まで絞られ、長編動画の再生開始が約40秒かかるため。中継は Range 取得で引き直して流すだけで、ファイルは置かない)。未設定・空なら従来どおり直接 URL のまま。実尺を RSS 側に持たせるのは、この音声ストリームが断片化 MP4 (fMP4) で長さ情報が二重に入るため、プレイヤー (特に iOS) が長さを二重に数えて実尺の2倍を表示してしまうからで、クライアントは `itunes:duration` を表示・シークの正として使う
 - 例外として、本人のチャンネル「藤原史和 川口を歩くQAエンジニア」(`UCbiDZXbr391oT_vsRiqwPFg`、コード内 `YT_AUDIO_ALWAYS_CHANNEL_ID`) だけは常時対応とする: 30日制限も最新3本の上限も付けず、取得できた動画 (最大20本) を毎時すべて依頼し直す。ze 側のバッチは URL が4時間を超えたエントリを取り直すため、毎時キューに入れ直すことでこのチャンネルの音声 URL は失効前に更新され続け、常に再生可能な状態が保たれる (ze 側の変更は不要)。全体の発火キャップは 100件 (通常分 最大23フィード×3本=69 + 常時対応分 最大20本に余裕を持たせた値)
 - フロントは `doPost` の JSON API でフィード一覧と記事 (既読状態の初回取り込み用) を読み、フィード管理を行う
 - 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、オーナー本人にだけセッションを発行する
@@ -48,7 +48,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 | `SPREADSHEET_ID` | 必須 | 本番シート `reader` (ステージングは `reader-staging`) のID |
 | `YOUTUBE_API_KEY` | YouTube用 | YouTube Data API v3 のキー。YouTube フィードの取り込みに必須 |
 | `A_ZE_GS_TOKEN` | 音声用 | a.ze.gs のコマンド用トークン (`X-Api-Token`)。毎時巡回で音声抽出 (`yt-audio`) を依頼するときに使う。未設定なら依頼だけを省く |
-| `YT_PLAY_TOKEN` | 音声用 | ze の音声中継 (`yt-play`) の合言葉。設定すると `?rss=` の enclosure が中継 URL (`https://a.ze.gs/yt-play/<token>/<動画ID>`) になる。未設定・空なら従来の直接 URL のまま |
+| `YT_PLAY_TOKEN` | 音声用 | ze の音声中継 (`yt-play`) の合言葉。設定すると `?rss=` の enclosure が中継 URL (`https://y.ze.gs/<token>/<動画ID>`) になる。未設定・空なら従来の直接 URL のまま |
 | `GOOGLE_CLIENT_ID` | 任意 | 設定すると IDトークンの `aud` をピン留めする (tweet-gas と同じ) |
 | `SHARE_TOKEN_HASH` / `SHARE_EXPIRES_AT` | 既存リンク用 | 一時アクセスリンクのハッシュと期限。`exchange_share` が読む。発行手段 (`issue_share`) は廃止したため、既存リンクは期限まで有効だが新規発行はできない |
 
