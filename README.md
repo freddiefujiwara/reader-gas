@@ -5,7 +5,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 - 毎時トリガー `fetchFeeds` が YouTube フィードだけを Data API 経由で巡回し、新着記事を `articles` シートへ追記する (通常の RSS フィードは v2 でクライアント側が取得する)
 - YouTube の音声は ogp と同じ非同期の形で扱う: 毎時巡回で各フィードの公開30日以内の最新3本ぶん、a.ze.gs の `yt-audio` コマンドへ音声ストリーム URL の抽出を依頼し (公開日時が読めない動画・30日を超えた動画は依頼しない。更新の止まったチャンネルは最新動画でも30日超なら対象外)、ze 側が抽出結果を `https://a.ze.gs/audio-urls.json` (動画ID → `{url, ts, dur}`、`dur` は実尺・秒で無いエントリもある) として公開する。RSS 出力 (`?rss=`) はその JSON を読み、抽出から5時間以内のエントリがあるアイテムにだけ enclosure として付け、エントリに `dur` があれば整数秒に丸めた `<itunes:duration>` も付ける (音声ファイル自体はどこにも置かない)。スクリプトプロパティ `YT_PLAY_TOKEN` が設定されている場合は、enclosure の URL は抽出済みの直接 URL ではなく、ze の中継 URL (`https://y.ze.gs/<token>/<動画ID>`) になる (直接 URL は通常の GET が約31KB/秒まで絞られ、長編動画の再生開始が約40秒かかるため。中継は Range 取得で引き直して流すだけで、ファイルは置かない)。未設定・空なら従来どおり直接 URL のまま。実尺を RSS 側に持たせるのは、この音声ストリームが断片化 MP4 (fMP4) で長さ情報が二重に入るため、プレイヤー (特に iOS) が長さを二重に数えて実尺の2倍を表示してしまうからで、クライアントは `itunes:duration` を表示・シークの正として使う
 - 例外として、本人のチャンネル「藤原史和 川口を歩くQAエンジニア」(`UCbiDZXbr391oT_vsRiqwPFg`、コード内 `YT_AUDIO_ALWAYS_CHANNEL_ID`) だけは常時対応とする: 30日制限も最新3本の上限も付けず、取得できた動画 (最大20本) を毎時すべて依頼し直す。ze 側のバッチは URL が4時間を超えたエントリを取り直すため、毎時キューに入れ直すことでこのチャンネルの音声 URL は失効前に更新され続け、常に再生可能な状態が保たれる (ze 側の変更は不要)。全体の発火キャップは 100件 (通常分 最大23フィード×3本=69 + 常時対応分 最大20本に余裕を持たせた値)
-- フロントは `doPost` の JSON API でフィード一覧と記事 (既読状態の初回取り込み用) を読み、フィード管理を行う
+- フロントは `doPost` の JSON API でフィード一覧と記事を読み、フィード管理を行う (既読状態は端末ローカル管理で、サーバーは持たない)
 - 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、オーナー本人にだけセッションを発行する
 
 ## シート構成
@@ -16,10 +16,9 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 |---|---|
 | `feeds` | フィード正本。管理はフロントの管理画面 (listFeeds / saveFeed / deleteFeed / reorderFeeds) から行う |
 | `articles` | 記事本体。`id` はフィードID＋guid/リンクの SHA-256 |
-| `states` | 記事ごとの既読状態 (v1 のサーバー側既読の名残。v2 では書き込まず、既読の初回取り込みと保持判定にだけ使う) |
 | `owner_sessions` | セッションのトークンハッシュだけを保存 (自動作成)。複数端末の同時セッション可。`role` が `owner` / `readonly` |
 
-保持ルール: 既読または状態なしの記事は、60日経過または新しい順5,000件を超えた分を削除する。未読は保持する。
+保持ルール: 記事は、取り込んでから60日経過または新しい順5,000件を超えた分を削除する。
 
 ## API (doPost, JSON)
 
@@ -27,10 +26,10 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 |---|---|---|
 | `exchange_session` | `idToken` | Google IDトークンを検証し、オーナーセッション (30日) を発行 |
 | `exchange_share` | `shareToken` | 一時アクセスリンクを検証し、読み取り専用セッションを発行 |
-| `list` | `sessionToken`, `limit?` (最大500) | 記事一覧 (既読マージ済み・新しい順)＋フィード一覧 (未読数付き)。v2 では既読状態の初回取り込みにだけ使う |
+| `list` | `sessionToken`, `limit?` (最大500) | 記事一覧 (新しい順。`isRead` は既読を端末ローカル管理にするため常に `false`)＋フィード一覧 (未読数付き＝サーバー側の記事数)。v2 では主にフィード一覧 (fetchUrl 付き) の取得に使う |
 | `listFeeds` | `sessionToken` (owner) | フィード管理用一覧 (全件、最終取得・未読数付き)。読み取り専用セッションは拒否 |
 | `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category,isPrivate}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消す。YouTube はチャンネルページ URL (`/channel/UC...`・`/@handle`) で登録でき、保存時は `/channel/UC...` 形に寄せる (ハンドルは Data API で解決し、タイトルも補完する) |
-| `deleteFeed` | `sessionToken` (owner), `feedId` | フィード行と、その記事・状態をまとめて削除。未知のIDは `{ok:false, error:"not_found"}` |
+| `deleteFeed` | `sessionToken` (owner), `feedId` | フィード行と、その記事をまとめて削除。未知のIDは `{ok:false, error:"not_found"}` |
 | `reorderFeeds` | `sessionToken` (owner), `feedIds:[...]` | フィードの並び順を変更 (表示順＝feedsシートの行順なので、行を並び替えて一括で書き戻す)。現在の全フィードIDと集合が一致しない・重複する場合は `{ok:false, error:"invalid", message}` |
 
 フィード管理のセキュリティ規則: `isPrivate` は入力値では決めず、URLのホストが `a.ze.gs` そのもののときだけ `true` に強制する (自前ホストのマーカーとしてだけ使う)。
