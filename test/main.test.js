@@ -14,6 +14,7 @@ import {
   toIsoDate,
   isTruthy,
   isAllowedIdTokenPayload,
+  verifyIdToken,
   hashesEqual,
   isSessionExpired,
   prunePlan,
@@ -2990,5 +2991,234 @@ test('fetchFeeds: 記事取得より前に購読同期が走り、追加され�
     // 削除されたフィードの記事はカスケードで消え、残った2フィードの記事が入る
     const articleFeedIds = ss.sheets['articles'].rows.slice(1).map((r) => r[1]).sort();
     assert.deepEqual(articleFeedIds, ['yt-keep', feedIdFromUrl('https://www.youtube.com/channel/' + CH_NEW)].sort());
+  } finally { restore(); }
+});
+
+// --- テスト総点検 (2026-11-16) の最小追加セット ---
+// 監査レポート test-audit-reader-gas.md の不足リスト (高1・高2・中3・中4・中5) への対応。
+
+test('doPost: 書き込み系アクションは readonly セッションで forbidden になり、シートも変わらない', () => {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['feed-a', 'フィードA', 'https://example.com/a.xml', 'tech', '', '', '', '', ''],
+      ['feed-b', 'フィードB', 'https://example.com/b.xml', 'tech', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW],
+  });
+  const restore = installSpreadsheet(ss);
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    const readonly = issueSession('readonly');
+    const before = JSON.stringify(ss.sheets['feeds'].rows);
+    assert.deepEqual(post({ action: 'listFeeds', sessionToken: readonly.sessionToken }), { ok: false, error: 'forbidden' });
+    assert.deepEqual(post({ action: 'saveFeed', sessionToken: readonly.sessionToken, feed: { url: 'https://example.com/c.xml', title: 'C' } }), { ok: false, error: 'forbidden' });
+    assert.deepEqual(post({ action: 'deleteFeed', sessionToken: readonly.sessionToken, feedId: 'feed-a' }), { ok: false, error: 'forbidden' });
+    assert.deepEqual(post({ action: 'reorderFeeds', sessionToken: readonly.sessionToken, feedIds: ['feed-b', 'feed-a'] }), { ok: false, error: 'forbidden' });
+    // 拒否された書き込みはシートに一切反映されない
+    assert.equal(JSON.stringify(ss.sheets['feeds'].rows), before);
+    // 対照: オーナーは同じアクションを通せる
+    const owner = issueSession('owner');
+    assert.equal(post({ action: 'listFeeds', sessionToken: owner.sessionToken }).ok, true);
+  } finally { restore(); }
+});
+
+test('doPost reorderFeeds: 指定順がシートに書き戻され、不正な順序は invalid で無変更', () => {
+  const rowA = ['feed-a', 'フィードA', 'https://example.com/a.xml', 'tech', '', '', '2026-11-15T00:00:00.000Z', '200', ''];
+  const rowB = ['feed-b', 'フィードB', 'https://example.com/b.xml', 'news', '', '', '', '', ''];
+  const rowC = ['feed-c', 'フィードC', 'https://example.com/c.xml', '', '', '', '', '', ''];
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW, rowA, rowB, rowC],
+    articles: [ARTICLE_HEADERS_ROW],
+  });
+  const restore = installSpreadsheet(ss);
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    const owner = issueSession('owner');
+    assert.deepEqual(post({ action: 'reorderFeeds', sessionToken: owner.sessionToken, feedIds: ['feed-c', 'feed-a', 'feed-b'] }), { ok: true });
+    // ヘッダーは先頭のまま、データ行だけが指定順に入れ替わる
+    assert.deepEqual(ss.sheets['feeds'].rows, [FEED_HEADERS_ROW, rowC, rowA, rowB]);
+    // 未知の ID を含む順序は invalid で、シートは変わらない
+    const bad = post({ action: 'reorderFeeds', sessionToken: owner.sessionToken, feedIds: ['feed-c', 'feed-a', 'nope'] });
+    assert.equal(bad.ok, false);
+    assert.equal(bad.error, 'invalid');
+    assert.deepEqual(ss.sheets['feeds'].rows, [FEED_HEADERS_ROW, rowC, rowA, rowB]);
+  } finally { restore(); }
+});
+
+test('doPost listFeeds: 応答のキー集合が固定され、行順と記事数がそのまま返る', () => {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['feed-b', 'フィードB', 'https://example.com/b.xml', 'news', '', '', '2026-11-15T01:00:00.000Z', '200', ''],
+      ['feed-a', 'フィードA', 'https://example.com/a.xml', 'tech', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW,
+      ['art1', 'feed-a', '記事1', 'https://example.com/1', '', '', '', ''],
+      ['art2', 'feed-a', '記事2', 'https://example.com/2', '', '', '', ''],
+      ['art3', 'feed-b', '記事3', 'https://example.com/3', '', '', '', ''],
+    ],
+  });
+  const restore = installSpreadsheet(ss);
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    const owner = issueSession('owner');
+    const res = post({ action: 'listFeeds', sessionToken: owner.sessionToken });
+    assert.equal(res.ok, true);
+    assert.deepEqual(Object.keys(res).sort(), ['feeds', 'ok']);
+    // シートの行順が表示順としてそのまま返る
+    assert.deepEqual(res.feeds.map((f) => f.id), ['feed-b', 'feed-a']);
+    assert.deepEqual(Object.keys(res.feeds[0]).sort(), [
+      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'title', 'unreadCount', 'url',
+    ]);
+    // 未読数 = そのフィードの記事数 (サーバー側に既読は無い)
+    assert.equal(res.feeds[0].unreadCount, 1);
+    assert.equal(res.feeds[1].unreadCount, 2);
+    assert.equal(res.feeds[0].title, 'フィードB');
+    assert.equal(res.feeds[0].category, 'news');
+    // ScriptApp が無い環境ではサービス URL が空で、fetchUrl はフィード URL そのまま
+    assert.equal(res.feeds[0].fetchUrl, 'https://example.com/b.xml');
+    assert.equal(res.feeds[0].lastFetchedAt, '2026-11-15T01:00:00.000Z');
+    assert.equal(res.feeds[0].lastStatus, '200');
+  } finally { restore(); }
+});
+
+// tokeninfo への UrlFetch を差し込んだ環境 (verifyIdToken と exchange_session 用)。
+function tokenInfoEnv({ responder, ss = new FakeSpreadsheet({}), extraProps = {} }) {
+  const props = fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', ...extraProps });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: props.service,
+    ContentService: fakeContentService(),
+    Utilities: fakeUtilities,
+    UrlFetchApp: { fetch: (url) => responder(url) },
+  });
+  return { restore, ss };
+}
+const jsonHttpResponse = (code, body) => ({
+  getResponseCode: () => code,
+  getContentText: () => (typeof body === 'string' ? body : JSON.stringify(body)),
+});
+
+test('verifyIdToken: tokeninfo の許可ペイロードをそのまま返し、URL に id_token が乗る', () => {
+  const payload = { email: 'zegenvs@gmail.com', email_verified: 'true', aud: 'client-123', sub: 'subject-1' };
+  let seenUrl = '';
+  const { restore } = tokenInfoEnv({
+    responder: (url) => { seenUrl = String(url); return jsonHttpResponse(200, payload); },
+    extraProps: { GOOGLE_CLIENT_ID: 'client-123' },
+  });
+  try {
+    assert.deepEqual(verifyIdToken('tok en/+='), payload);
+    assert.equal(seenUrl, 'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent('tok en/+='));
+  } finally { restore(); }
+});
+
+test('verifyIdToken: 非200・不正JSON・未検証メール・別メール・aud不一致はすべて null', () => {
+  const okPayload = { email: 'zegenvs@gmail.com', email_verified: 'true', aud: 'client-123' };
+  const responders = [
+    () => jsonHttpResponse(400, { error: 'invalid_token' }),
+    () => jsonHttpResponse(200, 'not json'),
+    () => jsonHttpResponse(200, { ...okPayload, email_verified: 'false' }),
+    () => jsonHttpResponse(200, { ...okPayload, email: 'someone@example.com' }),
+    () => jsonHttpResponse(200, { ...okPayload, aud: 'other-client' }),
+  ];
+  for (const responder of responders) {
+    const { restore } = tokenInfoEnv({ responder, extraProps: { GOOGLE_CLIENT_ID: 'client-123' } });
+    try {
+      assert.equal(verifyIdToken('some-token'), null);
+    } finally { restore(); }
+  }
+  // 空トークンは tokeninfo を叩かずに null
+  let called = false;
+  const env = tokenInfoEnv({ responder: () => { called = true; return jsonHttpResponse(200, okPayload); } });
+  try {
+    assert.equal(verifyIdToken(''), null);
+    assert.equal(called, false);
+  } finally { env.restore(); }
+});
+
+test('verifyIdToken / exchange_session: tokeninfo の例外は伝播し、doPost では ok:false でセッションは作られない', () => {
+  // 現行の verifyIdToken は UrlFetchApp.fetch の例外を握らない (非200や
+  // 検証 NG は null で返す)。例外は doPost の外側 catch で ok:false に
+  // なり、セッションは発行されない。この現行挙動を固定する。
+  const { restore, ss } = tokenInfoEnv({
+    responder: () => { throw new Error('network down'); },
+  });
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    assert.throws(() => verifyIdToken('some-token'), /network down/);
+    const res = post({ action: 'exchange_session', idToken: 'some-token' });
+    assert.equal(res.ok, false);
+    const sheet = ss.sheets['owner_sessions'];
+    assert.ok(!sheet || sheet.rows.length <= 1, 'セッション行が作られていない');
+  } finally { restore(); }
+});
+
+test('doPost exchange_session: ID トークンが通れば owner セッションが発行され、オーナー限定アクションまで使える', () => {
+  const payload = { email: 'zegenvs@gmail.com', email_verified: 'true', aud: 'client-123' };
+  const { restore, ss } = tokenInfoEnv({
+    responder: () => jsonHttpResponse(200, payload),
+    extraProps: { GOOGLE_CLIENT_ID: 'client-123' },
+  });
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    const issued = post({ action: 'exchange_session', idToken: 'valid-token' });
+    assert.equal(issued.ok, true);
+    assert.equal(issued.role, 'owner');
+    assert.ok(issued.sessionToken);
+    // 発行されたセッションで listFeeds が通る
+    assert.deepEqual(post({ action: 'listFeeds', sessionToken: issued.sessionToken }), { ok: true, feeds: [] });
+    // シートに残るのはハッシュだけで、生トークンは残らない
+    assert.ok(!JSON.stringify(ss.sheets['owner_sessions'].rows).includes(issued.sessionToken));
+  } finally { restore(); }
+});
+
+test('doPost exchange_session: ID トークンが拒否されれば unauthorized で、セッション行は作られない', () => {
+  const { restore, ss } = tokenInfoEnv({
+    responder: () => jsonHttpResponse(200, { email: 'zegenvs@gmail.com', email_verified: 'false' }),
+  });
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    assert.deepEqual(post({ action: 'exchange_session', idToken: 'bad-token' }), { ok: false, error: 'unauthorized' });
+    const sheet = ss.sheets['owner_sessions'];
+    assert.ok(!sheet || sheet.rows.length <= 1, 'セッション行が作られていない');
+  } finally { restore(); }
+});
+
+test('appsscript.json: webapp.access とスコープ・有効化サービスが固定されている', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../appsscript.json', import.meta.url), 'utf8'));
+  // 匿名アクセスが CI 再デプロイで巻き戻らないこと (access は ANYONE_ANONYMOUS が正)
+  assert.equal(manifest.webapp.access, 'ANYONE_ANONYMOUS');
+  assert.equal(manifest.webapp.executeAs, 'USER_DEPLOYING');
+  assert.deepEqual([...manifest.oauthScopes].sort(), [
+    'https://www.googleapis.com/auth/script.external_request',
+    'https://www.googleapis.com/auth/script.scriptapp',
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/youtube.readonly',
+  ].sort());
+  assert.deepEqual(manifest.dependencies.enabledAdvancedServices, [
+    { serviceId: 'youtube', userSymbol: 'YouTube', version: 'v3' },
+  ]);
+});
+
+test('fetchMyYouTubeSubscriptions: 次ページが返り続けると上限ページ数で例外になる', () => {
+  const yt = fakeYouTubeSubscriptions([{ items: [subscriptionItem(CH_KEEP, 'A')], nextPageToken: 'more' }]);
+  const restore = installGasGlobals({ YouTube: yt.service });
+  try {
+    assert.throws(() => fetchMyYouTubeSubscriptions(), /paging exceeded 20 pages/);
+    assert.equal(yt.calls.length, 20);
+  } finally { restore(); }
+});
+
+test('syncYouTubeSubscriptions: ページング上限超過では中止し、削除も追加も走らない', () => {
+  const { ss, restore, logs } = syncTestEnv({
+    feedsRows: [ytFeedRow('yt-gone', CH_GONE, 'G')],
+    pages: [{ items: [subscriptionItem(CH_KEEP, 'A')], nextPageToken: 'more' }],
+  });
+  try {
+    const result = syncYouTubeSubscriptions();
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'fetch_failed');
+    // 一覧が不完全な可能性があるため、購読に無いフィードも消さない
+    assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'yt-gone']);
+    assert.ok(logs.some((m) => m.includes('aborted (fetch_failed)') && m.includes('paging exceeded')), logs.join('\n'));
   } finally { restore(); }
 });
