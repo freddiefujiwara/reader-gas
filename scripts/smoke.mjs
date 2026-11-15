@@ -9,9 +9,13 @@ const EXEC_URL = process.env.READER_GAS_EXEC_URL
   || 'https://script.google.com/macros/s/AKfycbz-0BmbGrFsfaI9vkVsvc-f_69iq0HIfJMluS_H_SXpUnLxlU6lvYkDgmZpIvw1IpwB/exec';
 
 // RSS 出力を確認する YouTube フィードの ID。環境変数 READER_SMOKE_YT_FEED_ID で
-// 差し替えできる。既定値は移行前の slug ID で、シート移行フェーズ
-// (フィード ID のハッシュ化) が終わったらハッシュ ID に変わる。
-const YT_FEED_ID = process.env.READER_SMOKE_YT_FEED_ID || 'yt-rakutentech';
+// 差し替えできる。既定値は rakutentech のハッシュ ID (フィード ID の
+// ハッシュ化は完了済みで、現在の ID はすべて URL のハッシュ)。
+const YT_FEED_ID = process.env.READER_SMOKE_YT_FEED_ID || '85ce0e8df21fc1c6';
+
+// 実在する非 YouTube フィード (NHKニュース) のハッシュ ID。
+// ?rss= は YouTube フィード以外を feed_not_found にする仕様の確認用。
+const NON_YT_FEED_ID = '7ba6229a37625153';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -57,9 +61,9 @@ function parseJson(text) {
 
 // 3. 実在する非 YouTube フィードは feed_not_found
 {
-  const { text } = await getText(EXEC_URL + '?rss=nhk');
+  const { text } = await getText(EXEC_URL + '?rss=' + NON_YT_FEED_ID);
   const json = parseJson(text);
-  check('?rss=nhk が feed_not_found', !!json && json.ok === false && json.error === 'feed_not_found', text.slice(0, 120));
+  check('?rss=' + NON_YT_FEED_ID + ' (非YouTube) が feed_not_found', !!json && json.ok === false && json.error === 'feed_not_found', text.slice(0, 120));
 }
 
 // 4. 未知の ID も feed_not_found

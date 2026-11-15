@@ -30,7 +30,6 @@ import {
   youtubeApiErrorDetail,
   parseAudioUrlsMap,
   fetchAudioUrlsMap,
-  freshAudioUrl,
   ytPlayUrl,
   planYouTubeAudioTriggers,
   fireYouTubeAudioTriggers,
@@ -1955,23 +1954,6 @@ test('parseAudioUrlsMap: 形の合うエントリだけを残し、不正な入�
   assert.deepEqual(parseAudioUrlsMap(''), {});
   assert.deepEqual(parseAudioUrlsMap('[1,2]'), {});
   assert.deepEqual(parseAudioUrlsMap('null'), {});
-});
-
-test('freshAudioUrl: 抽出から5時間以内だけ URL を返し、古い・無いエントリは空', () => {
-  const nowMs = Date.parse('2026-11-15T12:00:00.000Z');
-  const nowSec = Math.floor(nowMs / 1000);
-  const map = {
-    vidFresh111: { url: 'https://stream.example.com/fresh', ts: nowSec - 3600 },
-    vidEdge1111: { url: 'https://stream.example.com/edge', ts: nowSec - 5 * 3600 },
-    vidStale111: { url: 'https://stream.example.com/stale', ts: nowSec - 5 * 3600 - 1 },
-  };
-  assert.equal(freshAudioUrl(map, 'vidFresh111', nowMs), 'https://stream.example.com/fresh');
-  // ちょうど5時間は新鮮な側に倒す
-  assert.equal(freshAudioUrl(map, 'vidEdge1111', nowMs), 'https://stream.example.com/edge');
-  assert.equal(freshAudioUrl(map, 'vidStale111', nowMs), '');
-  assert.equal(freshAudioUrl(map, 'vidMissing1', nowMs), '');
-  assert.equal(freshAudioUrl(null, 'vidFresh111', nowMs), '');
-  assert.equal(freshAudioUrl(undefined, 'vidFresh111', nowMs), '');
 });
 
 test('buildRssXml: 新鮮なエントリがあるアイテムにだけ enclosure を付ける', () => {
