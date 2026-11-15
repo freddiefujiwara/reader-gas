@@ -205,12 +205,12 @@ test('validateFeedInput: 正常系は正規化し、既定値を補う', () => {
     title: 'Zenn',
     url: 'https://zenn.dev/feed',
     category: '',
-    isPrivate: false,
   });
   const r2 = validateFeedInput({ id: 'nhk', title: 'NHK', url: 'https://www3.nhk.or.jp/rss/news/cat0.xml', category: ' news ', enabled: 'FALSE', isPrivate: false });
   assert.equal(r2.feed.category, 'news');
-  // enabled は廃止: 入力にあっても無視され、正規化結果に含まれない。
+  // enabled / isPrivate は廃止: 入力にあっても無視され、正規化結果に含まれない。
   assert.ok(!('enabled' in r2.feed));
+  assert.ok(!('isPrivate' in r2.feed));
 });
 
 test('validateFeedInput: 不正な入力は ok:false と理由を返す', () => {
@@ -235,31 +235,15 @@ test('validateFeedInput: 不正な入力は ok:false と理由を返す', () => 
   assert.equal(validateFeedInput(undefined).ok, false);
 });
 
-test('validateFeedInput: isPrivate は a.ze.gs のときだけ強制的に true、それ以外は常に false', () => {
-  // 自前ホスト: 入力が false でも true になる
-  const priv = validateFeedInput({ id: 'mfcf', title: 'MF', url: 'https://a.ze.gs/mfcf.xml', isPrivate: false });
-  assert.equal(priv.ok, true);
-  assert.equal(priv.feed.isPrivate, true);
-  // 第三者ホスト: 入力が true でも false になる (トークン漏洩防止)
-  const pub = validateFeedInput({ id: 'evil', title: 'Evil', url: 'https://example.com/feed', isPrivate: true });
-  assert.equal(pub.ok, true);
-  assert.equal(pub.feed.isPrivate, false);
-  // サブドメインや類似ホストは対象外
-  assert.equal(validateFeedInput({ id: 'sub', title: 'S', url: 'https://x.a.ze.gs/feed', isPrivate: true }).feed.isPrivate, false);
-  assert.equal(validateFeedInput({ id: 'look', title: 'L', url: 'https://a.ze.gs.example.com/feed', isPrivate: true }).feed.isPrivate, false);
-});
-
 test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変更で etag/last_modified だけ消える', () => {
-  const feed = { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech', isPrivate: false };
+  const feed = { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech' };
   const created = buildFeedRow(feed, null);
   assert.deepEqual(created, {
     id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech',
-    is_private: false,
     etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '',
   });
   const existing = {
     id: 'zenn', title: 'Old', url: 'https://zenn.dev/feed', category: '',
-    is_private: 'FALSE',
     etag: '"abc"', last_modified: 'Wed, 01 Jan 2026 00:00:00 GMT',
     last_fetched_at: '2026-11-14T00:00:00.000Z', last_status: '200', last_error: '',
   };
@@ -277,31 +261,29 @@ test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変
 });
 
 test('feedRowValues: ヘッダー順に並べ、未知ヘッダーは空文字', () => {
-  const row = buildFeedRow({ id: 'a', title: 'A', url: 'https://example.com/f', category: '', isPrivate: true }, null);
-  assert.deepEqual(feedRowValues(row, ['id', 'url', 'is_private', 'etag']), ['a', 'https://example.com/f', true, '']);
+  const row = buildFeedRow({ id: 'a', title: 'A', url: 'https://example.com/f', category: '' }, null);
+  assert.deepEqual(feedRowValues(row, ['id', 'url', 'etag']), ['a', 'https://example.com/f', '']);
 });
 
-test('buildFeedRow: 行は10列で、E列は is_private (enabled 列は撤去済み)', () => {
-  const row = buildFeedRow({ id: 'a', title: 'A', url: 'https://example.com/f', category: '', isPrivate: true }, null);
+test('buildFeedRow: 行は9列 (enabled / is_private 列は撤去済み)', () => {
+  const row = buildFeedRow({ id: 'a', title: 'A', url: 'https://example.com/f', category: '' }, null);
   const values = feedRowValues(row);
-  assert.equal(values.length, 10);
-  assert.equal(values[4], true);
+  assert.equal(values.length, 9);
 });
 
 test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
   const shaped = feedToApiShape({
     id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', category: 'private',
-    is_private: 'TRUE',
     last_status: '200', last_error: '', last_fetched_at: new Date('2026-11-14T00:15:30.088Z'),
   }, 7);
   assert.deepEqual(shaped, {
     id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', fetchUrl: 'https://a.ze.gs/x.freddie.xml', category: 'private',
-    isPrivate: true,
     lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
-  // enabled は廃止: 行に値があっても API 形式には出さない。
+  // enabled / isPrivate は廃止: 行に値があっても API 形式には出さない。
   assert.ok(!('enabled' in feedToApiShape({ id: 'x', enabled: 'FALSE' })));
+  assert.ok(!('isPrivate' in feedToApiShape({ id: 'x', is_private: 'TRUE' })));
 });
 
 test('countUnreadByFeed: サーバー側に既読状態が無いため記事数をそのまま数える', () => {
@@ -715,9 +697,9 @@ test('buildListPayload: フィードに enabled は付かない (廃止)', () =>
   // GAS グローバルの最小スタブ (シートは行列だけを持つフェイク)。
   const tables = {
     feeds: [
-      ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'],
-      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', false, '', '', '', '', ''],
-      ['yt-off', 'YT off', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', false, '', '', '', '', ''],
+      ['id', 'title', 'url', 'category', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'],
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
+      ['yt-off', 'YT off', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', '', '', '', '', ''],
     ],
     articles: [
       ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'],
@@ -771,7 +753,7 @@ test('buildListPayload: フィードに enabled は付かない (廃止)', () =>
 // グローバルの有無で経路が変わる関数があるため)。
 // ============================================================
 
-const FEED_HEADERS_ROW = ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
+const FEED_HEADERS_ROW = ['id', 'title', 'url', 'category', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
 const ARTICLE_HEADERS_ROW = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
 const SESSION_HEADERS_ROW = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
 
@@ -955,7 +937,7 @@ function rssTestSpreadsheet() {
   return new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
       ['yt-rakutentech', '楽天テック', 'https://www.youtube.com/channel/UC0SZCr0g1dOpKAfAZoQjIHw', '', 'FALSE', '', '', '', '200', ''],
-      ['nhk', 'NHK ニュース', 'https://www3.nhk.or.jp/rss/news/cat0.xml', '', 'FALSE', '', '', '', '', ''],
+      ['nhk', 'NHK ニュース', 'https://www3.nhk.or.jp/rss/news/cat0.xml', '', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW,
       ['row1', 'yt-rakutentech', '動画その1', 'https://www.youtube.com/watch?v=vidTech1111', '2026-11-14T01:00:00.000Z', '2026-11-14T02:00:00.000Z', '概要1', '楽天テック'],
@@ -1180,7 +1162,7 @@ test('buildListPayload: limit は 500 にクランプされ、不正値は既定
     articles.push(['a' + i, 'zenn', '記事' + i, 'https://example.com/' + i, t, t, '', '']);
   }
   const ss = new FakeSpreadsheet({
-    feeds: [FEED_HEADERS_ROW, ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'FALSE', '', '', '', '', '']],
+    feeds: [FEED_HEADERS_ROW, ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', '']],
     articles,
   });
   const restore = installSpreadsheet(ss);
@@ -1200,8 +1182,8 @@ test('buildListPayload: limit は 500 にクランプされ、不正値は既定
 test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim のまま (キー集合を固定)', () => {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-x', 'YT', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
-      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'FALSE', '', '', '', '', ''],
+      ['yt-x', 'YT', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', '', '', '', '', ''],
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW,
       ['a1', 'yt-x', '動画', 'https://www.youtube.com/watch?v=vidX111111', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '', ''],
@@ -1223,17 +1205,43 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
     assert.ok(!('enabled' in byId['zenn']));
     assert.equal(byId['yt-x'].unreadCount, 1);
     // フィードのキー集合は slim 化後 (PR #16) の形から enabled を除いた形に固定する
-    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'isPrivate', 'title', 'unreadCount', 'url']);
+    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'title', 'unreadCount', 'url']);
     // 既読は端末ローカル管理のため、isRead は常に false
     assert.equal(payload.articles[0].isRead, false);
+  } finally { restore(); }
+});
+
+test('buildListPayload: 旧10列シート (is_private 列が残っている過渡期) でも読み取りできる', () => {
+  // 列の読み取りはヘッダー名ベースのため、未知列が残っていても壊れない。
+  // 本番シートの is_private 列削除はコードのデプロイ後に行う前提。
+  const legacyHeaders = ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
+  const ss = new FakeSpreadsheet({
+    feeds: [legacyHeaders,
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'TRUE', '"abc"', '', '2026-11-14T00:00:00.000Z', '200', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW],
+  });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
+    ScriptApp: { getService: () => ({ getUrl: () => 'https://example.com/exec' }) },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const payload = buildListPayload({});
+    assert.equal(payload.ok, true);
+    assert.equal(payload.feeds.length, 1);
+    assert.equal(payload.feeds[0].id, 'zenn');
+    assert.equal(payload.feeds[0].category, 'tech');
+    assert.ok(!('isPrivate' in payload.feeds[0]));
   } finally { restore(); }
 });
 
 test('handleDeleteFeed: articles → feeds の順にカスケード削除する', () => {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-a', 'A チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
-      ['zenn', 'Zenn', 'https://zenn.dev/feed', '', 'FALSE', '', '', '', '', ''],
+      ['yt-a', 'A チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', '', '', '', '', ''],
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', '', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW,
       ['a1', 'yt-a', '記事1', 'https://example.com/1', '', '', '', ''],
@@ -1260,7 +1268,7 @@ test('handleDeleteFeed: articles → feeds の順にカスケード削除する'
 
 test('handleDeleteFeed: 未知の ID は not_found で、行は変わらない', () => {
   const ss = new FakeSpreadsheet({
-    feeds: [FEED_HEADERS_ROW, ['zenn', 'Zenn', 'https://zenn.dev/feed', '', 'FALSE', '', '', '', '', '']],
+    feeds: [FEED_HEADERS_ROW, ['zenn', 'Zenn', 'https://zenn.dev/feed', '', '', '', '', '', '']],
     articles: [ARTICLE_HEADERS_ROW],
   });
   const restore = installSpreadsheet(ss);
@@ -1275,7 +1283,7 @@ test('handleDeleteFeed: 未知の ID は not_found で、行は変わらない',
 function fetchTestEnv({ apiKey, responder }) {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-x', 'YT チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
+      ['yt-x', 'YT チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW],
     // states タブは廃止したため、fetchFeeds は作らない (テストで検証する)
@@ -1301,9 +1309,9 @@ test('fetchFeeds: YOUTUBE_API_KEY 未設定なら行に error と理由を記録
     assert.equal(result.fetched, 1);
     assert.equal(result.added, 0);
     const row = ss.sheets['feeds'].rows[1];
-    assert.equal(row[8], 'error');
-    assert.equal(row[9], 'YOUTUBE_API_KEY is not set');
-    assert.ok(row[7], 'last_fetched_at も記録される');
+    assert.equal(row[7], 'error');
+    assert.equal(row[8], 'YOUTUBE_API_KEY is not set');
+    assert.ok(row[6], 'last_fetched_at も記録される');
     // states タブは再作成されない (シートごと削除した本番で作り直さないため)
     assert.equal(ss.sheets['states'], undefined);
   } finally { restore(); }
@@ -1321,10 +1329,10 @@ test('fetchFeeds: HTTP 403 は API の詳細を含むエラー文を行に記録
     const result = fetchFeeds();
     assert.equal(result.added, 0);
     const row = ss.sheets['feeds'].rows[1];
-    assert.equal(row[8], 'error');
-    assert.ok(row[9].startsWith('YouTube API HTTP 403'), row[9]);
-    assert.ok(row[9].includes('exceeded your quota'), row[9]);
-    assert.ok(row[9].length <= 500, row[9]);
+    assert.equal(row[7], 'error');
+    assert.ok(row[8].startsWith('YouTube API HTTP 403'), row[8]);
+    assert.ok(row[8].includes('exceeded your quota'), row[8]);
+    assert.ok(row[8].length <= 500, row[8]);
   } finally { restore(); }
 });
 
@@ -1337,8 +1345,8 @@ test('fetchFeeds: 長い API エラーは詳細200字で切り、行の記録も
   try {
     fetchFeeds();
     const row = ss.sheets['feeds'].rows[1];
-    assert.equal(row[8], 'error');
-    assert.equal(row[9], 'YouTube API HTTP 403 - ' + 'x'.repeat(200));
+    assert.equal(row[7], 'error');
+    assert.equal(row[8], 'YouTube API HTTP 403 - ' + 'x'.repeat(200));
   } finally { restore(); }
 });
 
@@ -1357,8 +1365,8 @@ test('fetchFeeds: 成功時は last_status 200・last_error 空になり、記�
     assert.equal(result.ok, true);
     assert.equal(result.added, 1);
     const row = ss.sheets['feeds'].rows[1];
-    assert.equal(row[8], '200');
-    assert.equal(row[9], '');
+    assert.equal(row[7], '200');
+    assert.equal(row[8], '');
     const articles = ss.sheets['articles'].rows;
     assert.equal(articles.length, 2);
     assert.equal(articles[1][1], 'yt-x');
@@ -1607,9 +1615,9 @@ test('handleSaveFeed: slug ID の既存行は URL 一致で更新され、ID と
   } finally { restore(); }
 });
 
-test('handleSaveFeed: id 指定の更新は行を書き換え、10列で保存される', () => {
+test('handleSaveFeed: id 指定の更新は行を書き換え、9列で保存される', () => {
   const { ss, restore } = saveFeedEnv([
-    ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'FALSE', '', '', '', '', ''],
+    ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
   ]);
   try {
     const res = handleSaveFeed({ feed: { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'blog', enabled: false } });
@@ -1618,10 +1626,10 @@ test('handleSaveFeed: id 指定の更新は行を書き換え、10列で保存�
     const rows = ss.sheets['feeds'].rows;
     assert.equal(rows.length, 2);
     assert.equal(rows[1][3], 'blog');
-    // enabled 列は撤去済み: 行は10列で、E列 (index 4) は is_private になる。
+    // enabled / is_private 列は撤去済み: 行は9列で、E列 (index 4) は etag になる。
     // 入力の enabled は無視される。
-    assert.equal(rows[1].length, 10);
-    assert.equal(rows[1][4], false);
+    assert.equal(rows[1].length, 9);
+    assert.equal(rows[1][4], '');
   } finally { restore(); }
 });
 
@@ -1666,7 +1674,7 @@ test('handleSaveFeed: ハッシュ衝突 (同じ ID・別 URL の行がある) �
   const targetUrl = 'https://example.com/feed-b';
   const collidingId = feedIdFromUrl(targetUrl);
   const { ss, restore } = saveFeedEnv([
-    [collidingId, 'Feed A', 'https://example.com/feed-a', '', 'FALSE', '', '', '', '', ''],
+    [collidingId, 'Feed A', 'https://example.com/feed-a', '', '', '', '', '', ''],
   ]);
   try {
     const res = handleSaveFeed({ feed: { title: 'Feed B', url: targetUrl } });
@@ -1851,7 +1859,7 @@ test('handleSaveFeed: 既定 resolver は APIキーが無い・該当が無い�
 function fetchTitleEnv({ feedTitle, responder }) {
   const ss = new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
-      ['yt-x', feedTitle, 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''],
+      ['yt-x', feedTitle, 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', '', '', '', '', ''],
     ],
     articles: [ARTICLE_HEADERS_ROW],
   });
@@ -1883,7 +1891,7 @@ test('fetchFeeds: タイトル未設定なら channels.list のチャンネル�
     assert.equal(result.added, 1);
     const row = ss.sheets['feeds'].rows[1];
     assert.equal(row[1], '正式チャンネル名');
-    assert.equal(row[8], '200');
+    assert.equal(row[7], '200');
   } finally { restore(); }
 });
 
@@ -1901,8 +1909,8 @@ test('fetchFeeds: タイトル補完が失敗しても巡回は続け、タイ�
     assert.equal(result.added, 1);
     const row = ss.sheets['feeds'].rows[1];
     assert.equal(row[1], '');
-    assert.equal(row[8], '200');
-    assert.equal(row[9], '');
+    assert.equal(row[7], '200');
+    assert.equal(row[8], '');
   } finally { restore(); }
 });
 
@@ -2165,7 +2173,7 @@ function playlistBodyWith(items) {
   });
 }
 
-const YT_FEED_ROW_X = ['yt-x', 'YT チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '', ''];
+const YT_FEED_ROW_X = ['yt-x', 'YT チャンネル', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', '', '', '', '', ''];
 
 // feedsRows と articles の初期行を差し替えられる fetchFeeds 用環境。
 function fetchAudioEnv({ props = {}, feedsRows, articlesRows = [], responder }) {
@@ -2421,8 +2429,8 @@ test('fetchFeeds: 最新動画でも公開30日を超えていれば抽出トリ
 });
 
 test('fetchFeeds: 抽出トリガーはフィードをまたいだ重複を除いて発火する', () => {
-  const rowA = ['yt-a', 'チャンネルA', 'https://www.youtube.com/channel/UCaaaaaaaaaaA', '', 'FALSE', '', '', '', '', ''];
-  const rowB = ['yt-b', 'チャンネルB', 'https://www.youtube.com/channel/UCbbbbbbbbbbB', '', 'FALSE', '', '', '', '', ''];
+  const rowA = ['yt-a', 'チャンネルA', 'https://www.youtube.com/channel/UCaaaaaaaaaaA', '', '', '', '', '', ''];
+  const rowB = ['yt-b', 'チャンネルB', 'https://www.youtube.com/channel/UCbbbbbbbbbbB', '', '', '', '', '', ''];
   const bodyA = playlistBodyWith([
     ['vidShared01', '2026-11-10T00:00:00Z'],
     ['vidOnlyA001', '2026-11-09T00:00:00Z'],
@@ -2448,7 +2456,7 @@ test('fetchFeeds: 抽出トリガーはフィードをまたいだ重複を除�
 });
 
 test('fetchFeeds: 常時対応チャンネルは30日超でも取得できた全件に発火する', () => {
-  const rowSpecial = ['yt-special', '藤原史和 川口を歩くQAエンジニア', 'https://www.youtube.com/channel/UCbiDZXbr391oT_vsRiqwPFg', '', 'FALSE', '', '', '', '', ''];
+  const rowSpecial = ['yt-special', '藤原史和 川口を歩くQAエンジニア', 'https://www.youtube.com/channel/UCbiDZXbr391oT_vsRiqwPFg', '', '', '', '', '', ''];
   const items = [];
   for (let i = 1; i <= 12; i++) {
     // 全て公開から30日を大きく超えた日付にする
@@ -2470,7 +2478,7 @@ test('fetchFeeds: 常時対応チャンネルは30日超でも取得できた全
 });
 
 test('fetchFeeds: 音楽ジャンルのフィードは30日超でも新しい順20本まで発火する', () => {
-  const rowMusic = ['yt-music', '音楽チャンネル', 'https://www.youtube.com/channel/UCmusicchanneL1', '音楽', 'FALSE', '', '', '', '', ''];
+  const rowMusic = ['yt-music', '音楽チャンネル', 'https://www.youtube.com/channel/UCmusicchanneL1', '音楽', '', '', '', '', ''];
   const items = [];
   for (let i = 1; i <= 15; i++) {
     // 全て公開から30日を大きく超えた日付にする (月をずらして新しい順を付ける)
@@ -2523,8 +2531,8 @@ test('fetchFeeds: 抽出トリガーが例外を投げても巡回は成功す�
     assert.equal(result.ok, true);
     assert.equal(result.added, 1);
     const row = ss.sheets['feeds'].rows[1];
-    assert.equal(row[8], '200');
-    assert.equal(row[9], '');
+    assert.equal(row[7], '200');
+    assert.equal(row[8], '');
   } finally { restore(); }
 });
 
@@ -2675,7 +2683,7 @@ function fakeYouTubeSubscriptions(pages) {
 }
 
 function ytFeedRow(id, channelId, title = 'YT', category = '') {
-  return [id, title, 'https://www.youtube.com/channel/' + channelId, category, 'FALSE', '', '', '', '', ''];
+  return [id, title, 'https://www.youtube.com/channel/' + channelId, category, '', '', '', '', ''];
 }
 
 test('parseYouTubeSubscriptionsPage: snippet から channelId とタイトルを抜き、次ページトークンを返す', () => {
@@ -2838,7 +2846,7 @@ test('syncYouTubeSubscriptions: 新規チャンネルは仮ジャンル YouTube 
   const { ss, restore, logs } = syncTestEnv({
     feedsRows: [
       ytFeedRow('yt-keep', CH_KEEP, 'A'),
-      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'FALSE', '', '', '', '', ''],
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
     ],
     pages: [{ items: [subscriptionItem(CH_KEEP, 'A'), subscriptionItem(CH_NEW, '新しいチャンネル')] }],
   });
@@ -2852,7 +2860,7 @@ test('syncYouTubeSubscriptions: 新規チャンネルは仮ジャンル YouTube 
     assert.equal(added[1], '新しいチャンネル');
     assert.equal(added[2], 'https://www.youtube.com/channel/' + CH_NEW);
     assert.equal(added[3], 'YouTube');
-    assert.equal(added[4], false);
+    assert.equal(added.length, 9);
     assert.ok(logs.some((m) => m.includes('added=1') && m.includes('deleted=0')), logs.join('\n'));
   } finally { restore(); }
 });

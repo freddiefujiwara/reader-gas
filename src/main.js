@@ -4,8 +4,9 @@
 // 毎時トリガー fetchFeeds が YouTube フィードだけを巡回して articles へ追記する (v2)。
 // 既読状態は v2 から端末ローカル管理のため、サーバー側に states タブは持たない
 // (doPost の list が返す isRead は常に false。フィード管理も doPost で行う)。
-// フィード管理 (listFeeds / saveFeed / deleteFeed / reorderFeeds) はオーナー専用とし、
-// is_private は URL のホストが a.ze.gs のときだけ立てる (トークン漏洩防止)。
+// フィード管理 (listFeeds / saveFeed / deleteFeed / reorderFeeds) はオーナー専用とする。
+// 非公開フラグ (is_private) は廃止し、feeds タブの列自体も撤去した (全9列)。
+// フロントは表示・取得の分岐に使っておらず、入力値も無視されていた。
 // 認証は tweet-gas と同型: Google IDトークンをサーバー側で検証し、
 // オーナー本人 (ALLOWED_EMAIL) にだけ30日セッションを発行する。
 // セッションは owner_sessions タブにトークンの SHA-256 ハッシュだけを保存し、
@@ -23,7 +24,7 @@
 // v3 フェーズ1: フィードIDは URL のハッシュ (feedIdFromUrl) で決め、タイトルは
 // 自動取得のみとする (YouTube は登録時に空で受け、fetchFeeds が補完する)。
 // 既存シートの ID 付け替え (slug → ハッシュ) は完了済みで、現在の行はすべてハッシュ ID。
-// 有効/無効 (enabled) は廃止し、feeds タブの列自体も撤去した (全10列)。
+// 有効/無効 (enabled) は廃止し、feeds タブの列自体も撤去した。
 // 巡回・一覧・保存のどこでも参照しない。
 // YouTube の保存形はチャンネルページ URL (/channel/UC...) に統一する。
 // /@handle 形で登録されても保存時に正規形へ寄せる
@@ -38,7 +39,7 @@ const SHARE_TOKEN_HASH_PROP = 'SHARE_TOKEN_HASH';
 const SHARE_EXPIRES_AT_PROP = 'SHARE_EXPIRES_AT';
 const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SESSION_HEADERS = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
-const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
+const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
 const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
 const RETENTION_DAYS = 60;
 const MAX_ARTICLES = 5000;
@@ -1105,7 +1106,6 @@ function syncYouTubeSubscriptions() {
           title: item.title,
           url: item.url,
           category: YT_SUBSCRIPTION_SYNC_CATEGORY,
-          isPrivate: false,
         }, null);
         sheet.appendRow(feedRowValues(rowObj, headers));
         added++;
@@ -1286,7 +1286,6 @@ function buildListPayload(body) {
       url: String(f.url || ''),
       fetchUrl: buildFetchUrl(f, serviceUrl),
       category: String(f.category || ''),
-      isPrivate: isTruthy(f.is_private),
       unreadCount: unreadByFeed[f.id] || 0,
     })),
   };
@@ -1297,7 +1296,6 @@ function buildListPayload(body) {
 // 純関数のバリデーション/整形を Node テスト対象にし、シート操作は薄く保つ。
 
 const FEED_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
-const PRIVATE_FEED_HOST = 'a.ze.gs';
 
 // Pure-JS https URL check (Apps Script には URL コンストラクタが無いため正規表現で分解する)。
 // Returns { ok:true, url, host } or { ok:false, message }.
@@ -1325,10 +1323,8 @@ function parseFeedUrl(rawUrl) {
 }
 
 // Validates/normalizes a feed input object.
-// Returns { ok:true, feed:{id,title,url,category,isPrivate} } or { ok:false, message }.
-// enabled は廃止したため入力にあっても無視し、正規化結果にも含めない。
-// NOTE: isPrivate は入力値では決めず、URL のホストが a.ze.gs そのもののときだけ
-// true に強制する。現在はホスト由来のマーカーとしてだけ使い、トークンは関与しない。
+// Returns { ok:true, feed:{id,title,url,category} } or { ok:false, message }.
+// enabled / isPrivate は廃止したため入力にあっても無視し、正規化結果にも含めない。
 // id は任意: 指定があれば形式だけを検証する。追加時の実 ID は URL のハッシュで
 // 決めるため、id は「どの行を更新するか」の指定としてだけ使う (handleSaveFeed)。
 // title は原則必須だが、YouTube 疑似フィードだけは空を許す (登録時に自動取得
@@ -1353,7 +1349,6 @@ function validateFeedInput(input) {
       title,
       url: parsed.url,
       category,
-      isPrivate: parsed.host === PRIVATE_FEED_HOST,
     },
   };
 }
@@ -1370,7 +1365,6 @@ function buildFeedRow(feed, existing) {
     title: feed.title,
     url: feed.url,
     category: feed.category,
-    is_private: feed.isPrivate,
     etag: keepCache ? String(prev.etag || '') : '',
     last_modified: keepCache ? String(prev.last_modified || '') : '',
     last_fetched_at: prev ? cellIso(prev.last_fetched_at) : '',
@@ -1407,7 +1401,6 @@ function buildFetchUrl(feed, serviceUrl) {
 function feedToApiShape(feedObj, unreadCount, serviceUrl) {
   const f = feedObj || {};
   const base = serviceUrl !== undefined ? String(serviceUrl || '') : getServiceUrl();
-  const priv = f.is_private !== undefined ? f.is_private : f.isPrivate;
   const fetched = f.last_fetched_at !== undefined ? f.last_fetched_at : f.lastFetchedAt;
   const status = f.last_status !== undefined ? f.last_status : f.lastStatus;
   const error = f.last_error !== undefined ? f.last_error : f.lastError;
@@ -1417,7 +1410,6 @@ function feedToApiShape(feedObj, unreadCount, serviceUrl) {
     url: String(f.url || ''),
     fetchUrl: buildFetchUrl(f, base),
     category: String(f.category || ''),
-    isPrivate: isTruthy(priv),
     lastStatus: String(status || ''),
     lastError: String(error || ''),
     lastFetchedAt: cellIso(fetched),
