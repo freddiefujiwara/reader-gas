@@ -3,6 +3,7 @@
 Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web App)。
 
 - 毎時トリガー `fetchFeeds` が YouTube フィードだけを Data API 経由で巡回し、新着記事を `articles` シートへ追記する (通常の RSS フィードは v2 でクライアント側が取得する)
+- YouTube のチャンネル登録 (購読) を正として、毎時巡回の記事取得より前に `syncYouTubeSubscriptions` が YouTube フィードを同期する (追加も削除も同期)。購読の取得は YouTube 連携サービス (Advanced Service、要 `youtube.readonly` スコープ) を所有者アカウントの権限で使う (動画取得の APIキー方式とは別経路)。同期対象はチャンネル正規形 URL (`/channel/UC...`) のフィードだけで、通常フィードには触らない。本人のチャンネル (`UCbiDZXbr391oT_vsRiqwPFg`、コード内 `YT_AUDIO_ALWAYS_CHANNEL_ID`) は購読に現れないため常に対象外 (ピン留め)。新規追加のジャンルは仮に `YouTube` とし (後から管理画面で変更できる)、タイトルは追加時にだけ購読側の名前を設定する (既存行のタイトルは手編集されうるため同期しない)。安全策: 購読の取得に失敗した・0件だった場合は同期を中止して何も変更せず、削除は1回5件が上限 (超えたら削除だけを中止して警告を残す)。同期の結果 (追加・削除・中止の件数と理由) は Logger に残る
 - YouTube の音声は ogp と同じ非同期の形で扱う: 毎時巡回で各フィードの公開30日以内の最新3本ぶん、a.ze.gs の `yt-audio` コマンドへ音声ストリーム URL の抽出を依頼し (公開日時が読めない動画・30日を超えた動画は依頼しない。更新の止まったチャンネルは最新動画でも30日超なら対象外)、ze 側が抽出結果を `https://a.ze.gs/audio-urls.json` (動画ID → `{url, ts, dur}`、`dur` は実尺・秒で無いエントリもある) として公開する。RSS 出力 (`?rss=`) はその JSON を読み、抽出から5時間以内のエントリがあるアイテムにだけ enclosure として付け、エントリに `dur` があれば整数秒に丸めた `<itunes:duration>` も付ける (音声ファイル自体はどこにも置かない)。スクリプトプロパティ `YT_PLAY_TOKEN` が設定されている場合は、enclosure の URL は抽出済みの直接 URL ではなく、ze の中継 URL (`https://y.ze.gs/<token>/<動画ID>`) になる (直接 URL は通常の GET が約31KB/秒まで絞られ、長編動画の再生開始が約40秒かかるため。中継は Range 取得で引き直して流すだけで、ファイルは置かない)。未設定・空なら従来どおり直接 URL のまま。実尺を RSS 側に持たせるのは、この音声ストリームが断片化 MP4 (fMP4) で長さ情報が二重に入るため、プレイヤー (特に iOS) が長さを二重に数えて実尺の2倍を表示してしまうからで、クライアントは `itunes:duration` を表示・シークの正として使う
 - 例外として、本人のチャンネル「藤原史和 川口を歩くQAエンジニア」(`UCbiDZXbr391oT_vsRiqwPFg`、コード内 `YT_AUDIO_ALWAYS_CHANNEL_ID`) だけは常時対応とする: 30日制限も最新3本の上限も付けず、取得できた動画 (最大20本) を毎時すべて依頼し直す。ze 側のバッチは URL が4時間を超えたエントリを取り直すため、毎時キューに入れ直すことでこのチャンネルの音声 URL は失効前に更新され続け、常に再生可能な状態が保たれる (ze 側の変更は不要)。全体の発火キャップは 100件 (通常分 最大23フィード×3本=69 + 常時対応分 最大20本に余裕を持たせた値)
 - フロントは `doPost` の JSON API でフィード一覧と記事を読み、フィード管理を行う (既読状態は端末ローカル管理で、サーバーは持たない)
@@ -56,8 +57,9 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 ### 初回だけ手動で実行する関数
 
 1. `setupFetchTrigger` — `fetchFeeds` の毎時トリガーを (再) 登録する
-2. 動作確認として `fetchFeeds` を1回実行し、`feeds` の `last_status` と `articles` の追記を確認する
-3. デプロイ後は匿名アクセスで `/exec` (GET) が `{ok:true, service:"reader-gas"}` を返すことを必ず確認する (`appsscript.json` の `webapp.access` は `ANYONE_ANONYMOUS`)
+2. `syncYouTubeSubscriptions` — YouTube 連携サービスの初回認可としてエディタで1回実行し、YouTube スコープ (`youtube.readonly`) を許可する。認可が古いスコープ集合のまま残って連携サービスが権限エラーになる場合は、Google アカウントの「サードパーティ製のアプリとサービス」からこのプロジェクトの連携を一度削除し、再実行して許可し直す
+3. 動作確認として `fetchFeeds` を1回実行し、`feeds` の `last_status` と `articles` の追記を確認する
+4. デプロイ後は匿名アクセスで `/exec` (GET) が `{ok:true, service:"reader-gas"}` を返すことを必ず確認する (`appsscript.json` の `webapp.access` は `ANYONE_ANONYMOUS`)
 
 ### 一時アクセスリンク
 

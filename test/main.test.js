@@ -49,6 +49,10 @@ import {
   reorderRowsByIds,
   validateFeedOrder,
   appendNewEntries,
+  parseYouTubeSubscriptionsPage,
+  fetchMyYouTubeSubscriptions,
+  planYouTubeSubscriptionSync,
+  syncYouTubeSubscriptions,
   fetchFeeds,
   issueSession,
   validateSession,
@@ -2427,5 +2431,352 @@ test('fireYouTubeAudioTriggers: トークンが無ければ差し込み口も呼
     );
     assert.equal(fired, 0);
     assert.equal(called, 0);
+  } finally { restore(); }
+});
+
+// ============================================================
+// YouTube チャンネル登録 (購読) とフィードの同期。
+// 購読の取得は YouTube 連携サービス (Advanced Service) を
+// globalThis.YouTube のフェイクで差し替えて検証する。
+// ============================================================
+
+const CH_KEEP = 'UCkeepChannel000000001';
+const CH_GONE = 'UCgoneChannel000000001';
+const CH_NEW = 'UCnewChannel0000000001';
+const CH_PINNED = 'UCbiDZXbr391oT_vsRiqwPFg'; // 本人のチャンネル (ピン留め)
+
+function subscriptionItem(channelId, title) {
+  return { snippet: { title, resourceId: { channelId } } };
+}
+
+// YouTube 連携サービスのフェイク。pages の要素が応答オブジェクト
+// (または throw する Error) で、呼び出し順に返る。
+function fakeYouTubeSubscriptions(pages) {
+  const calls = [];
+  let idx = 0;
+  return {
+    calls,
+    service: {
+      Subscriptions: {
+        list: (part, params) => {
+          calls.push([part, { ...params }]);
+          const page = pages[Math.min(idx, pages.length - 1)];
+          idx++;
+          if (page instanceof Error) throw page;
+          return page;
+        },
+      },
+    },
+  };
+}
+
+function ytFeedRow(id, channelId, title = 'YT', category = '') {
+  return [id, title, 'https://www.youtube.com/channel/' + channelId, category, 'FALSE', '', '', '', '', ''];
+}
+
+test('parseYouTubeSubscriptionsPage: snippet から channelId とタイトルを抜き、次ページトークンを返す', () => {
+  const parsed = parseYouTubeSubscriptionsPage({
+    items: [
+      subscriptionItem(CH_KEEP, ' チャンネルA '),
+      { snippet: { title: 'IDなし', resourceId: {} } },
+      { snippet: null },
+      {},
+      subscriptionItem(CH_NEW, 'チャンネルB'),
+    ],
+    nextPageToken: 'tok2',
+  });
+  assert.deepEqual(parsed.channels, [
+    { channelId: CH_KEEP, title: 'チャンネルA' },
+    { channelId: CH_NEW, title: 'チャンネルB' },
+  ]);
+  assert.equal(parsed.nextPageToken, 'tok2');
+  // 応答が壊れていても空として扱う (呼び出し側の中止判定に委ねる)
+  assert.deepEqual(parseYouTubeSubscriptionsPage(null), { channels: [], nextPageToken: '' });
+  assert.deepEqual(parseYouTubeSubscriptionsPage({}), { channels: [], nextPageToken: '' });
+});
+
+test('planYouTubeSubscriptionSync: 購読にあって feeds に無いチャンネルは正規形 URL とハッシュ ID で追加候補になる', () => {
+  const feeds = [
+    { id: 'yt-keep', title: 'A', url: 'https://www.youtube.com/channel/' + CH_KEEP, category: '' },
+    { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech' },
+  ];
+  const plan = planYouTubeSubscriptionSync(feeds, [
+    { channelId: CH_KEEP, title: 'A' },
+    { channelId: CH_NEW, title: '新しいチャンネル' },
+  ]);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.toAdd.length, 1);
+  assert.equal(plan.toAdd[0].channelId, CH_NEW);
+  assert.equal(plan.toAdd[0].title, '新しいチャンネル');
+  assert.equal(plan.toAdd[0].url, 'https://www.youtube.com/channel/' + CH_NEW);
+  assert.equal(plan.toAdd[0].id, feedIdFromUrl('https://www.youtube.com/channel/' + CH_NEW));
+  assert.deepEqual(plan.toDelete, []);
+  assert.equal(plan.deleteBlocked, false);
+});
+
+test('planYouTubeSubscriptionSync: 購読に無い YouTube フィードは削除候補になり、通常フィードには触らない', () => {
+  const feeds = [
+    { id: 'yt-keep', title: 'A', url: 'https://www.youtube.com/channel/' + CH_KEEP, category: '' },
+    { id: 'yt-gone', title: 'G', url: 'https://www.youtube.com/channel/' + CH_GONE, category: '' },
+    { id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech' },
+  ];
+  const plan = planYouTubeSubscriptionSync(feeds, [{ channelId: CH_KEEP, title: 'A' }]);
+  assert.equal(plan.ok, true);
+  // 削除判定は URL のチャンネルIDで行い、行の ID (slug でも) をそのまま返す
+  assert.deepEqual(plan.toDelete, [
+    { id: 'yt-gone', channelId: CH_GONE, url: 'https://www.youtube.com/channel/' + CH_GONE },
+  ]);
+  assert.deepEqual(plan.toAdd, []);
+});
+
+test('planYouTubeSubscriptionSync: 本人のチャンネル (ピン留め) は購読に無くても削除せず、購読にあっても追加しない', () => {
+  const feeds = [
+    { id: 'own', title: '本人', url: 'https://www.youtube.com/channel/' + CH_PINNED, category: '音楽' },
+    { id: 'yt-keep', title: 'A', url: 'https://www.youtube.com/channel/' + CH_KEEP, category: '' },
+  ];
+  const plan = planYouTubeSubscriptionSync(feeds, [{ channelId: CH_KEEP, title: 'A' }]);
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.toDelete, []);
+  assert.deepEqual(plan.toAdd, []);
+  // feeds に無い状態で購読側に現れても (実際には起こらないが) 追加対象にしない
+  const plan2 = planYouTubeSubscriptionSync([], [
+    { channelId: CH_PINNED, title: '本人' },
+    { channelId: CH_KEEP, title: 'A' },
+  ]);
+  assert.deepEqual(plan2.toAdd.map((a) => a.channelId), [CH_KEEP]);
+});
+
+test('planYouTubeSubscriptionSync: 購読が空・不正なら中止 (ok:false) で何も計画しない', () => {
+  const feeds = [
+    { id: 'yt-gone', title: 'G', url: 'https://www.youtube.com/channel/' + CH_GONE, category: '' },
+  ];
+  assert.deepEqual(planYouTubeSubscriptionSync(feeds, []), { ok: false, reason: 'empty', toAdd: [], toDelete: [], deleteBlocked: false });
+  assert.equal(planYouTubeSubscriptionSync(feeds, null).ok, false);
+  assert.equal(planYouTubeSubscriptionSync(feeds, undefined).reason, 'invalid');
+  // channelId が読めないエントリだけなら実質0件として中止する
+  assert.equal(planYouTubeSubscriptionSync(feeds, [{ title: 'x' }]).reason, 'empty');
+});
+
+test('planYouTubeSubscriptionSync: 削除候補が上限 (5件) を超えたら deleteBlocked で、追加は計画される', () => {
+  const feeds = [{ id: 'yt-keep', title: 'A', url: 'https://www.youtube.com/channel/' + CH_KEEP, category: '' }];
+  for (let i = 0; i < 6; i++) {
+    feeds.push({ id: 'yt-gone-' + i, title: 'G' + i, url: 'https://www.youtube.com/channel/UCgone0000000000000' + i, category: '' });
+  }
+  const plan = planYouTubeSubscriptionSync(feeds, [
+    { channelId: CH_KEEP, title: 'A' },
+    { channelId: CH_NEW, title: 'N' },
+  ]);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.toDelete.length, 6);
+  assert.equal(plan.deleteBlocked, true);
+  assert.equal(plan.toAdd.length, 1);
+  // ちょうど上限なら削除できる
+  const plan5 = planYouTubeSubscriptionSync(feeds.slice(0, 6), [{ channelId: CH_KEEP, title: 'A' }]);
+  assert.equal(plan5.toDelete.length, 5);
+  assert.equal(plan5.deleteBlocked, false);
+});
+
+test('planYouTubeSubscriptionSync: 購読の重複は一意化され、追加は1件だけになる', () => {
+  const plan = planYouTubeSubscriptionSync([], [
+    { channelId: CH_NEW, title: 'N' },
+    { channelId: CH_NEW, title: 'N (重複)' },
+  ]);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.toAdd.length, 1);
+  assert.equal(plan.toAdd[0].title, 'N');
+});
+
+test('fetchMyYouTubeSubscriptions: ページングをたどって全件を集約し、引数は mine=true で渡る', () => {
+  const yt = fakeYouTubeSubscriptions([
+    { items: [subscriptionItem(CH_KEEP, 'A')], nextPageToken: 'tok2' },
+    { items: [subscriptionItem(CH_NEW, 'B')] },
+  ]);
+  const restore = installGasGlobals({ YouTube: yt.service });
+  try {
+    const channels = fetchMyYouTubeSubscriptions();
+    assert.deepEqual(channels, [
+      { channelId: CH_KEEP, title: 'A' },
+      { channelId: CH_NEW, title: 'B' },
+    ]);
+    assert.equal(yt.calls.length, 2);
+    assert.equal(yt.calls[0][0], 'snippet');
+    assert.deepEqual(yt.calls[0][1], { mine: true, maxResults: 50 });
+    assert.deepEqual(yt.calls[1][1], { mine: true, maxResults: 50, pageToken: 'tok2' });
+  } finally { restore(); }
+});
+
+test('fetchMyYouTubeSubscriptions: 連携サービスが無い環境では例外になる', () => {
+  const restore = installGasGlobals({ YouTube: undefined });
+  try {
+    assert.throws(() => fetchMyYouTubeSubscriptions(), /advanced service is not enabled/);
+  } finally { restore(); }
+});
+
+// syncYouTubeSubscriptions の統合テスト用環境。
+function syncTestEnv({ feedsRows = [], articlesRows = [], pages }) {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW, ...feedsRows],
+    articles: [ARTICLE_HEADERS_ROW, ...articlesRows],
+  });
+  const yt = fakeYouTubeSubscriptions(pages);
+  const logs = [];
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
+    Utilities: fakeUtilities,
+    YouTube: yt.service,
+    Logger: { log: (msg) => logs.push(String(msg)) },
+  });
+  return { ss, restore, logs, yt };
+}
+
+test('syncYouTubeSubscriptions: 新規チャンネルは仮ジャンル YouTube で正規形の行が追加される', () => {
+  const { ss, restore, logs } = syncTestEnv({
+    feedsRows: [
+      ytFeedRow('yt-keep', CH_KEEP, 'A'),
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', 'FALSE', '', '', '', '', ''],
+    ],
+    pages: [{ items: [subscriptionItem(CH_KEEP, 'A'), subscriptionItem(CH_NEW, '新しいチャンネル')] }],
+  });
+  try {
+    const result = syncYouTubeSubscriptions();
+    assert.deepEqual(result, { ok: true, added: 1, deleted: 0, deleteBlocked: false, subscriptionCount: 2 });
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 4);
+    const added = rows[3];
+    assert.equal(added[0], feedIdFromUrl('https://www.youtube.com/channel/' + CH_NEW));
+    assert.equal(added[1], '新しいチャンネル');
+    assert.equal(added[2], 'https://www.youtube.com/channel/' + CH_NEW);
+    assert.equal(added[3], 'YouTube');
+    assert.equal(added[4], false);
+    assert.ok(logs.some((m) => m.includes('added=1') && m.includes('deleted=0')), logs.join('\n'));
+  } finally { restore(); }
+});
+
+test('syncYouTubeSubscriptions: 購読解除されたチャンネルは記事ごと削除され、他の記事は残る', () => {
+  const { ss, restore } = syncTestEnv({
+    feedsRows: [ytFeedRow('yt-keep', CH_KEEP, 'A'), ytFeedRow('yt-gone', CH_GONE, 'G')],
+    articlesRows: [
+      ['art-g1', 'yt-gone', '動画1', 'https://www.youtube.com/watch?v=v1', '', '', '', ''],
+      ['art-g2', 'yt-gone', '動画2', 'https://www.youtube.com/watch?v=v2', '', '', '', ''],
+      ['art-k1', 'yt-keep', '動画3', 'https://www.youtube.com/watch?v=v3', '', '', '', ''],
+    ],
+    pages: [{ items: [subscriptionItem(CH_KEEP, 'A')] }],
+  });
+  try {
+    const result = syncYouTubeSubscriptions();
+    assert.equal(result.ok, true);
+    assert.equal(result.deleted, 1);
+    assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'yt-keep']);
+    assert.deepEqual(ss.sheets['articles'].rows.map((r) => r[0]), ['id', 'art-k1']);
+  } finally { restore(); }
+});
+
+test('syncYouTubeSubscriptions: 本人のチャンネル (ピン留め) は購読に無くても残る', () => {
+  const { ss, restore } = syncTestEnv({
+    feedsRows: [ytFeedRow('own', CH_PINNED, '本人', '音楽'), ytFeedRow('yt-keep', CH_KEEP, 'A')],
+    pages: [{ items: [subscriptionItem(CH_KEEP, 'A')] }],
+  });
+  try {
+    const result = syncYouTubeSubscriptions();
+    assert.equal(result.ok, true);
+    assert.equal(result.deleted, 0);
+    assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'own', 'yt-keep']);
+  } finally { restore(); }
+});
+
+test('syncYouTubeSubscriptions: 購読の取得に失敗したら中止し、フィードは一切変わらない', () => {
+  const { ss, restore, logs } = syncTestEnv({
+    feedsRows: [ytFeedRow('yt-gone', CH_GONE, 'G')],
+    pages: [new Error('API unavailable')],
+  });
+  try {
+    const result = syncYouTubeSubscriptions();
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'fetch_failed');
+    assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'yt-gone']);
+    assert.ok(logs.some((m) => m.includes('aborted (fetch_failed)')), logs.join('\n'));
+  } finally { restore(); }
+});
+
+test('syncYouTubeSubscriptions: 購読が0件なら中止し、YouTube フィードを消さない', () => {
+  const { ss, restore, logs } = syncTestEnv({
+    feedsRows: [ytFeedRow('yt-gone', CH_GONE, 'G')],
+    pages: [{ items: [] }],
+  });
+  try {
+    const result = syncYouTubeSubscriptions();
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'empty');
+    assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'yt-gone']);
+    assert.ok(logs.some((m) => m.includes('aborted (empty)')), logs.join('\n'));
+  } finally { restore(); }
+});
+
+test('syncYouTubeSubscriptions: 削除候補が上限を超えたら削除だけ中止し、追加は行われる', () => {
+  const feedsRows = [ytFeedRow('yt-keep', CH_KEEP, 'A')];
+  for (let i = 0; i < 6; i++) {
+    feedsRows.push(ytFeedRow('yt-gone-' + i, 'UCgone0000000000000' + i, 'G' + i));
+  }
+  const { ss, restore, logs } = syncTestEnv({
+    feedsRows,
+    pages: [{ items: [subscriptionItem(CH_KEEP, 'A'), subscriptionItem(CH_NEW, 'N')] }],
+  });
+  try {
+    const result = syncYouTubeSubscriptions();
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 1);
+    assert.equal(result.deleted, 0);
+    assert.equal(result.deleteBlocked, true);
+    // 6件とも残り、新規行が末尾に足される
+    assert.equal(ss.sheets['feeds'].rows.length, 1 + 7 + 1);
+    assert.ok(logs.some((m) => m.includes('deletes skipped')), logs.join('\n'));
+  } finally { restore(); }
+});
+
+test('fetchFeeds: 記事取得より前に購読同期が走り、追加されたチャンネルも同じ巡回で取り込まれる', () => {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ytFeedRow('yt-keep', CH_KEEP, 'A'),
+      ytFeedRow('yt-gone', CH_GONE, 'G'),
+    ],
+    articles: [ARTICLE_HEADERS_ROW,
+      ['art-g1', 'yt-gone', '動画G', 'https://www.youtube.com/watch?v=vG', '', '', '', ''],
+    ],
+  });
+  const yt = fakeYouTubeSubscriptions([
+    { items: [subscriptionItem(CH_KEEP, 'A'), subscriptionItem(CH_NEW, '新しいチャンネル')] },
+  ]);
+  const playlistBody = JSON.stringify({
+    items: [
+      { snippet: { title: '新着動画', description: '説明', publishedAt: '2026-11-14T00:00:00Z', channelTitle: 'ch', resourceId: { videoId: 'vidNew12345' } } },
+    ],
+  });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key' }).service,
+    Utilities: fakeUtilities,
+    YouTube: yt.service,
+    Logger: { log: () => {} },
+    UrlFetchApp: {
+      fetch: (url) => {
+        if (String(url).includes('playlistItems')) {
+          return { getResponseCode: () => 200, getContentText: () => playlistBody };
+        }
+        throw new Error('unexpected fetch: ' + url);
+      },
+    },
+  });
+  try {
+    const result = fetchFeeds();
+    assert.equal(result.ok, true);
+    // 同期で yt-gone が消え、yt-new が増えた後の2件が巡回対象になる
+    assert.equal(result.fetched, 2);
+    assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), [
+      'id', 'yt-keep', feedIdFromUrl('https://www.youtube.com/channel/' + CH_NEW),
+    ]);
+    // 削除されたフィードの記事はカスケードで消え、残った2フィードの記事が入る
+    const articleFeedIds = ss.sheets['articles'].rows.slice(1).map((r) => r[1]).sort();
+    assert.deepEqual(articleFeedIds, ['yt-keep', feedIdFromUrl('https://www.youtube.com/channel/' + CH_NEW)].sort());
   } finally { restore(); }
 });
