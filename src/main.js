@@ -441,12 +441,12 @@ function freshAudioUrl(audioUrls, videoId, nowMs) {
 // ストリームを引き直してそのまま流す (ファイルは置かない)。
 // スクリプトプロパティ YT_PLAY_TOKEN (中継の合言葉) が設定されて
 // いれば、?rss= の enclosure は直接 URL ではなく中継 URL
-// (https://a.ze.gs/yt-play/<token>/<videoId>) にする。中継側も
+// (https://y.ze.gs/<token>/<videoId>) にする。中継側も
 // audio-urls.json の鮮度をもとに実 URL を解決する前提のため、
 // enclosure を付ける条件 (抽出から5時間以内のエントリがあること)
 // は従来どおり。プロパティ未設定・空なら従来の直接 URL のまま。
 
-const YT_PLAY_BASE_URL = 'https://a.ze.gs/yt-play/';
+const YT_PLAY_BASE_URL = 'https://y.ze.gs/';
 
 // 中継 URL の組み立て (純関数)。token が空、または videoId が
 // 無ければ空文字 (= 中継しない) を返す。

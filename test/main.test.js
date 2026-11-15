@@ -1959,7 +1959,7 @@ test('buildRssXml: enclosure に dur があれば実尺を itunes:duration (整�
 test('ytPlayUrl: 合言葉と動画IDから中継 URL を組み立て、欠ければ空', () => {
   assert.equal(
     ytPlayUrl('secret-token', 'vidFresh111'),
-    'https://a.ze.gs/yt-play/secret-token/vidFresh111',
+    'https://y.ze.gs/secret-token/vidFresh111',
   );
   assert.equal(ytPlayUrl('', 'vidFresh111'), '');
   assert.equal(ytPlayUrl(null, 'vidFresh111'), '');
@@ -1980,7 +1980,7 @@ test('buildRssXml: 合言葉があれば enclosure は中継 URL になり、直
     vidStale111: { url: 'https://stream.example.com/stale', ts: nowSec - 6 * 3600 },
   };
   const xml = buildRssXml(YT_FEED_FOR_RSS, rows, audioUrls, 'secret-token');
-  assert.ok(xml.includes('<enclosure url="https://a.ze.gs/yt-play/secret-token/vidFresh111" type="audio/x-m4a" length="0"/>'));
+  assert.ok(xml.includes('<enclosure url="https://y.ze.gs/secret-token/vidFresh111" type="audio/x-m4a" length="0"/>'));
   // 直接のストリーム URL はどこにも出ない
   assert.ok(!xml.includes('stream.example.com'));
   // itunes:duration は従来どおり付く
@@ -2087,7 +2087,7 @@ test('doGet: ?rss= は YT_PLAY_TOKEN があれば中継 URL の enclosure を配
   });
   try {
     const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
-    assert.ok(xml.includes('<enclosure url="https://a.ze.gs/yt-play/secret-token/vidAudio111" type="audio/x-m4a" length="0"/>'));
+    assert.ok(xml.includes('<enclosure url="https://y.ze.gs/secret-token/vidAudio111" type="audio/x-m4a" length="0"/>'));
     // 直接のストリーム URL は出ない。itunes:duration は従来どおり付く
     assert.ok(!xml.includes('stream.example.com'));
     assert.ok(xml.includes('<itunes:duration>2297</itunes:duration>'));
