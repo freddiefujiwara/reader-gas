@@ -880,9 +880,207 @@ function fireYouTubeAudioTriggers(feedVideos, fireTrigger, nowMs) {
   return fired;
 }
 
+// --- YouTube チャンネル登録 (購読) とフィードの同期 ---
+// YouTube のチャンネル登録を正として、リーダーの YouTube フィードを
+// 毎時巡回 (fetchFeeds) の記事取得より前に同期する (追加も削除も同期)。
+// 購読の取得は Apps Script の YouTube 連携サービス (Advanced Service、
+// appsscript.json の enabledAdvancedServices) を所有者アカウントの
+// 権限で使う。動画取得の APIキー方式 (YOUTUBE_API_KEY) とは別経路で、
+// 連携サービスには oauthScopes の youtube.readonly が要る。
+// 同期対象は URL がチャンネル正規形 (/channel/UC...) のフィードだけ
+// で、通常フィードには触らない。本人のチャンネル
+// (YT_AUDIO_ALWAYS_CHANNEL_ID) は購読に現れないため、常に同期対象
+// から外す (ピン留め。追加も削除もしない)。
+// タイトルは追加時にだけ購読側の名前を設定し、既存フィードの
+// タイトルは同期しない (管理画面で手編集されうるため)。
+
+// 同期で新規追加するフィードに仮で入れるジャンル (後から管理画面で
+// 変更できる前提)。
+const YT_SUBSCRIPTION_SYNC_CATEGORY = 'YouTube';
+// 1回の同期で削除する件数の上限。超える場合は削除だけを中止する
+// (購読側の一時的な異常で大量削除になる事故を防ぐ)。
+const YT_SUBSCRIPTION_SYNC_MAX_DELETES = 5;
+// 購読一覧のページング上限 (50件 × 20ページ = 最大1,000チャンネル)。
+// 上限を超えたら一覧が不完全な可能性があるため、同期自体を中止する。
+const YT_SUBSCRIPTION_SYNC_MAX_PAGES = 20;
+
+// 同期の経過・結果のログ。Apps Script では Logger に残し、
+// Node テスト環境 (Logger が無い) では console に落とす。
+function logSubscriptionSync(message) {
+  if (typeof Logger !== 'undefined' && Logger.log) Logger.log(message);
+  else if (typeof console !== 'undefined' && console.log) console.log(message);
+}
+
+// subscriptions.list の応答 (連携サービスの戻りオブジェクト) の
+// 1ページ分を { channels: [{ channelId, title }], nextPageToken } へ
+// 正規化する (純関数)。channelId が読めない item は落とす。
+function parseYouTubeSubscriptionsPage(response) {
+  const res = response || {};
+  const items = Array.isArray(res.items) ? res.items : [];
+  const channels = [];
+  items.forEach((item) => {
+    const sn = (item && item.snippet) || {};
+    const resourceId = sn.resourceId || {};
+    const channelId = String(resourceId.channelId || '').trim();
+    if (!channelId) return;
+    channels.push({ channelId, title: String(sn.title || '').trim() });
+  });
+  return { channels, nextPageToken: String(res.nextPageToken || '') };
+}
+
+// 連携サービスで購読1ページ分を取得する (薄いラッパー)。
+// 連携サービスが有効でない環境 (Node テスト等) では例外にする。
+function listMyYouTubeSubscriptionsPage(pageToken) {
+  if (typeof YouTube === 'undefined' || !YouTube.Subscriptions || !YouTube.Subscriptions.list) {
+    throw new Error('YouTube advanced service is not enabled');
+  }
+  const params = { mine: true, maxResults: 50 };
+  if (pageToken) params.pageToken = pageToken;
+  return YouTube.Subscriptions.list('snippet', params);
+}
+
+// 購読全件を [{ channelId, title }] で取得する。取得失敗・ページング
+// 上限超過は例外として呼び出し側 (同期の中止) に伝える。
+function fetchMyYouTubeSubscriptions() {
+  const channels = [];
+  let pageToken = '';
+  for (let page = 0; page < YT_SUBSCRIPTION_SYNC_MAX_PAGES; page++) {
+    const parsed = parseYouTubeSubscriptionsPage(listMyYouTubeSubscriptionsPage(pageToken));
+    parsed.channels.forEach((c) => { channels.push(c); });
+    if (!parsed.nextPageToken) return channels;
+    pageToken = parsed.nextPageToken;
+  }
+  throw new Error('YouTube subscriptions paging exceeded ' + YT_SUBSCRIPTION_SYNC_MAX_PAGES + ' pages');
+}
+
+// 購読と feeds の差分を計算する (純関数)。
+// 購読が配列でない・有効なチャンネルが0件なら { ok:false, reason }
+// を返し、同期は中止になる (何も変更しない)。
+// ok の場合の toAdd は [{ channelId, title, url, id }] (id は URL の
+// ハッシュ)、toDelete は [{ id, channelId, url }]。削除候補が上限を
+// 超えたら deleteBlocked が立ち、削除だけが中止される。
+// 対象は URL からチャンネルIDが抜けるフィード (正規形) だけで、
+// ピン留め (YT_AUDIO_ALWAYS_CHANNEL_ID) は追加・削除ともに対象外。
+function planYouTubeSubscriptionSync(feeds, subscriptions) {
+  const none = { toAdd: [], toDelete: [], deleteBlocked: false };
+  if (!Array.isArray(subscriptions)) return { ok: false, reason: 'invalid', ...none };
+  // 購読はチャンネルIDで一意化する (タイトルは最初に現れたものを採用)。
+  const subByChannel = {};
+  subscriptions.forEach((s) => {
+    const channelId = String((s && s.channelId) || '').trim();
+    if (!channelId || subByChannel[channelId]) return;
+    subByChannel[channelId] = { channelId, title: String((s && s.title) || '').trim() };
+  });
+  if (!Object.keys(subByChannel).length) return { ok: false, reason: 'empty', ...none };
+  const existingChannelIds = {};
+  const existingFeedIds = {};
+  (feeds || []).forEach((f) => {
+    if (!f) return;
+    if (f.id) existingFeedIds[String(f.id)] = true;
+    const channelId = youtubeChannelIdFromUrl(f.url);
+    if (channelId) existingChannelIds[channelId] = true;
+  });
+  const toAdd = [];
+  Object.keys(subByChannel).forEach((channelId) => {
+    if (channelId === YT_AUDIO_ALWAYS_CHANNEL_ID) return;
+    if (existingChannelIds[channelId]) return;
+    const url = youtubeFeedUrlFromChannelId(channelId);
+    const id = feedIdFromUrl(url);
+    // 別 URL の既存行が同じ ID を持っていたらハッシュ衝突として、
+    // そのチャンネルの追加だけを省く (handleSaveFeed と同じ扱い)。
+    if (existingFeedIds[id]) return;
+    existingFeedIds[id] = true;
+    toAdd.push({ channelId, title: subByChannel[channelId].title, url, id });
+  });
+  const toDelete = [];
+  const deleteSeen = {};
+  (feeds || []).forEach((f) => {
+    if (!f || !f.id) return;
+    const channelId = youtubeChannelIdFromUrl(f.url);
+    if (!channelId) return;
+    if (channelId === YT_AUDIO_ALWAYS_CHANNEL_ID) return;
+    if (subByChannel[channelId]) return;
+    if (deleteSeen[String(f.id)]) return;
+    deleteSeen[String(f.id)] = true;
+    toDelete.push({ id: String(f.id), channelId, url: String(f.url || '') });
+  });
+  return {
+    ok: true,
+    toAdd,
+    toDelete,
+    deleteBlocked: toDelete.length > YT_SUBSCRIPTION_SYNC_MAX_DELETES,
+  };
+}
+
+// 購読同期の本体。例外はすべて握って結果オブジェクトで返し、
+// 呼び出し側 (fetchFeeds やエディタでの手動実行) を失敗させない。
+// エディタから直接実行もできる (初回の YouTube スコープ認可用)。
+function syncYouTubeSubscriptions() {
+  let subscriptions;
+  try {
+    subscriptions = fetchMyYouTubeSubscriptions();
+  } catch (e) {
+    logSubscriptionSync('youtube-subscription-sync: aborted (fetch_failed): ' + String((e && e.message) || e));
+    return { ok: false, reason: 'fetch_failed', added: 0, deleted: 0, deleteBlocked: false };
+  }
+  let added = 0;
+  let deleted = 0;
+  let deleteBlocked = false;
+  try {
+    const ss = openDataSpreadsheet();
+    const feeds = readSheetAsObjects(ss, 'feeds');
+    const plan = planYouTubeSubscriptionSync(feeds, subscriptions);
+    if (!plan.ok) {
+      logSubscriptionSync('youtube-subscription-sync: aborted (' + plan.reason + ')');
+      return { ok: false, reason: plan.reason, added: 0, deleted: 0, deleteBlocked: false };
+    }
+    deleteBlocked = plan.deleteBlocked;
+    if (plan.toAdd.length) {
+      const sheet = getSheetOrCreate(ss, 'feeds', FEEDS_HEADERS);
+      const values = sheet.getDataRange().getValues();
+      const headers = values.length ? values[0] : FEEDS_HEADERS;
+      plan.toAdd.forEach((item) => {
+        const rowObj = buildFeedRow({
+          id: item.id,
+          title: item.title,
+          url: item.url,
+          category: YT_SUBSCRIPTION_SYNC_CATEGORY,
+          isPrivate: false,
+        }, null);
+        sheet.appendRow(feedRowValues(rowObj, headers));
+        added++;
+      });
+    }
+    if (plan.deleteBlocked) {
+      logSubscriptionSync('youtube-subscription-sync: deletes skipped: ' + plan.toDelete.length
+        + ' candidates exceed the cap of ' + YT_SUBSCRIPTION_SYNC_MAX_DELETES);
+    } else {
+      plan.toDelete.forEach((item) => {
+        // 削除は既存のフィード削除と同じカスケード (articles も消す)。
+        const result = handleDeleteFeed({ feedId: item.id });
+        if (result && result.ok) deleted++;
+      });
+    }
+    logSubscriptionSync('youtube-subscription-sync: subscriptions=' + subscriptions.length
+      + ' added=' + added + ' deleted=' + deleted + ' deleteBlocked=' + deleteBlocked);
+    return { ok: true, added, deleted, deleteBlocked, subscriptionCount: subscriptions.length };
+  } catch (e) {
+    logSubscriptionSync('youtube-subscription-sync: aborted (error): ' + String((e && e.message) || e));
+    return { ok: false, reason: 'error', added, deleted, deleteBlocked };
+  }
+}
+
 // fireTrigger はテスト用の差し込み口 (音声抽出トリガー用)。
 // 時間ベーストリガーからは引数なし (実際はイベントオブジェクト) で呼ばれる。
 function fetchFeeds(fireTrigger) {
+  // 記事取得より前に、YouTube のチャンネル登録 (購読) とフィードを
+  // 同期する (購読が正。追加も削除も同期)。同期は失敗しても例外を
+  // 握る設計だが、念のためここでも握って巡回自体は従来どおり続ける。
+  try {
+    syncYouTubeSubscriptions();
+  } catch (e) {
+    logSubscriptionSync('youtube-subscription-sync: unexpected error: ' + String((e && e.message) || e));
+  }
   const ss = openDataSpreadsheet();
   const feedsSheet = getSheetOrCreate(ss, 'feeds', FEEDS_HEADERS);
   const articlesSheet = getSheetOrCreate(ss, 'articles', ARTICLES_HEADERS);
@@ -1397,4 +1595,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, freshAudioUrl, ytPlayUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, freshAudioUrl, ytPlayUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
