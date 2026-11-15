@@ -2307,6 +2307,67 @@ test('planYouTubeAudioTriggers: 常時対応と通常フィードが混ざって
   assert.deepEqual(planYouTubeAudioTriggers([special, normal], now), ['vidSOld0001', 'vidNNew0001']);
 });
 
+test('planYouTubeAudioTriggers: 音楽ジャンルは期間の縛りなしで新しい順10本まで選ぶ (30日超も対象)', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  // 15本: 新しい順で vidM15 (2026-11-14) 〜 vidM01 (2025-01-01)。
+  // 大半は30日より古いが、音楽ジャンルでは期間で絞らない。
+  const dates = [
+    '2025-01-01', '2025-03-01', '2025-05-01', '2025-07-01', '2025-09-01',
+    '2025-11-01', '2026-01-01', '2026-03-01', '2026-05-01', '2026-07-01',
+    '2026-09-01', '2026-10-01', '2026-10-20', '2026-11-10', '2026-11-14',
+  ];
+  const music = dates.map((d, i) => ({
+    videoId: 'vidM' + String(i + 1).padStart(2, '0'),
+    publishedAt: d + 'T00:00:00.000Z',
+    category: '音楽',
+  }));
+  const plan = planYouTubeAudioTriggers([music], now);
+  assert.equal(plan.length, 10);
+  assert.equal(plan[0], 'vidM15');
+  assert.equal(plan[9], 'vidM06'); // 2025-11-01 (30日超) まで入る
+  assert.ok(!plan.includes('vidM05'));
+});
+
+test('planYouTubeAudioTriggers: 音楽ジャンルでも動画IDの無いものは除き、日時不明は最も古い扱いで最後に並ぶ', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const music = [
+    { videoId: '', publishedAt: '2026-11-14T00:00:00.000Z', category: '音楽' },
+    { videoId: 'vidMNoDate1', publishedAt: '', category: '音楽' },
+    { videoId: 'vidMDated01', publishedAt: '2024-01-01T00:00:00.000Z', category: '音楽' },
+  ];
+  assert.deepEqual(planYouTubeAudioTriggers([music], now), ['vidMDated01', 'vidMNoDate1']);
+});
+
+test('planYouTubeAudioTriggers: 音楽と通常が混ざっても通常分は3本・30日以内のまま', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const music = [1, 2, 3, 4, 5].map((i) => ({
+    videoId: 'vidMOld000' + i,
+    publishedAt: '2025-06-0' + i + 'T00:00:00.000Z',
+    category: '音楽',
+  }));
+  const normal = [
+    { videoId: 'vidNOld0001', publishedAt: '2025-06-01T00:00:00.000Z', category: '教養・ラジオ' },
+    { videoId: 'vidNNew0001', publishedAt: '2026-11-14T00:00:00.000Z', category: '教養・ラジオ' },
+  ];
+  const plan = planYouTubeAudioTriggers([music, normal], now);
+  assert.deepEqual(plan, ['vidMOld0005', 'vidMOld0004', 'vidMOld0003', 'vidMOld0002', 'vidMOld0001', 'vidNNew0001']);
+});
+
+test('planYouTubeAudioTriggers: 常時対応チャンネルは音楽ジャンルでも全件扱いが優先される', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const special = [];
+  for (let i = 1; i <= 15; i++) {
+    special.push({
+      videoId: 'vidSM' + String(i).padStart(4, '0'),
+      publishedAt: '2025-01-10T00:00:00.000Z',
+      channelId: 'UCbiDZXbr391oT_vsRiqwPFg',
+      category: '音楽',
+    });
+  }
+  const plan = planYouTubeAudioTriggers([special], now);
+  assert.equal(plan.length, 15); // 音楽の10本枠ではなく全件
+});
+
 test('fetchFeeds: 抽出トリガーは各フィードの最新3本に発火する', () => {
   const items = [];
   for (let i = 1; i <= 12; i++) {
@@ -2424,6 +2485,30 @@ test('fetchFeeds: 常時対応チャンネルは30日超でも取得できた全
   } finally { restore(); }
 });
 
+test('fetchFeeds: 音楽ジャンルのフィードは30日超でも新しい順10本まで発火する', () => {
+  const rowMusic = ['yt-music', '音楽チャンネル', 'https://www.youtube.com/channel/UCmusicchanneL1', '音楽', 'FALSE', '', '', '', '', ''];
+  const items = [];
+  for (let i = 1; i <= 12; i++) {
+    // 全て公開から30日を大きく超えた日付にする (月をずらして新しい順を付ける)
+    items.push(['vidMu' + String(i).padStart(5, '0'), '2025-' + String(i).padStart(2, '0') + '-15T00:00:00Z']);
+  }
+  const body = playlistBodyWith(items);
+  const { restore } = fetchAudioEnv({
+    props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [rowMusic],
+    responder: () => ({ getResponseCode: () => 200, getContentText: () => body }),
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 12);
+    assert.equal(calls.length, 10); // 音楽は10本まで (通常は30日超なら0本)
+    assert.equal(calls[0], 'vidMu00012'); // 新しい順
+    assert.equal(calls[9], 'vidMu00003');
+  } finally { restore(); }
+});
+
 test('fetchFeeds: A_ZE_GS_TOKEN 未設定なら抽出トリガーは発火しない (エラーにもしない)', () => {
   const body = playlistBodyWith([['vidNew12345', '2026-11-14T00:00:00Z']]);
   const { restore } = fetchAudioEnv({
@@ -2526,6 +2611,27 @@ test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全
   try {
     // 計画は 20 + 27フィード×3本 = 101件 → キャップで100件に絞られる
     const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, now);
+    assert.equal(fired, 100);
+    assert.equal(count, 100);
+  } finally { restore(); }
+});
+
+test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キャップ100件でフィード順に打ち切る', () => {
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+  });
+  const feedVideos = [];
+  for (let f = 0; f < 12; f++) {
+    const videos = [];
+    for (let i = 0; i < 15; i++) {
+      // 音楽は30日超でも計画に入るため、12フィード×10本 = 120件の計画になる
+      videos.push({ videoId: 'vidMu' + f + '_' + i, publishedAt: '2025-06-01T00:00:00.000Z', category: '音楽' });
+    }
+    feedVideos.push(videos);
+  }
+  let count = 0;
+  try {
+    const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, Date.parse('2026-11-15T00:00:00.000Z'));
     assert.equal(fired, 100);
     assert.equal(count, 100);
   } finally { restore(); }
