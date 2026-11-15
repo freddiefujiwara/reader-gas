@@ -822,8 +822,9 @@ function selectFetchTargets(feeds) {
 //   上限も付けず、取得できた動画を毎時すべて依頼し直して常時再生
 //   可能な状態を保つ (下の定数のコメント参照)。
 // - ジャンルが「音楽」 (YT_AUDIO_TRIGGER_MUSIC_CATEGORY) のフィードは、
-//   30日制限を付けず、新しい順に最新10本までを対象にする。音楽は
+//   30日制限を付けず、新しい順に最新20本までを対象にする。音楽は
 //   更新頻度が低くても過去分を再生したいため (本人の決定)。
+//   20本は YouTube の1回の取得上限 (最新20本) と揃えた値。
 // 失敗しても巡回自体は失敗にしない (fire-and-forget)。
 
 const YT_AUDIO_TRIGGER_BASE_URL = 'https://a.ze.gs/yt-audio/';
@@ -831,7 +832,7 @@ const YT_AUDIO_TRIGGER_PER_FEED = 3;
 // 音楽ジャンルの特別扱い: このジャンルのフィードだけ、期間の縛りを
 // 外して新しい順に YT_AUDIO_TRIGGER_MUSIC_PER_FEED 本まで選ぶ。
 const YT_AUDIO_TRIGGER_MUSIC_CATEGORY = '音楽';
-const YT_AUDIO_TRIGGER_MUSIC_PER_FEED = 10;
+const YT_AUDIO_TRIGGER_MUSIC_PER_FEED = 20;
 // 全体キャップ。通常分 (最大23フィード×3本=69) と常時対応分
 // (最大20本) の合計89本に余裕を持たせた値。音楽フィードの枠が
 // 増えた分だけ合計が100を超える場合は、従来どおりフィード順の
@@ -1213,7 +1214,7 @@ function fetchFeeds(fireTrigger) {
     }
   });
   // 各フィードの公開30日以内の最新3本 (音楽ジャンルは期間なしの
-  // 最新10本、常時対応チャンネルは全件) の音声抽出を ze へ依頼する
+  // 最新20本、常時対応チャンネルは全件) の音声抽出を ze へ依頼する
   // (記事の保存が済んでから発火する)。
   // トリガーの成否は巡回結果に影響させない。
   try {
