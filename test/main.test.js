@@ -31,6 +31,7 @@ import {
   parseAudioUrlsMap,
   fetchAudioUrlsMap,
   freshAudioUrl,
+  ytPlayUrl,
   planYouTubeAudioTriggers,
   fireYouTubeAudioTriggers,
   escapeXml,
@@ -1955,6 +1956,56 @@ test('buildRssXml: enclosure に dur があれば実尺を itunes:duration (整�
   assert.ok(!itemOf('エントリ無し動画').includes('<itunes:duration>'));
 });
 
+test('ytPlayUrl: 合言葉と動画IDから中継 URL を組み立て、欠ければ空', () => {
+  assert.equal(
+    ytPlayUrl('secret-token', 'vidFresh111'),
+    'https://a.ze.gs/yt-play/secret-token/vidFresh111',
+  );
+  assert.equal(ytPlayUrl('', 'vidFresh111'), '');
+  assert.equal(ytPlayUrl(null, 'vidFresh111'), '');
+  assert.equal(ytPlayUrl(undefined, 'vidFresh111'), '');
+  assert.equal(ytPlayUrl('secret-token', ''), '');
+  assert.equal(ytPlayUrl('secret-token', null), '');
+});
+
+test('buildRssXml: 合言葉があれば enclosure は中継 URL になり、直接 URL は出ない', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = [
+    ytArticleRow('2026-11-14T01:00:00.000Z', 'vidFresh111', '新鮮な動画', ''),
+    ytArticleRow('2026-11-13T01:00:00.000Z', 'vidStale111', '古い動画', ''),
+    ytArticleRow('2026-11-12T01:00:00.000Z', 'vidMissing1', '無い動画', ''),
+  ];
+  const audioUrls = {
+    vidFresh111: { url: 'https://stream.example.com/play?vid=1&sig=abc', ts: nowSec - 60, dur: 104.234 },
+    vidStale111: { url: 'https://stream.example.com/stale', ts: nowSec - 6 * 3600 },
+  };
+  const xml = buildRssXml(YT_FEED_FOR_RSS, rows, audioUrls, 'secret-token');
+  assert.ok(xml.includes('<enclosure url="https://a.ze.gs/yt-play/secret-token/vidFresh111" type="audio/x-m4a" length="0"/>'));
+  // 直接のストリーム URL はどこにも出ない
+  assert.ok(!xml.includes('stream.example.com'));
+  // itunes:duration は従来どおり付く
+  assert.ok(xml.includes('<itunes:duration>104</itunes:duration>'));
+  // 鮮度切れ・欠落のアイテムには、合言葉があっても enclosure 自体が付かない
+  assert.equal((xml.match(/<enclosure /g) || []).length, 1);
+  assert.ok(!xml.includes('yt-play/secret-token/vidStale111'));
+  assert.ok(!xml.includes('yt-play/secret-token/vidMissing1'));
+});
+
+test('buildRssXml: 合言葉が未設定・空なら従来どおり直接 URL の enclosure', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = [
+    ytArticleRow('2026-11-14T01:00:00.000Z', 'vidFresh111', '新鮮な動画', ''),
+  ];
+  const audioUrls = {
+    vidFresh111: { url: 'https://stream.example.com/direct', ts: nowSec - 60 },
+  };
+  [undefined, null, ''].forEach((token) => {
+    const xml = buildRssXml(YT_FEED_FOR_RSS, rows, audioUrls, token);
+    assert.ok(xml.includes('<enclosure url="https://stream.example.com/direct" type="audio/x-m4a" length="0"/>'));
+    assert.ok(!xml.includes('yt-play'));
+  });
+});
+
 test('fetchAudioUrlsMap: HTTPエラーや例外は空マップ (RSS は enclosure 無しで続く)', () => {
   const restore500 = installGasGlobals({
     UrlFetchApp: { fetch: () => ({ getResponseCode: () => 500, getContentText: () => '' }) },
@@ -2016,6 +2067,30 @@ test('doGet: audio-urls.json の取得に失敗しても RSS は enclosure 無�
     const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
     assert.ok(xml.includes('音声つき動画'));
     assert.ok(!xml.includes('<enclosure'));
+  } finally { restore(); }
+});
+
+test('doGet: ?rss= は YT_PLAY_TOKEN があれば中継 URL の enclosure を配信する', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const mapJson = JSON.stringify({ vidAudio111: { url: 'https://stream.example.com/vidAudio111', ts: nowSec - 60, dur: 2297.4 } });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => audioRssSpreadsheet('vidAudio111') },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', YT_PLAY_TOKEN: 'secret-token' }).service,
+    ContentService: fakeContentService(),
+    UrlFetchApp: {
+      fetch: (url) => {
+        assert.equal(String(url), 'https://a.ze.gs/audio-urls.json');
+        return { getResponseCode: () => 200, getContentText: () => mapJson };
+      },
+    },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.ok(xml.includes('<enclosure url="https://a.ze.gs/yt-play/secret-token/vidAudio111" type="audio/x-m4a" length="0"/>'));
+    // 直接のストリーム URL は出ない。itunes:duration は従来どおり付く
+    assert.ok(!xml.includes('stream.example.com'));
+    assert.ok(xml.includes('<itunes:duration>2297</itunes:duration>'));
   } finally { restore(); }
 });
 
