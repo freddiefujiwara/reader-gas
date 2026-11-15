@@ -234,7 +234,6 @@ function summarize(html, maxChars) {
 function toIsoDate(value) {
   if (!value) return '';
   const t = Date.parse(String(value).trim());
-  if (!t && t !== 0) return '';
   if (Number.isNaN(t)) return '';
   return new Date(t).toISOString();
 }
@@ -297,13 +296,22 @@ function youtubeUploadsPlaylistId(channelId) {
   return id.startsWith('UC') ? 'UU' + id.slice(2) : '';
 }
 
+// YouTube API の応答 JSON から items 配列を取り出す共通処理。
+// JSON が壊れている・items が配列でない場合は空配列にする。
+function jsonItems(jsonText) {
+  try {
+    const data = JSON.parse(String(jsonText || ''));
+    return data && Array.isArray(data.items) ? data.items : [];
+  } catch (e) {
+    return [];
+  }
+}
+
 // playlistItems の応答 JSON をエントリ配列へ正規化する。
 // 削除・非公開動画 (タイトルが Deleted video / Private video) は取り込まない。
 function parseYouTubePlaylistItems(jsonText, feed) {
   const feedId = feed && feed.id ? String(feed.id) : '';
-  let data;
-  try { data = JSON.parse(String(jsonText || '')); } catch (e) { return []; }
-  const items = data && Array.isArray(data.items) ? data.items : [];
+  const items = jsonItems(jsonText);
   const entries = [];
   items.forEach((item) => {
     const sn = (item && item.snippet) || {};
@@ -326,9 +334,7 @@ function parseYouTubePlaylistItems(jsonText, feed) {
 // channels.list の応答からチャンネル名を取り出す。タイトル未設定の
 // YouTube フィード (登録時に空で入る) の補完に使う。取れなければ空文字。
 function parseYouTubeChannelTitle(jsonText) {
-  let data;
-  try { data = JSON.parse(String(jsonText || '')); } catch (e) { return ''; }
-  const items = data && Array.isArray(data.items) ? data.items : [];
+  const items = jsonItems(jsonText);
   const sn = (items[0] && items[0].snippet) || {};
   return String(sn.title || '').trim();
 }
@@ -337,9 +343,7 @@ function parseYouTubeChannelTitle(jsonText) {
 // ハンドル解決用)。先頭の item の id と snippet.title を使い、
 // item が無い・id が無い・JSON が壊れている場合は null。
 function parseChannelLookupResponse(jsonText) {
-  let data;
-  try { data = JSON.parse(String(jsonText || '')); } catch (e) { return null; }
-  const items = data && Array.isArray(data.items) ? data.items : [];
+  const items = jsonItems(jsonText);
   const first = items[0] || null;
   const channelId = first ? String(first.id || '').trim() : '';
   if (!channelId) return null;
@@ -477,9 +481,16 @@ function videoIdFromLink(link) {
 }
 
 function toRfc822(isoString) {
-  const t = Date.parse(cellIso(isoString) || String(isoString || ''));
+  const t = Date.parse(cellIso(isoString));
   if (Number.isNaN(t)) return '';
   return new Date(t).toUTCString();
+}
+
+// 記事の新しい順ソートに使う時刻 (公開日時を優先し、無ければ
+// 取り込み日時)。読めない場合は 0 (= 最も古い扱い)。
+// 引数はシート行の snake_case でも list 応答の camelCase でも同じ。
+function articleTimeMs(published, fetched) {
+  return Date.parse(cellIso(published) || cellIso(fetched) || '') || 0;
 }
 
 const RSS_MAX_ITEMS = 50;
@@ -494,11 +505,9 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken) {
   const f = feed || {};
   const title = String(f.title || '');
   const channelId = youtubeChannelIdFromUrl(f.url);
-  const sorted = (articleRows || []).slice().sort((a, b) => {
-    const ta = Date.parse(cellIso(a.published_at) || cellIso(a.fetched_at) || '') || 0;
-    const tb = Date.parse(cellIso(b.published_at) || cellIso(b.fetched_at) || '') || 0;
-    return tb - ta;
-  }).slice(0, RSS_MAX_ITEMS);
+  const sorted = (articleRows || []).slice()
+    .sort((a, b) => articleTimeMs(b.published_at, b.fetched_at) - articleTimeMs(a.published_at, a.fetched_at))
+    .slice(0, RSS_MAX_ITEMS);
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">',
@@ -553,20 +562,15 @@ function prunePlan(articles, nowIso, options) {
   const retentionMs = (opts.retentionDays || RETENTION_DAYS) * 24 * 60 * 60 * 1000;
   const maxArticles = opts.maxArticles || MAX_ARTICLES;
   const now = nowIso ? Date.parse(nowIso) : Date.now();
-  const sorted = (articles || []).slice().sort((a, b) => {
-    const ta = Date.parse(cellIso(a.published_at) || cellIso(a.fetched_at) || '') || 0;
-    const tb = Date.parse(cellIso(b.published_at) || cellIso(b.fetched_at) || '') || 0;
-    return tb - ta;
-  });
-  const keepRank = {};
-  sorted.forEach((a, idx) => { keepRank[a.id] = idx < maxArticles; });
+  const sorted = (articles || []).slice()
+    .sort((a, b) => articleTimeMs(b.published_at, b.fetched_at) - articleTimeMs(a.published_at, a.fetched_at));
   const deleteArticleIds = [];
-  sorted.forEach((a) => {
+  sorted.forEach((a, idx) => {
     // 経過日数は「取り込んだ日」から数える (公開日が古い動画などを
     // 取り込んだ瞬間に消してしまわないため)。
     const t = Date.parse(cellIso(a.fetched_at) || cellIso(a.published_at) || '') || 0;
     const tooOld = t > 0 && now - t > retentionMs;
-    const beyondCap = !keepRank[a.id];
+    const beyondCap = idx >= maxArticles;
     if (tooOld || beyondCap) deleteArticleIds.push(a.id);
   });
   return { deleteArticleIds };
@@ -582,13 +586,9 @@ function pruneArticles() {
 
 function remainingRowsAfterDelete(values, keyIdx, ids) {
   if (!values || !values.length) return values;
-  const remaining = [values[0]];
-  if (!ids || !ids.length) {
-    for (let i = 1; i < values.length; i++) remaining.push(values[i]);
-    return remaining;
-  }
   const target = {};
-  ids.forEach((id) => { target[String(id)] = true; });
+  (ids || []).forEach((id) => { target[String(id)] = true; });
+  const remaining = [values[0]];
   for (let i = 1; i < values.length; i++) {
     if (!target[String(values[i][keyIdx])]) remaining.push(values[i]);
   }
@@ -711,6 +711,8 @@ function validateSession(token) {
   const hashIdx = headers.indexOf('token_hash');
   const expIdx = headers.indexOf('expires_at');
   const roleIdx = headers.indexOf('role');
+  const accessIdx = headers.indexOf('access_count');
+  const lastIdx = headers.indexOf('last_accessed_at');
   const hash = sha256Hex(String(token));
   const nowIso = new Date().toISOString();
   for (let i = 1; i < values.length; i++) {
@@ -718,8 +720,6 @@ function validateSession(token) {
     if (!hashesEqual(row[hashIdx], hash)) continue;
     const expiresAt = cellIso(row[expIdx]);
     if (isSessionExpired(expiresAt, nowIso)) return null;
-    const accessIdx = headers.indexOf('access_count');
-    const lastIdx = headers.indexOf('last_accessed_at');
     if (accessIdx >= 0) sheet.getRange(i + 1, accessIdx + 1).setValue(Number(row[accessIdx] || 0) + 1);
     if (lastIdx >= 0) sheet.getRange(i + 1, lastIdx + 1).setValue(nowIso);
     const role = roleIdx >= 0 && row[roleIdx] ? String(row[roleIdx]) : 'owner';
@@ -867,16 +867,17 @@ function planYouTubeAudioTriggers(feedVideos, nowMs) {
   const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const seen = {};
   const ids = [];
+  const push = (v) => {
+    const videoId = String((v && v.videoId) || '');
+    if (!videoId || seen[videoId]) return;
+    seen[videoId] = true;
+    ids.push(videoId);
+  };
   (feedVideos || []).forEach((videos) => {
     const list = videos || [];
     if (list.some((v) => v && v.channelId === YT_AUDIO_ALWAYS_CHANNEL_ID)) {
       // 常時対応チャンネル: 取得できた順 (新しい順) に全件を選ぶ。
-      list.forEach((v) => {
-        const videoId = String((v && v.videoId) || '');
-        if (!videoId || seen[videoId]) return;
-        seen[videoId] = true;
-        ids.push(videoId);
-      });
+      list.forEach(push);
       return;
     }
     const isMusic = list.some((v) => v && v.category === YT_AUDIO_TRIGGER_MUSIC_CATEGORY);
@@ -894,12 +895,7 @@ function planYouTubeAudioTriggers(feedVideos, nowMs) {
       return tb - ta;
     });
     const perFeed = isMusic ? YT_AUDIO_TRIGGER_MUSIC_PER_FEED : YT_AUDIO_TRIGGER_PER_FEED;
-    sorted.slice(0, perFeed).forEach((v) => {
-      const videoId = String((v && v.videoId) || '');
-      if (!videoId || seen[videoId]) return;
-      seen[videoId] = true;
-      ids.push(videoId);
-    });
+    sorted.slice(0, perFeed).forEach(push);
   });
   return ids;
 }
@@ -1130,6 +1126,22 @@ function syncYouTubeSubscriptions() {
   }
 }
 
+// channels.list でチャンネル名を引く (タイトル未設定の YouTube
+// フィードの補完用)。取れなければ空文字で、失敗は例外にしない
+// (補完できなくても記事の取り込みは続けるため)。
+function lookupYouTubeChannelTitle(channelId, apiKey) {
+  try {
+    const channelUrl = 'https://www.googleapis.com/youtube/v3/channels?part=snippet'
+      + '&id=' + encodeURIComponent(channelId)
+      + '&key=' + encodeURIComponent(apiKey);
+    const res = UrlFetchApp.fetch(channelUrl, { method: 'get', muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return '';
+    return parseYouTubeChannelTitle(res.getContentText());
+  } catch (e) {
+    return '';
+  }
+}
+
 // fireTrigger はテスト用の差し込み口 (音声抽出トリガー用)。
 // 時間ベーストリガーからは引数なし (実際はイベントオブジェクト) で呼ばれる。
 function fetchFeeds(fireTrigger) {
@@ -1150,10 +1162,10 @@ function fetchFeeds(fireTrigger) {
   const feeds = rowsToObjects(feedValues);
   // Map feed id -> 1-based sheet row number (header is row 1).
   const rowNumById = {};
+  const idIdx = headers.indexOf('id');
   for (let i = 1; i < feedValues.length; i++) {
-    const obj = {};
-    headers.forEach((h, idx) => { obj[h] = feedValues[i][idx]; });
-    if (obj.id) rowNumById[obj.id] = i + 1;
+    const id = feedValues[i][idIdx];
+    if (id) rowNumById[id] = i + 1;
   }
   const youtubeFeeds = selectFetchTargets(feeds);
   const existingIds = {};
@@ -1172,20 +1184,10 @@ function fetchFeeds(fireTrigger) {
       // (YouTube フィードは登録時にタイトルを自動取得できないため空で入る)。
       // 補完の失敗は巡回自体の失敗にせず、タイトルは空のまま続ける。
       if (!String(feed.title || '').trim()) {
-        try {
-          const channelUrl = 'https://www.googleapis.com/youtube/v3/channels?part=snippet'
-            + '&id=' + encodeURIComponent(youtubeChannelIdFromUrl(feed.url))
-            + '&key=' + encodeURIComponent(youtubeApiKey);
-          const channelRes = UrlFetchApp.fetch(channelUrl, { method: 'get', muteHttpExceptions: true });
-          if (channelRes.getResponseCode() === 200) {
-            const channelTitle = parseYouTubeChannelTitle(channelRes.getContentText());
-            if (channelTitle) {
-              updateFeedRow(feedsSheet, headers, rowNum, { title: channelTitle });
-              feed.title = channelTitle;
-            }
-          }
-        } catch (titleErr) {
-          // 補完できなくても記事の取り込みは続ける。
+        const channelTitle = lookupYouTubeChannelTitle(youtubeChannelIdFromUrl(feed.url), youtubeApiKey);
+        if (channelTitle) {
+          updateFeedRow(feedsSheet, headers, rowNum, { title: channelTitle });
+          feed.title = channelTitle;
         }
       }
       const playlistId = youtubeUploadsPlaylistId(youtubeChannelIdFromUrl(feed.url));
@@ -1239,11 +1241,7 @@ function setupFetchTrigger() {
 // (フィード/カテゴリ/未読の絞り込みは v2 ではクライアント側で行う)。
 function filterArticles(articles) {
   const out = (articles || []).slice();
-  out.sort((a, b) => {
-    const ta = Date.parse(a.publishedAt || a.fetchedAt || '') || 0;
-    const tb = Date.parse(b.publishedAt || b.fetchedAt || '') || 0;
-    return tb - ta;
-  });
+  out.sort((a, b) => articleTimeMs(b.publishedAt, b.fetchedAt) - articleTimeMs(a.publishedAt, a.fetchedAt));
   return out;
 }
 
@@ -1268,10 +1266,9 @@ function buildListPayload(body) {
       isRead: false,
     };
   });
-  const unreadByFeed = {};
-  merged.forEach((a) => {
-    if (!a.isRead) unreadByFeed[a.feedId] = (unreadByFeed[a.feedId] || 0) + 1;
-  });
+  // isRead は常に false (既読は端末ローカル管理) のため、未読数は
+  // そのまま記事数になる。
+  const unreadByFeed = countUnreadByFeed(merged);
   const sorted = filterArticles(merged);
   let limit = Number(body.limit || 100);
   if (!Number.isFinite(limit) || limit <= 0) limit = 100;
@@ -1453,7 +1450,7 @@ function handleSaveFeed(body, resolveHandle) {
   if (channelRef) {
     let channelId = channelRef.kind === 'id' ? channelRef.channelId : '';
     let resolvedTitle = '';
-    if (channelRef && channelRef.kind === 'handle') {
+    if (channelRef.kind === 'handle') {
       const resolve = resolveHandle || lookupYouTubeChannelByHandle;
       const found = resolve(channelRef.handle);
       if (!found || !String(found.channelId || '').trim()) {
@@ -1479,21 +1476,27 @@ function handleSaveFeed(body, resolveHandle) {
     headers.forEach((h, idx) => { obj[h] = values[i][idx]; });
     return obj;
   };
+  // データ行 (1始まりの添字) から条件に合う最初の行を探す。無ければ -1。
+  const findRow = (pred) => {
+    for (let i = 1; i < values.length; i++) {
+      if (pred(values[i])) return i;
+    }
+    return -1;
+  };
   let existing = null;
   let rowNum = -1;
+  const takeRow = (i) => { existing = rowAt(i); rowNum = i + 1; };
   // 1) id の指定があり、その行があればその行を更新する (管理画面の編集経路。
   //    移行前の slug ID の行もそのまま扱う)。
   if (feed.id && idIdx >= 0) {
-    for (let i = 1; i < values.length; i++) {
-      if (String(values[i][idIdx]) === feed.id) { existing = rowAt(i); rowNum = i + 1; break; }
-    }
+    const i = findRow((row) => String(row[idIdx]) === feed.id);
+    if (i >= 0) takeRow(i);
   }
   // 2) 同じ URL の行があれば、その行の更新として扱う (再追加の冪等化)。
   //    行の ID は維持する。
   if (!existing && urlIdx >= 0) {
-    for (let i = 1; i < values.length; i++) {
-      if (String(values[i][urlIdx]) === feed.url) { existing = rowAt(i); rowNum = i + 1; break; }
-    }
+    const i = findRow((row) => String(row[urlIdx]) === feed.url);
+    if (i >= 0) takeRow(i);
   }
   // 2b) YouTube は、入力形が違っても (/@handle で登録 → 保存形で保存済み等)
   //     チャンネルIDが一致すれば同じ行の更新として扱う (クロスフォームな
@@ -1501,9 +1504,8 @@ function handleSaveFeed(body, resolveHandle) {
   if (!existing && urlIdx >= 0) {
     const feedChannelId = youtubeChannelIdFromUrl(feed.url);
     if (feedChannelId) {
-      for (let i = 1; i < values.length; i++) {
-        if (youtubeChannelIdFromUrl(values[i][urlIdx]) === feedChannelId) { existing = rowAt(i); rowNum = i + 1; break; }
-      }
+      const i = findRow((row) => youtubeChannelIdFromUrl(row[urlIdx]) === feedChannelId);
+      if (i >= 0) takeRow(i);
     }
   }
   if (existing) {
@@ -1515,12 +1517,8 @@ function handleSaveFeed(body, resolveHandle) {
     //    同じ ID の行が別 URL で存在したらハッシュ衝突として弾く
     //    (同じ URL の行は手順2で拾われているため、ここには来ない)。
     feed.id = feedIdFromUrl(feed.url);
-    if (idIdx >= 0) {
-      for (let i = 1; i < values.length; i++) {
-        if (String(values[i][idIdx]) === feed.id) {
-          return { ok: false, error: 'conflict', message: 'feed id collision for url: ' + feed.url };
-        }
-      }
+    if (idIdx >= 0 && findRow((row) => String(row[idIdx]) === feed.id) >= 0) {
+      return { ok: false, error: 'conflict', message: 'feed id collision for url: ' + feed.url };
     }
   }
   const rowObj = buildFeedRow(feed, existing);
@@ -1626,33 +1624,19 @@ function doPost(e) {
     const sessionToken = body.sessionToken || body.session_token || '';
     const session = validateSession(sessionToken);
     if (!session) return jsonOutput({ ok: false, error: 'unauthorized' });
-    if (action === 'listFeeds') {
+    // オーナー専用アクション (readonly セッションは一律 forbidden)。
+    const ownerActions = {
+      listFeeds: () => buildListFeedsPayload(),
+      saveFeed: () => handleSaveFeed(body),
+      deleteFeed: () => handleDeleteFeed(body),
+      reorderFeeds: () => handleReorderFeeds(body),
+      issueShareLink: () => issueShareLink(),
+      getShareLinkStatus: () => getShareLinkStatus(),
+      revokeShareLink: () => revokeShareLink(),
+    };
+    if (Object.prototype.hasOwnProperty.call(ownerActions, action)) {
       if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(buildListFeedsPayload());
-    }
-    if (action === 'saveFeed') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(handleSaveFeed(body));
-    }
-    if (action === 'deleteFeed') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(handleDeleteFeed(body));
-    }
-    if (action === 'reorderFeeds') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(handleReorderFeeds(body));
-    }
-    if (action === 'issueShareLink') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(issueShareLink());
-    }
-    if (action === 'getShareLinkStatus') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(getShareLinkStatus());
-    }
-    if (action === 'revokeShareLink') {
-      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
-      return jsonOutput(revokeShareLink());
+      return jsonOutput(ownerActions[action]());
     }
     if (action === 'list') {
       return jsonOutput(buildListPayload(body));
