@@ -29,14 +29,14 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 | `exchange_share` | `shareToken` | 一時アクセスリンクを検証し、読み取り専用セッションを発行 |
 | `list` | `sessionToken`, `limit?` (最大500) | 記事一覧 (新しい順。`isRead` は既読を端末ローカル管理にするため常に `false`)＋フィード一覧 (未読数付き＝サーバー側の記事数)。v2 では主にフィード一覧 (fetchUrl 付き) の取得に使う |
 | `listFeeds` | `sessionToken` (owner) | フィード管理用一覧 (全件、最終取得・未読数付き)。読み取り専用セッションは拒否 |
-| `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category,isPrivate}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消す。YouTube はチャンネルページ URL (`/channel/UC...`・`/@handle`) で登録でき、保存時は `/channel/UC...` 形に寄せる (ハンドルは Data API で解決し、タイトルも補完する) |
+| `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消す。YouTube はチャンネルページ URL (`/channel/UC...`・`/@handle`) で登録でき、保存時は `/channel/UC...` 形に寄せる (ハンドルは Data API で解決し、タイトルも補完する) |
 | `deleteFeed` | `sessionToken` (owner), `feedId` | フィード行と、その記事をまとめて削除。未知のIDは `{ok:false, error:"not_found"}` |
 | `reorderFeeds` | `sessionToken` (owner), `feedIds:[...]` | フィードの並び順を変更 (表示順＝feedsシートの行順なので、行を並び替えて一括で書き戻す)。現在の全フィードIDと集合が一致しない・重複する場合は `{ok:false, error:"invalid", message}` |
 | `issueShareLink` | `sessionToken` (owner) | 一時アクセスリンクを発行し、`{ok:true, token, expiresAt}` を返す (TTL 30日)。保存はハッシュのみで、発行のたびに置き換わるため旧リンクは無効になる。平文トークンを返すのはこの応答だけ |
 | `getShareLinkStatus` | `sessionToken` (owner) | 共有リンクの状態を `{ok:true, active, expiresAt}` で返す。有効なリンクが無い・期限切れなら `active:false`、`expiresAt:null` |
 | `revokeShareLink` | `sessionToken` (owner) | 共有リンクの保存レコードを消して即時無効化し、`{ok:true}` を返す |
 
-フィード管理のセキュリティ規則: `isPrivate` は入力値では決めず、URLのホストが `a.ze.gs` そのもののときだけ `true` に強制する (自前ホストのマーカーとしてだけ使う)。
+非公開フラグ (`isPrivate` / feeds タブの `is_private` 列) は廃止した。フロントは表示・取得の分岐に使っておらず、入力値も無視されていたため、計算・保存・応答のすべてを取り除き、feeds タブは9列 (id, title, url, category, etag, last_modified, last_fetched_at, last_status, last_error) にした。
 
 `doGet` は `{ok:true, service:"reader-gas"}` のヘルスチェックと、YouTube フィードの RSS 2.0 出力 (`?rss=<フィードID>`、対象外のIDは `{ok:false, error:"feed_not_found"}`) を行う。
 
