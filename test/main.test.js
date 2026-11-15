@@ -2289,14 +2289,16 @@ test('planYouTubeAudioTriggers: 常時対応と通常フィードが混ざって
   assert.deepEqual(planYouTubeAudioTriggers([special, normal], now), ['vidSOld0001', 'vidNNew0001']);
 });
 
-test('planYouTubeAudioTriggers: 音楽ジャンルは期間の縛りなしで新しい順10本まで選ぶ (30日超も対象)', () => {
+test('planYouTubeAudioTriggers: 音楽ジャンルは期間の縛りなしで新しい順20本まで選ぶ (30日超も対象)', () => {
   const now = Date.parse('2026-11-15T00:00:00.000Z');
-  // 15本: 新しい順で vidM15 (2026-11-14) 〜 vidM01 (2025-01-01)。
+  // 25本: 新しい順で vidM25 (2026-11-14) 〜 vidM01 (2023-01-01)。
   // 大半は30日より古いが、音楽ジャンルでは期間で絞らない。
   const dates = [
-    '2025-01-01', '2025-03-01', '2025-05-01', '2025-07-01', '2025-09-01',
-    '2025-11-01', '2026-01-01', '2026-03-01', '2026-05-01', '2026-07-01',
-    '2026-09-01', '2026-10-01', '2026-10-20', '2026-11-10', '2026-11-14',
+    '2023-01-01', '2023-04-01', '2023-07-01', '2023-10-01', '2024-01-01',
+    '2024-04-01', '2024-07-01', '2024-10-01', '2025-01-01', '2025-03-01',
+    '2025-05-01', '2025-07-01', '2025-09-01', '2025-11-01', '2026-01-01',
+    '2026-03-01', '2026-05-01', '2026-07-01', '2026-09-01', '2026-10-01',
+    '2026-10-20', '2026-11-10', '2026-11-12', '2026-11-13', '2026-11-14',
   ];
   const music = dates.map((d, i) => ({
     videoId: 'vidM' + String(i + 1).padStart(2, '0'),
@@ -2304,9 +2306,9 @@ test('planYouTubeAudioTriggers: 音楽ジャンルは期間の縛りなしで新
     category: '音楽',
   }));
   const plan = planYouTubeAudioTriggers([music], now);
-  assert.equal(plan.length, 10);
-  assert.equal(plan[0], 'vidM15');
-  assert.equal(plan[9], 'vidM06'); // 2025-11-01 (30日超) まで入る
+  assert.equal(plan.length, 20);
+  assert.equal(plan[0], 'vidM25');
+  assert.equal(plan[19], 'vidM06'); // 2024-04-01 (30日超) まで入る
   assert.ok(!plan.includes('vidM05'));
 });
 
@@ -2347,7 +2349,7 @@ test('planYouTubeAudioTriggers: 常時対応チャンネルは音楽ジャンル
     });
   }
   const plan = planYouTubeAudioTriggers([special], now);
-  assert.equal(plan.length, 15); // 音楽の10本枠ではなく全件
+  assert.equal(plan.length, 15); // 音楽の20本枠ではなく全件
 });
 
 test('fetchFeeds: 抽出トリガーは各フィードの最新3本に発火する', () => {
@@ -2467,12 +2469,14 @@ test('fetchFeeds: 常時対応チャンネルは30日超でも取得できた全
   } finally { restore(); }
 });
 
-test('fetchFeeds: 音楽ジャンルのフィードは30日超でも新しい順10本まで発火する', () => {
+test('fetchFeeds: 音楽ジャンルのフィードは30日超でも新しい順20本まで発火する', () => {
   const rowMusic = ['yt-music', '音楽チャンネル', 'https://www.youtube.com/channel/UCmusicchanneL1', '音楽', 'FALSE', '', '', '', '', ''];
   const items = [];
-  for (let i = 1; i <= 12; i++) {
+  for (let i = 1; i <= 15; i++) {
     // 全て公開から30日を大きく超えた日付にする (月をずらして新しい順を付ける)
-    items.push(['vidMu' + String(i).padStart(5, '0'), '2025-' + String(i).padStart(2, '0') + '-15T00:00:00Z']);
+    const y = 2024 + Math.floor((i - 1) / 12);
+    const m = String(((i - 1) % 12) + 1).padStart(2, '0');
+    items.push(['vidMu' + String(i).padStart(5, '0'), y + '-' + m + '-15T00:00:00Z']);
   }
   const body = playlistBodyWith(items);
   const { restore } = fetchAudioEnv({
@@ -2484,10 +2488,10 @@ test('fetchFeeds: 音楽ジャンルのフィードは30日超でも新しい順
   try {
     const result = fetchFeeds((videoId) => { calls.push(videoId); });
     assert.equal(result.ok, true);
-    assert.equal(result.added, 12);
-    assert.equal(calls.length, 10); // 音楽は10本まで (通常は30日超なら0本)
-    assert.equal(calls[0], 'vidMu00012'); // 新しい順
-    assert.equal(calls[9], 'vidMu00003');
+    assert.equal(result.added, 15);
+    assert.equal(calls.length, 15); // 音楽は20本まで (取得15本すべて発火。通常は30日超なら0本)
+    assert.equal(calls[0], 'vidMu00015'); // 新しい順
+    assert.equal(calls[14], 'vidMu00001');
   } finally { restore(); }
 });
 
@@ -2606,7 +2610,7 @@ test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キ
   for (let f = 0; f < 12; f++) {
     const videos = [];
     for (let i = 0; i < 15; i++) {
-      // 音楽は30日超でも計画に入るため、12フィード×10本 = 120件の計画になる
+      // 音楽は30日超でも計画に入るため、12フィード×15本 = 180件の計画になる
       videos.push({ videoId: 'vidMu' + f + '_' + i, publishedAt: '2025-06-01T00:00:00.000Z', category: '音楽' });
     }
     feedVideos.push(videos);
