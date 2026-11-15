@@ -12,8 +12,11 @@
 // 複数端末の同時セッションを妨げない。
 // 一時アクセスリンク (share) は読み取り専用: exchange_share で検証し、
 // role=readonly のセッションを発行する。書き込み系の操作は readonly を拒否する。
-// 新規の共有リンク発行 (issue_share) は廃止したため、新しいリンクは作れない
-// (既存リンクは SHARE_EXPIRES_AT の期限まで有効)。
+// 共有リンクの保存はスクリプトプロパティ SHARE_TOKEN_HASH (SHA-256 ハッシュ
+// のみ) と SHARE_EXPIRES_AT の単一レコードで、発行・状態確認・無効化は
+// オーナー専用アクション (issueShareLink / getShareLinkStatus /
+// revokeShareLink) で行う。発行のたびにレコードを置き換えるため、
+// 旧リンクはその時点で無効になる (TTL は30日)。
 // v2 では RSS フィードの巡回はクライアント側 (url-fetch-gas 経由) で行うため、
 // サーバー側の巡回は YouTube だけを対象にする。A_ZE_GS_TOKEN は
 // 音声抽出トリガー (yt-audio コマンド) を叩くときにだけ読む。
@@ -31,6 +34,9 @@ const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
 const OWNER_SHEET_NAME = 'owner_sessions';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const SHARE_TOKEN_HASH_PROP = 'SHARE_TOKEN_HASH';
+const SHARE_EXPIRES_AT_PROP = 'SHARE_EXPIRES_AT';
+const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SESSION_HEADERS = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
 const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'is_private', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
 const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
@@ -731,11 +737,52 @@ function validateSession(token) {
 function validateShareToken(token) {
   if (!token) return false;
   const props = PropertiesService.getScriptProperties();
-  const expectedHash = props.getProperty('SHARE_TOKEN_HASH');
-  const expiresAt = props.getProperty('SHARE_EXPIRES_AT');
+  const expectedHash = props.getProperty(SHARE_TOKEN_HASH_PROP);
+  const expiresAt = props.getProperty(SHARE_EXPIRES_AT_PROP);
   if (!expectedHash || !expiresAt) return false;
   if (isSessionExpired(expiresAt, new Date().toISOString())) return false;
   return hashesEqual(sha256Hex(String(token)), expectedHash);
+}
+
+// 共有リンクの保存値から状態応答を作る純関数。レコードが無い・
+// 期限切れなら active: false とし、expiresAt は返さない。
+function shareLinkStatus(hash, expiresAt, nowIso) {
+  if (!hash || !expiresAt || isSessionExpired(expiresAt, nowIso)) {
+    return { active: false, expiresAt: null };
+  }
+  return { active: true, expiresAt };
+}
+
+// 共有リンクを発行する (オーナー専用アクション issueShareLink の本体)。
+// トークンはセッションと同じ生成器で作り、保存は SHA-256 ハッシュのみ。
+// 単一レコードを置き換えるため、発行した時点で旧リンクは無効になる。
+// 平文トークンを返すのはこの応答だけ。
+function issueShareLink() {
+  const expiresAt = new Date(Date.now() + SHARE_TTL_SECONDS * 1000).toISOString();
+  const token = generateRawToken();
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(SHARE_TOKEN_HASH_PROP, sha256Hex(token));
+  props.setProperty(SHARE_EXPIRES_AT_PROP, expiresAt);
+  return { ok: true, token, expiresAt };
+}
+
+function getShareLinkStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const status = shareLinkStatus(
+    props.getProperty(SHARE_TOKEN_HASH_PROP),
+    props.getProperty(SHARE_EXPIRES_AT_PROP),
+    new Date().toISOString()
+  );
+  return { ok: true, active: status.active, expiresAt: status.expiresAt };
+}
+
+// 共有リンクを即時無効化する。保存レコード自体を消すため、
+// validateShareToken はその直後から false を返す。
+function revokeShareLink() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(SHARE_TOKEN_HASH_PROP);
+  props.deleteProperty(SHARE_EXPIRES_AT_PROP);
+  return { ok: true };
 }
 
 // --- Feed fetching (hourly trigger) ---
@@ -1587,6 +1634,18 @@ function doPost(e) {
       if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
       return jsonOutput(handleReorderFeeds(body));
     }
+    if (action === 'issueShareLink') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(issueShareLink());
+    }
+    if (action === 'getShareLinkStatus') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(getShareLinkStatus());
+    }
+    if (action === 'revokeShareLink') {
+      if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
+      return jsonOutput(revokeShareLink());
+    }
     if (action === 'list') {
       return jsonOutput(buildListPayload(body));
     }
@@ -1595,4 +1654,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, freshAudioUrl, ytPlayUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, handleSaveFeed, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, freshAudioUrl, ytPlayUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, doGet, doPost };

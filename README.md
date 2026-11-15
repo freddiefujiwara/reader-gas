@@ -32,6 +32,9 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 | `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category,isPrivate}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消す。YouTube はチャンネルページ URL (`/channel/UC...`・`/@handle`) で登録でき、保存時は `/channel/UC...` 形に寄せる (ハンドルは Data API で解決し、タイトルも補完する) |
 | `deleteFeed` | `sessionToken` (owner), `feedId` | フィード行と、その記事をまとめて削除。未知のIDは `{ok:false, error:"not_found"}` |
 | `reorderFeeds` | `sessionToken` (owner), `feedIds:[...]` | フィードの並び順を変更 (表示順＝feedsシートの行順なので、行を並び替えて一括で書き戻す)。現在の全フィードIDと集合が一致しない・重複する場合は `{ok:false, error:"invalid", message}` |
+| `issueShareLink` | `sessionToken` (owner) | 一時アクセスリンクを発行し、`{ok:true, token, expiresAt}` を返す (TTL 30日)。保存はハッシュのみで、発行のたびに置き換わるため旧リンクは無効になる。平文トークンを返すのはこの応答だけ |
+| `getShareLinkStatus` | `sessionToken` (owner) | 共有リンクの状態を `{ok:true, active, expiresAt}` で返す。有効なリンクが無い・期限切れなら `active:false`、`expiresAt:null` |
+| `revokeShareLink` | `sessionToken` (owner) | 共有リンクの保存レコードを消して即時無効化し、`{ok:true}` を返す |
 
 フィード管理のセキュリティ規則: `isPrivate` は入力値では決めず、URLのホストが `a.ze.gs` そのもののときだけ `true` に強制する (自前ホストのマーカーとしてだけ使う)。
 
@@ -50,7 +53,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 | `A_ZE_GS_TOKEN` | 音声用 | a.ze.gs のコマンド用トークン (`X-Api-Token`)。毎時巡回で音声抽出 (`yt-audio`) を依頼するときに使う。未設定なら依頼だけを省く |
 | `YT_PLAY_TOKEN` | 音声用 | ze の音声中継 (`yt-play`) の合言葉。設定すると `?rss=` の enclosure が中継 URL (`https://y.ze.gs/<token>/<動画ID>`) になる。未設定・空なら従来の直接 URL のまま |
 | `GOOGLE_CLIENT_ID` | 任意 | 設定すると IDトークンの `aud` をピン留めする (tweet-gas と同じ) |
-| `SHARE_TOKEN_HASH` / `SHARE_EXPIRES_AT` | 既存リンク用 | 一時アクセスリンクのハッシュと期限。`exchange_share` が読む。発行手段 (`issue_share`) は廃止したため、既存リンクは期限まで有効だが新規発行はできない |
+| `SHARE_TOKEN_HASH` / `SHARE_EXPIRES_AT` | 発行時に自動 | 一時アクセスリンクのハッシュ (SHA-256) と期限。`exchange_share` の検証が読み、`issueShareLink` が書き、`revokeShareLink` が消す。手動で設定する必要はない |
 
 プロパティが設定画面で保存できない場合は、一時ファイルから `PropertiesService.getScriptProperties().setProperty(...)` を1回実行して設定し、設定画面を新しいタブで開き直して残っていることを確認する (既存の回避手順)。
 
@@ -63,7 +66,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 
 ### 一時アクセスリンク
 
-既存のリンクは、フロントが `#share=<トークン>` で受け取り、`exchange_share` で読み取り専用セッションに交換する形で、`SHARE_EXPIRES_AT` の期限まで有効。新規発行の手段は無い (`issue_share` は廃止)。
+オーナーが `issueShareLink` で発行する (TTL 30日)。フロントはリンクを `#share=<トークン>` で受け取り、`exchange_share` で読み取り専用セッションに交換する。保存はスクリプトプロパティ `SHARE_TOKEN_HASH` / `SHARE_EXPIRES_AT` の単一レコードで、トークンの平文は保存せず SHA-256 ハッシュだけを置く。発行のたびにレコードを置き換えるため旧リンクは無効になり、`revokeShareLink` で即時無効化もできる。状態は `getShareLinkStatus` で確認する。検証経路 (`exchange_share` → `validateShareToken`) は従来どおりで、保存形式も従来と同じプロパティのため、移行は不要で既存リンクもそのまま有効。
 
 ## 開発
 
