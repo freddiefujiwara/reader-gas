@@ -824,15 +824,25 @@ function selectFetchTargets(feeds) {
 // 最新3本で、新着かどうかは問わない (ze 側が抽出済みのものは
 // 重複排除するため、毎時叩き直しても安い)。更新の止まった
 // チャンネルは最新動画でも30日を超えていれば何も発火しない。
-// 例外は YT_AUDIO_ALWAYS_CHANNEL_ID のチャンネルだけで、こちらは
-// 30日制限も最新3本の上限も付けず、取得できた動画を毎時すべて
-// 依頼し直して常時再生可能な状態を保つ (下の定数のコメント参照)。
+// 例外は2種類ある:
+// - YT_AUDIO_ALWAYS_CHANNEL_ID のチャンネルは、30日制限も最新3本の
+//   上限も付けず、取得できた動画を毎時すべて依頼し直して常時再生
+//   可能な状態を保つ (下の定数のコメント参照)。
+// - ジャンルが「音楽」 (YT_AUDIO_TRIGGER_MUSIC_CATEGORY) のフィードは、
+//   30日制限を付けず、新しい順に最新10本までを対象にする。音楽は
+//   更新頻度が低くても過去分を再生したいため (本人の決定)。
 // 失敗しても巡回自体は失敗にしない (fire-and-forget)。
 
 const YT_AUDIO_TRIGGER_BASE_URL = 'https://a.ze.gs/yt-audio/';
 const YT_AUDIO_TRIGGER_PER_FEED = 3;
+// 音楽ジャンルの特別扱い: このジャンルのフィードだけ、期間の縛りを
+// 外して新しい順に YT_AUDIO_TRIGGER_MUSIC_PER_FEED 本まで選ぶ。
+const YT_AUDIO_TRIGGER_MUSIC_CATEGORY = '音楽';
+const YT_AUDIO_TRIGGER_MUSIC_PER_FEED = 10;
 // 全体キャップ。通常分 (最大23フィード×3本=69) と常時対応分
-// (最大20本) の合計89本に余裕を持たせた値。
+// (最大20本) の合計89本に余裕を持たせた値。音楽フィードの枠が
+// 増えた分だけ合計が100を超える場合は、従来どおりフィード順の
+// 先頭から100件で打ち切る (後ろのフィードから省かれる)。
 const YT_AUDIO_TRIGGER_MAX_PER_RUN = 100;
 const YT_AUDIO_TRIGGER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // 常時対応チャンネル (本人のチャンネル「藤原史和 川口を歩くQAエンジニア」)。
@@ -846,13 +856,18 @@ const YT_AUDIO_ALWAYS_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
 // 30日以内 (ちょうど30日前を含む) の動画だけに絞り、その中で
 // 新しい順に最大 YT_AUDIO_TRIGGER_PER_FEED 本を選び、動画IDで
 // 重複を除いて並べる。公開日時が読めない動画は安全側で対象外。
-// ただし常時対応チャンネル (YT_AUDIO_ALWAYS_CHANNEL_ID) のフィードは
-// 例外で、公開日時や件数に関係なく、動画IDのある全件を選ぶ
-// (公開日時が読めない動画も対象。常時再生可能を保つため)。
+// 例外は2種類:
+// - 常時対応チャンネル (YT_AUDIO_ALWAYS_CHANNEL_ID) のフィードは、
+//   公開日時や件数に関係なく、動画IDのある全件を選ぶ
+//   (公開日時が読めない動画も対象。常時再生可能を保つため)。
+// - 音楽ジャンル (YT_AUDIO_TRIGGER_MUSIC_CATEGORY) のフィードは、
+//   期間では絞らず (公開日時が読めない動画は最も古いものとして
+//   並べる)、新しい順に最大 YT_AUDIO_TRIGGER_MUSIC_PER_FEED 本を選ぶ。
 // 上限件数の適用は発火側 (fireYouTubeAudioTriggers) で行う。
 // nowMs はテスト用の差し込み口 (省略時は現在時刻)。
-// feedVideos はフィードごとの { videoId, publishedAt, channelId }
-// の配列の配列 (channelId は常時対応チャンネルの判定用)。
+// feedVideos はフィードごとの { videoId, publishedAt, channelId,
+// category } の配列の配列 (channelId は常時対応チャンネルの判定用、
+// category は音楽ジャンルの判定用)。
 function planYouTubeAudioTriggers(feedVideos, nowMs) {
   const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const seen = {};
@@ -869,18 +884,22 @@ function planYouTubeAudioTriggers(feedVideos, nowMs) {
       });
       return;
     }
-    const fresh = list.filter((v) => {
+    const isMusic = list.some((v) => v && v.category === YT_AUDIO_TRIGGER_MUSIC_CATEGORY);
+    const candidates = list.filter((v) => {
       // 動画IDの無いものは件数上限の枠も使わないよう、最初に除く。
       if (!v || !String(v.videoId || '')) return false;
+      // 音楽ジャンルは期間の縛りなし (30日より古い動画も対象)。
+      if (isMusic) return true;
       const ts = Date.parse(v.publishedAt || '');
       return !isNaN(ts) && now - ts <= YT_AUDIO_TRIGGER_MAX_AGE_MS;
     });
-    const sorted = fresh.slice().sort((a, b) => {
+    const sorted = candidates.slice().sort((a, b) => {
       const tb = Date.parse((b && b.publishedAt) || '') || 0;
       const ta = Date.parse((a && a.publishedAt) || '') || 0;
       return tb - ta;
     });
-    sorted.slice(0, YT_AUDIO_TRIGGER_PER_FEED).forEach((v) => {
+    const perFeed = isMusic ? YT_AUDIO_TRIGGER_MUSIC_PER_FEED : YT_AUDIO_TRIGGER_PER_FEED;
+    sorted.slice(0, perFeed).forEach((v) => {
       const videoId = String((v && v.videoId) || '');
       if (!videoId || seen[videoId]) return;
       seen[videoId] = true;
@@ -1188,6 +1207,8 @@ function fetchFeeds(fireTrigger) {
         videoId: String(entry.guid || '') || videoIdFromLink(entry.link),
         publishedAt: entry.publishedAt || '',
         channelId: youtubeChannelIdFromUrl(feed.url),
+        // 音楽ジャンルの特別扱いの判定用にフィードのジャンルも渡す。
+        category: String(feed.category || ''),
       })).filter((v) => v.videoId));
       updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '200', last_error: '' });
     } catch (err) {
@@ -1198,8 +1219,9 @@ function fetchFeeds(fireTrigger) {
       });
     }
   });
-  // 各フィードの公開30日以内の最新3本 (常時対応チャンネルは全件) の
-  // 音声抽出を ze へ依頼する (記事の保存が済んでから発火する)。
+  // 各フィードの公開30日以内の最新3本 (音楽ジャンルは期間なしの
+  // 最新10本、常時対応チャンネルは全件) の音声抽出を ze へ依頼する
+  // (記事の保存が済んでから発火する)。
   // トリガーの成否は巡回結果に影響させない。
   try {
     fireYouTubeAudioTriggers(feedVideos, fireTrigger);
