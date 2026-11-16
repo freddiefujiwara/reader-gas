@@ -33,6 +33,8 @@ import {
   fetchAudioUrlsMap,
   ytPlayUrl,
   planYouTubeAudioTriggers,
+  computeStarredArticleIds,
+  planStarredAudioTriggers,
   fireYouTubeAudioTriggers,
   escapeXml,
   videoIdFromLink,
@@ -63,6 +65,7 @@ import {
   revokeShareLink,
   handleSaveFeed,
   handleDeleteFeed,
+  handleSetStar,
   doGet,
   doPost,
 } from '../src/main.js';
@@ -3220,5 +3223,309 @@ test('syncYouTubeSubscriptions: ページング上限超過では中止し、削
     // 一覧が不完全な可能性があるため、購読に無いフィードも消さない
     assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'yt-gone']);
     assert.ok(logs.some((m) => m.includes('aborted (fetch_failed)') && m.includes('paging exceeded')), logs.join('\n'));
+  } finally { restore(); }
+});
+
+// ============================================================
+// スター制 (YouTube 再生対象の手動オーバーライド＋デフォルト判定)
+// ============================================================
+
+const ARTICLE_HEADERS_ROW_STAR = [...ARTICLE_HEADERS_ROW, 'star_override'];
+const STAR_NOW = Date.parse('2026-11-15T00:00:00.000Z');
+const STAR_FEED_NORMAL = { id: 'yt-n', title: '通常', url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', category: '' };
+const STAR_FEED_MUSIC = { id: 'yt-m', title: '音楽', url: 'https://www.youtube.com/channel/UCmusicchanneL1', category: '音楽' };
+const STAR_FEED_OWN = { id: 'yt-own', title: '本人', url: 'https://www.youtube.com/channel/UCbiDZXbr391oT_vsRiqwPFg', category: '' };
+
+function starArticle(id, feedId, videoId, publishedAt, override) {
+  const a = {
+    id, feed_id: feedId, title: '動画 ' + videoId,
+    link: 'https://www.youtube.com/watch?v=' + videoId,
+    published_at: publishedAt, fetched_at: publishedAt, summary: '', author: '',
+  };
+  if (override !== undefined) a.star_override = override;
+  return a;
+}
+
+test('computeStarredArticleIds: デフォルトは通常フィードで30日以内・新しい順3本だけ', () => {
+  const articles = [
+    starArticle('a1', 'yt-n', 'vidS00001', '2026-11-14T00:00:00.000Z'),
+    starArticle('a2', 'yt-n', 'vidS00002', '2026-11-13T00:00:00.000Z'),
+    starArticle('a3', 'yt-n', 'vidS00003', '2026-11-12T00:00:00.000Z'),
+    starArticle('a4', 'yt-n', 'vidS00004', '2026-11-11T00:00:00.000Z'),
+    starArticle('a5', 'yt-n', 'vidS00005', '2026-11-10T00:00:00.000Z'),
+    starArticle('a6', 'yt-n', 'vidS00006', '2026-09-01T00:00:00.000Z'),
+  ];
+  const starred = computeStarredArticleIds([STAR_FEED_NORMAL], articles, STAR_NOW);
+  assert.deepEqual(Object.keys(starred).sort(), ['a1', 'a2', 'a3']);
+});
+
+test('computeStarredArticleIds: 音楽は期間なしの新しい順20本、常時対応チャンネルは全件', () => {
+  const music = [];
+  for (let i = 1; i <= 25; i++) {
+    // 2024年の日付を新しい順に25本 (すべて30日より古い)
+    const d = new Date(Date.parse('2024-12-31T00:00:00.000Z') - (i - 1) * 24 * 60 * 60 * 1000).toISOString();
+    music.push(starArticle('m' + i, 'yt-m', 'vidM' + String(i).padStart(5, '0'), d));
+  }
+  const own = [
+    starArticle('o1', 'yt-own', 'vidO00001', '2023-01-01T00:00:00.000Z'),
+    starArticle('o2', 'yt-own', 'vidO00002', '2023-06-01T00:00:00.000Z'),
+  ];
+  const starred = computeStarredArticleIds([STAR_FEED_MUSIC, STAR_FEED_OWN], [...music, ...own], STAR_NOW);
+  // 音楽は新しい順20本まで (m1..m20)、古い5本 (m21..m25) は入らない
+  assert.equal(Object.keys(starred).filter((id) => id.startsWith('m')).length, 20);
+  assert.ok(starred['m20']);
+  assert.ok(!starred['m21']);
+  // 常時対応チャンネルは古くても全件
+  assert.ok(starred['o1'] && starred['o2']);
+});
+
+test('computeStarredArticleIds: 手動オーバーライドが優先され、外した枠への繰り上げは起きない', () => {
+  const articles = [
+    starArticle('v1', 'yt-n', 'vidNv00001', '2026-11-14T00:00:00.000Z', 'off'),
+    starArticle('v2', 'yt-n', 'vidNv00002', '2026-11-13T00:00:00.000Z'),
+    starArticle('v3', 'yt-n', 'vidNv00003', '2026-11-12T00:00:00.000Z'),
+    starArticle('v4', 'yt-n', 'vidNv00004', '2026-11-11T00:00:00.000Z'),
+    starArticle('v5', 'yt-n', 'vidNv00005', '2026-11-10T00:00:00.000Z', 'on'),
+    starArticle('vOld', 'yt-n', 'vidNv00006', '2026-08-01T00:00:00.000Z', 'on'),
+  ];
+  const starred = computeStarredArticleIds([STAR_FEED_NORMAL], articles, STAR_NOW);
+  // デフォルトは v1..v3 だが v1 は手動で外したため入らない。
+  // v4 は v1 の枠に繰り上がらない (ランキングは記事集合全体で評価)。
+  // v5 と vOld はデフォルト外でも手動で付けたため入る。
+  assert.deepEqual(Object.keys(starred).sort(), ['v2', 'v3', 'v5', 'vOld']);
+});
+
+test('computeStarredArticleIds: 非YouTubeの記事は対象外、未知のオーバーライド値は自動判定扱い', () => {
+  const webFeed = { id: 'web', title: 'Web', url: 'https://example.com/feed', category: '' };
+  const articles = [
+    // 非 YouTube フィードの記事は、手動 on でも実効スターにならない
+    { id: 'w1', feed_id: 'web', title: '記事', link: 'https://example.com/1', published_at: '2026-11-14T00:00:00.000Z', fetched_at: '', summary: '', author: '', star_override: 'on' },
+    // フィードが存在しない記事も対象外
+    starArticle('x1', 'no-such-feed', 'vidX00001', '2026-11-14T00:00:00.000Z', 'on'),
+    // 'yes' のような想定外の値は '' (自動判定) として扱い、デフォルトで付く
+    starArticle('y1', 'yt-n', 'vidY00001', '2026-11-14T00:00:00.000Z', 'yes'),
+  ];
+  const starred = computeStarredArticleIds([webFeed, STAR_FEED_NORMAL], articles, STAR_NOW);
+  assert.deepEqual(Object.keys(starred), ['y1']);
+});
+
+test('planStarredAudioTriggers: フィード順に、デフォルト (off除く)＋手動 on を新しい順で足す', () => {
+  const articles = [
+    starArticle('m1', 'yt-m', 'vidMu00001', '2024-05-01T00:00:00.000Z'),
+    starArticle('v1', 'yt-n', 'vidNv00001', '2026-11-14T00:00:00.000Z', 'off'),
+    starArticle('v2', 'yt-n', 'vidNv00002', '2026-11-13T00:00:00.000Z'),
+    starArticle('v3', 'yt-n', 'vidNv00003', '2026-11-12T00:00:00.000Z'),
+    starArticle('v4', 'yt-n', 'vidNv00004', '2026-11-11T00:00:00.000Z'),
+    starArticle('v5', 'yt-n', 'vidNv00005', '2026-11-10T00:00:00.000Z', 'on'),
+    starArticle('vOld', 'yt-n', 'vidNv00006', '2026-08-01T00:00:00.000Z', 'on'),
+  ];
+  const planned = planStarredAudioTriggers([STAR_FEED_MUSIC, STAR_FEED_NORMAL], articles, STAR_NOW);
+  // 音楽 (先のフィード) のデフォルト → 通常のデフォルト (v1 は off で除く)
+  // → 手動 on の追加分 (新しい順: v5 → vOld)。v4 はどちらにも入らない。
+  assert.deepEqual(planned, ['vidMu00001', 'vidNv00002', 'vidNv00003', 'vidNv00005', 'vidNv00006']);
+});
+
+test('handleSetStar: on で star_override 列を遅延追加して保存し、その場で抽出を依頼する', () => {
+  const ss = new FakeSpreadsheet({
+    articles: [ARTICLE_HEADERS_ROW,
+      ['art-1', 'yt-x', '動画1', 'https://www.youtube.com/watch?v=vidStar0001', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '', ''],
+    ],
+  });
+  const restore = installSpreadsheet(ss, { A_ZE_GS_TOKEN: 'fake-ze-token' });
+  const calls = [];
+  try {
+    const result = handleSetStar({ id: 'art-1', on: true }, (videoId, token) => { calls.push([videoId, token]); });
+    assert.deepEqual(result, { ok: true, id: 'art-1', star_state: 'on', starred: true });
+    // 列が無かったのでヘッダーへ追加され、その行のセルに on が入る
+    assert.equal(ss.sheets['articles'].rows[0][8], 'star_override');
+    assert.equal(ss.sheets['articles'].rows[1][8], 'on');
+    // 既存の列は壊れていない
+    assert.equal(ss.sheets['articles'].rows[1][2], '動画1');
+    // 即時投入は1回だけ、動画IDとトークンが渡る
+    assert.deepEqual(calls, [['vidStar0001', 'fake-ze-token']]);
+  } finally { restore(); }
+});
+
+test('handleSetStar: off は依頼せず、既存の列は再利用し、未知IDは not_found で無変更', () => {
+  const ss = new FakeSpreadsheet({
+    articles: [ARTICLE_HEADERS_ROW_STAR,
+      ['art-1', 'yt-x', '動画1', 'https://www.youtube.com/watch?v=vidStar0001', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '', '', 'on'],
+    ],
+  });
+  const restore = installSpreadsheet(ss, { A_ZE_GS_TOKEN: 'fake-ze-token' });
+  const calls = [];
+  try {
+    const result = handleSetStar({ id: 'art-1', on: false }, (videoId) => { calls.push(videoId); });
+    assert.deepEqual(result, { ok: true, id: 'art-1', star_state: 'off', starred: false });
+    assert.equal(ss.sheets['articles'].rows[1][8], 'off');
+    // ヘッダーは増えない (既存列の再利用)
+    assert.equal(ss.sheets['articles'].rows[0].length, 9);
+    assert.deepEqual(calls, []);
+    // 未知の ID は not_found で、シートは変わらない
+    const before = JSON.stringify(ss.sheets['articles'].rows);
+    assert.deepEqual(handleSetStar({ id: 'nope', on: true }), { ok: false, error: 'not_found' });
+    assert.equal(JSON.stringify(ss.sheets['articles'].rows), before);
+    // ID が無ければ invalid
+    assert.equal(handleSetStar({ on: true }).error, 'invalid');
+  } finally { restore(); }
+});
+
+test('handleSetStar: A_ZE_GS_TOKEN 未設定でも保存は成功し、依頼だけ省く', () => {
+  const ss = new FakeSpreadsheet({
+    articles: [ARTICLE_HEADERS_ROW_STAR,
+      ['art-1', 'yt-x', '動画1', 'https://www.youtube.com/watch?v=vidStar0001', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '', '', ''],
+    ],
+  });
+  const restore = installSpreadsheet(ss);
+  const calls = [];
+  try {
+    const result = handleSetStar({ id: 'art-1', on: true }, (videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.equal(ss.sheets['articles'].rows[1][8], 'on');
+    assert.deepEqual(calls, []);
+  } finally { restore(); }
+});
+
+test('doPost set_star: オーナーは実行でき、readonly は forbidden、無セッションは unauthorized', () => {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW],
+    articles: [ARTICLE_HEADERS_ROW,
+      ['art-1', 'yt-x', '動画1', 'https://www.youtube.com/watch?v=vidStar0001', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '', ''],
+    ],
+  });
+  const restore = installSpreadsheet(ss);
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    assert.deepEqual(post({ action: 'set_star', id: 'art-1', on: true }), { ok: false, error: 'unauthorized' });
+    const readonly = issueSession('readonly');
+    assert.deepEqual(post({ action: 'set_star', sessionToken: readonly.sessionToken, id: 'art-1', on: true }), { ok: false, error: 'forbidden' });
+    // 拒否された書き込みは反映されない (列も作られない)
+    assert.equal(ss.sheets['articles'].rows[0].length, 8);
+    const owner = issueSession('owner');
+    assert.deepEqual(
+      post({ action: 'set_star', sessionToken: owner.sessionToken, id: 'art-1', on: true }),
+      { ok: true, id: 'art-1', star_state: 'on', starred: true }
+    );
+    assert.equal(ss.sheets['articles'].rows[1][8], 'on');
+  } finally { restore(); }
+});
+
+test('buildRssXml: スター制マップを渡すと、スターの付いたアイテムにだけ enclosure が付く', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const feed = { title: 'ch', url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A' };
+  const rows = [
+    { id: 'r1', feed_id: 'f', title: 'スター付き', link: 'https://www.youtube.com/watch?v=vidStar0001', published_at: '2026-11-14T00:00:00.000Z', fetched_at: '', summary: '', author: '' },
+    { id: 'r2', feed_id: 'f', title: 'スター無し', link: 'https://www.youtube.com/watch?v=vidPlain001', published_at: '2026-11-13T00:00:00.000Z', fetched_at: '', summary: '', author: '' },
+  ];
+  const audioUrls = {
+    vidStar0001: { url: 'https://stream.example.com/star', ts: nowSec - 60 },
+    vidPlain001: { url: 'https://stream.example.com/plain', ts: nowSec - 60 },
+  };
+  const gated = buildRssXml(feed, rows, audioUrls, '', { vidStar0001: true });
+  assert.ok(gated.includes('<enclosure url="https://stream.example.com/star"'));
+  assert.ok(!gated.includes('stream.example.com/plain'));
+  // アイテム自体は両方とも出る (絞るのは enclosure だけ)
+  assert.equal((gated.match(/<item>/g) || []).length, 2);
+  // 空マップでは全アイテム enclosure 無し
+  const none = buildRssXml(feed, rows, audioUrls, '', {});
+  assert.ok(!none.includes('<enclosure'));
+  // 省略時は従来どおり両方に付く
+  const legacy = buildRssXml(feed, rows, audioUrls, '');
+  assert.ok(legacy.includes('stream.example.com/plain'));
+});
+
+test('doGet: ?rss= は override off の動画に enclosure を付けず、on の古い動画には付ける', () => {
+  // audio-urls.json のキャッシュ (モジュール内) が先行テストで温まって
+  // いる場合はそちらが使われるため、マップは既存フィクスチャと同じ
+  // vidAudio111 のエントリで組み立て、どちらの経路でも成り立つ形にする。
+  const nowSec = Math.floor(Date.now() / 1000);
+  const mapJson = JSON.stringify({ vidAudio111: { url: 'https://stream.example.com/vidAudio111', ts: nowSec - 60, dur: 2297.4 } });
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['yt-off-feed', 'OFFフィード', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', '', '', '', '', ''],
+      ['yt-on-feed', 'ONフィード', 'https://www.youtube.com/channel/UCmusicchanneL1', '', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW_STAR,
+      ['rowOff', 'yt-off-feed', '外した動画', 'https://www.youtube.com/watch?v=vidAudio111', '2026-11-14T01:00:00.000Z', '2026-11-14T02:00:00.000Z', '', '', 'off'],
+      ['rowOn', 'yt-on-feed', '付けた動画', 'https://www.youtube.com/watch?v=vidAudio111', '2025-01-01T00:00:00.000Z', '2026-11-14T02:00:00.000Z', '', '', 'on'],
+    ],
+  });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
+    ContentService: fakeContentService(),
+    UrlFetchApp: { fetch: () => ({ getResponseCode: () => 200, getContentText: () => mapJson }) },
+    Utilities: fakeUtilities,
+  });
+  try {
+    // 新しい動画でも、手動で外していれば enclosure は付かない
+    const xmlOff = doGet({ parameter: { rss: 'yt-off-feed' } }).getContent();
+    assert.ok(xmlOff.includes('外した動画'));
+    assert.ok(!xmlOff.includes('<enclosure'));
+    // 古い動画でも、手動で付けていれば enclosure が付く
+    const xmlOn = doGet({ parameter: { rss: 'yt-on-feed' } }).getContent();
+    assert.ok(xmlOn.includes('<enclosure url="https://stream.example.com/vidAudio111"'));
+  } finally { restore(); }
+});
+
+test('buildListPayload: 記事に star_state (オーバーライド) と starred (実効スター) が付く', () => {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const iso = (t) => new Date(t).toISOString();
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['yt-x', 'YT', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', '', '', '', '', ''],
+      ['web', 'Web', 'https://example.com/feed', 'tech', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW_STAR,
+      ['a1', 'yt-x', '最新', 'https://www.youtube.com/watch?v=vidL00001', iso(now - dayMs), iso(now - dayMs), '', '', ''],
+      ['a2', 'yt-x', '外した', 'https://www.youtube.com/watch?v=vidL00002', iso(now - 2 * dayMs), iso(now - 2 * dayMs), '', '', 'off'],
+      ['a3', 'yt-x', '付けた古い動画', 'https://www.youtube.com/watch?v=vidL00003', iso(now - 400 * dayMs), iso(now - dayMs), '', '', 'on'],
+      ['a4', 'web', '通常記事', 'https://example.com/1', iso(now - dayMs), iso(now - dayMs), '', '', ''],
+    ],
+  });
+  const restore = installSpreadsheet(ss);
+  try {
+    const payload = buildListPayload({});
+    const byId = {};
+    payload.articles.forEach((a) => { byId[a.id] = a; });
+    assert.deepEqual([byId['a1'].star_state, byId['a1'].starred], ['', true]);
+    assert.deepEqual([byId['a2'].star_state, byId['a2'].starred], ['off', false]);
+    assert.deepEqual([byId['a3'].star_state, byId['a3'].starred], ['on', true]);
+    // 非 YouTube の記事はスター対象外
+    assert.deepEqual([byId['a4'].star_state, byId['a4'].starred], ['', false]);
+  } finally { restore(); }
+});
+
+test('fetchFeeds: スター制で、off の最新動画は発火せず、on の古い動画は発火する', () => {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const iso = (t) => new Date(t).toISOString();
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW, YT_FEED_ROW_X],
+    articles: [ARTICLE_HEADERS_ROW_STAR,
+      [articleId('yt-x', 'vidOff00001'), 'yt-x', '外した動画', 'https://www.youtube.com/watch?v=vidOff00001', iso(now - dayMs), iso(now - dayMs), '', '', 'off'],
+      [articleId('yt-x', 'vidOn000001'), 'yt-x', '付けた古い動画', 'https://www.youtube.com/watch?v=vidOn000001', '2025-06-01T00:00:00.000Z', iso(now - dayMs), '', '', 'on'],
+    ],
+  });
+  const body = playlistBodyWith([
+    ['vidOff00001', iso(now - dayMs)],
+    ['vidOn000001', '2025-06-01T00:00:00Z'],
+  ]);
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({
+      SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key', A_ZE_GS_TOKEN: 'fake-ze-token',
+    }).service,
+    UrlFetchApp: { fetch: () => ({ getResponseCode: () => 200, getContentText: () => body }) },
+    Utilities: fakeUtilities,
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 0); // どちらも既存記事
+    // 最新でも off なら発火しない。30日超でも on なら発火する
+    assert.deepEqual(calls, ['vidOn000001']);
   } finally { restore(); }
 });

@@ -30,6 +30,14 @@
 // /@handle 形で登録されても保存時に正規形へ寄せる
 // (handleSaveFeed)。ハンドルは channels.list の forHandle で解決し、
 // タイトルも補完する。既存行の videos.xml 形は移行済みで、互換は持たない。
+// 再生対象 (音声抽出トリガーと RSS の enclosure) はスター制:
+// 実効スターが付いた YouTube 動画だけを対象にする。シートに保存
+// するのは articles タブの star_override 列 (手動オーバーライド:
+// '' = 自動判定に任せる、'on' = 手動で付けた、'off' = 手動で外した)
+// だけで、実効スターはオーバーライドがあればそれを優先し、無ければ
+// デフォルトルール (従来の planYouTubeAudioTriggers の選定規則) を
+// 現在の記事集合に対して評価した結果で決める。列が無いシートでは
+// 全行が '' 扱いになるため、移行なしで従来の挙動と一致する。
 
 const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
@@ -40,7 +48,7 @@ const SHARE_EXPIRES_AT_PROP = 'SHARE_EXPIRES_AT';
 const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SESSION_HEADERS = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
 const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
-const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'];
+const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author', 'star_override'];
 const RETENTION_DAYS = 60;
 const MAX_ARTICLES = 5000;
 const SUMMARY_MAX_CHARS = 500;
@@ -501,7 +509,10 @@ const RSS_MAX_ITEMS = 50;
 // 省略時・該当エントリが古い/無いアイテムには enclosure を付けない。
 // ytPlayToken (中継の合言葉) があれば、enclosure の URL は直接の
 // ストリーム URL ではなく中継 URL になる (ytPlayUrl 参照)。
-function buildRssXml(feed, articleRows, audioUrls, ytPlayToken) {
+// starredVideoIds (動画ID -> 真値のマップ) を渡した場合は、実効スター
+// の付いたアイテムにだけ enclosure を付ける (スター制)。省略時は
+// 従来どおり、スターに関係なく新鮮なエントリがあれば付ける。
+function buildRssXml(feed, articleRows, audioUrls, ytPlayToken, starredVideoIds) {
   const f = feed || {};
   const title = String(f.title || '');
   const channelId = youtubeChannelIdFromUrl(f.url);
@@ -525,8 +536,11 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken) {
     lines.push('      <link>' + escapeXml(link) + '</link>');
     lines.push('      <guid isPermaLink="false">' + escapeXml(videoId) + '</guid>');
     // 音声ストリーム URL の enclosure。新鮮なエントリがあるときだけ付ける。
+    // スター制のマップが渡されていれば、実効スターの付いたアイテムだけ。
     // 中継の合言葉があれば、直接 URL ではなく中継 URL を出す。
-    const audioEntry = freshAudioEntry(audioUrls, videoId);
+    const audioEntry = starredVideoIds && !starredVideoIds[videoId]
+      ? null
+      : freshAudioEntry(audioUrls, videoId);
     const directUrl = audioEntry ? String(audioEntry.url || '') : '';
     const audioUrl = (directUrl && ytPlayUrl(ytPlayToken, videoId)) || directUrl;
     if (audioUrl) {
@@ -827,6 +841,9 @@ function selectFetchTargets(feeds) {
 //   更新頻度が低くても過去分を再生したいため (本人の決定)。
 //   20本は YouTube の1回の取得上限 (最新20本) と揃えた値。
 // 失敗しても巡回自体は失敗にしない (fire-and-forget)。
+// スター制の導入後は、この選定規則は「デフォルトのスター判定」と
+// して computeStarredArticleIds / planStarredAudioTriggers から
+// 使われ、実際の発火対象は実効スターの付いた動画だけになる。
 
 const YT_AUDIO_TRIGGER_BASE_URL = 'https://a.ze.gs/yt-audio/';
 const YT_AUDIO_TRIGGER_PER_FEED = 3;
@@ -900,6 +917,112 @@ function planYouTubeAudioTriggers(feedVideos, nowMs) {
   return ids;
 }
 
+// --- YouTube 再生対象のスター制 ---
+// 実効スターの計算 (純関数)。デフォルトルールの評価は
+// planYouTubeAudioTriggers をフィード単位でそのまま使う。
+// ランキングはオーバーライドの有無に関係なくフィードの記事集合
+// 全体で評価するため、手動で外した動画の枠に次の動画が繰り上がる
+// ことはない (繰り上げたい場合は次の動画にも手動で付ける)。
+
+// 記事行の手動オーバーライドを取り出す (純関数)。'on' / 'off'
+// 以外 (空・欠落・想定外の値) はすべて '' (= 自動判定) として扱う。
+function starOverrideOf(article) {
+  const v = String((article && article.star_override) || '').trim().toLowerCase();
+  return v === 'on' || v === 'off' ? v : '';
+}
+
+// デフォルト評価の材料をフィード単位にまとめる (内部ヘルパー)。
+// 対象は YouTube フィードの記事だけで、フィードの並び (シートの
+// 行順) と記事の並び (シートの行順) を保つ。
+function groupStarCandidates(feeds, articles) {
+  const order = [];
+  const byFeedId = {};
+  (feeds || []).forEach((f) => {
+    if (!f || !f.id) return;
+    const channelId = youtubeChannelIdFromUrl(f.url);
+    if (!channelId) return;
+    const key = String(f.id);
+    if (byFeedId[key]) return;
+    byFeedId[key] = { feed: f, channelId, videos: [], infos: [] };
+    order.push(key);
+  });
+  (articles || []).forEach((a) => {
+    if (!a) return;
+    const group = byFeedId[String(a.feed_id)];
+    if (!group) return;
+    const videoId = videoIdFromLink(a.link);
+    const publishedAt = cellIso(a.published_at);
+    group.videos.push({
+      videoId,
+      publishedAt,
+      channelId: group.channelId,
+      category: String(group.feed.category || ''),
+    });
+    group.infos.push({
+      articleId: String(a.id || ''),
+      videoId,
+      publishedAt,
+      override: starOverrideOf(a),
+    });
+  });
+  return { order, byFeedId };
+}
+
+// 実効スターが付いた記事IDを { articleId: true } で返す (純関数)。
+// feeds / articles はシート行オブジェクト (snake_case キー)。
+// nowMs はテスト用の差し込み口 (省略時は現在時刻)。
+function computeStarredArticleIds(feeds, articles, nowMs) {
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  const { order, byFeedId } = groupStarCandidates(feeds, articles);
+  const starred = {};
+  order.forEach((feedId) => {
+    const group = byFeedId[feedId];
+    const defaultIds = {};
+    planYouTubeAudioTriggers([group.videos], now).forEach((videoId) => { defaultIds[videoId] = true; });
+    group.infos.forEach((info) => {
+      if (!info.articleId) return;
+      if (info.override === 'on') starred[info.articleId] = true;
+      else if (info.override === 'off') return;
+      else if (info.videoId && defaultIds[info.videoId]) starred[info.articleId] = true;
+    });
+  });
+  return starred;
+}
+
+// 抽出トリガーの発火計画 (純関数): 実効スターが付いた動画IDを
+// フィード順に並べて返す。デフォルト分は planYouTubeAudioTriggers
+// の並びを保ち (手動で外した分は除く)、手動で付けた分 (デフォルト
+// に含まれないもの) はフィードごとに新しい順で後ろへ足す。
+// 全体キャップ (100件) は発火側 (fireYouTubeAudioTriggers) で付ける。
+function planStarredAudioTriggers(feeds, articles, nowMs) {
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  const { order, byFeedId } = groupStarCandidates(feeds, articles);
+  const seen = {};
+  const ids = [];
+  const push = (videoId) => {
+    if (!videoId || seen[videoId]) return;
+    seen[videoId] = true;
+    ids.push(videoId);
+  };
+  order.forEach((feedId) => {
+    const group = byFeedId[feedId];
+    const infoByVideoId = {};
+    group.infos.forEach((info) => {
+      if (info.videoId && !infoByVideoId[info.videoId]) infoByVideoId[info.videoId] = info;
+    });
+    planYouTubeAudioTriggers([group.videos], now).forEach((videoId) => {
+      const info = infoByVideoId[videoId];
+      if (info && info.override === 'off') return;
+      push(videoId);
+    });
+    group.infos
+      .filter((info) => info.override === 'on' && info.videoId)
+      .sort((a, b) => (Date.parse(b.publishedAt) || 0) - (Date.parse(a.publishedAt) || 0))
+      .forEach((info) => { push(info.videoId); });
+  });
+  return ids;
+}
+
 // 実際のトリガー発火 (1件分)。応答は待たない (muteHttpExceptions)。
 function fireYouTubeAudioTrigger(videoId, token) {
   UrlFetchApp.fetch(YT_AUDIO_TRIGGER_BASE_URL + encodeURIComponent(String(videoId || '')), {
@@ -916,11 +1039,13 @@ function fireYouTubeAudioTrigger(videoId, token) {
 // (省略時は fireYouTubeAudioTrigger)。時間ベーストリガーから呼ばれる
 // fetchFeeds 経由ではイベントオブジェクトが渡ってくるため、関数で
 // なければ既定実装に落とす。nowMs は30日判定用のテスト差し込み口。
-function fireYouTubeAudioTriggers(feedVideos, fireTrigger, nowMs) {
+// plannedIds (動画IDの配列) を渡した場合は feedVideos からの計画を
+// 省いてそれを発火対象にする (スター制の計画はこちらで渡す)。
+function fireYouTubeAudioTriggers(feedVideos, fireTrigger, nowMs, plannedIds) {
   const token = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
   if (!token) return 0;
   const fire = typeof fireTrigger === 'function' ? fireTrigger : fireYouTubeAudioTrigger;
-  const planned = planYouTubeAudioTriggers(feedVideos, nowMs);
+  const planned = Array.isArray(plannedIds) ? plannedIds : planYouTubeAudioTriggers(feedVideos, nowMs);
   const targets = planned.slice(0, YT_AUDIO_TRIGGER_MAX_PER_RUN);
   if (planned.length > targets.length) {
     console.log('yt-audio: triggers capped at ' + targets.length + ' of ' + planned.length + ' videos');
@@ -1172,8 +1297,6 @@ function fetchFeeds(fireTrigger) {
   readSheetAsObjects(ss, 'articles').forEach((a) => { existingIds[a.id] = true; });
   const fetchedAt = new Date().toISOString();
   let addedTotal = 0;
-  // フィードごとの動画一覧 (音声抽出トリガーの発火対象の選定用)。
-  const feedVideos = [];
   // YouTube フィードは公式APIから取り込む (RSS は 404 のため)。
   const youtubeApiKey = PropertiesService.getScriptProperties().getProperty('YOUTUBE_API_KEY');
   youtubeFeeds.forEach((feed) => {
@@ -1199,13 +1322,6 @@ function fetchFeeds(fireTrigger) {
       if (code !== 200) throw new Error('YouTube API HTTP ' + code + youtubeApiErrorDetail(res.getContentText()));
       const entries = parseYouTubePlaylistItems(res.getContentText(), feed);
       addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt);
-      feedVideos.push(entries.map((entry) => ({
-        videoId: String(entry.guid || '') || videoIdFromLink(entry.link),
-        publishedAt: entry.publishedAt || '',
-        channelId: youtubeChannelIdFromUrl(feed.url),
-        // 音楽ジャンルの特別扱いの判定用にフィードのジャンルも渡す。
-        category: String(feed.category || ''),
-      })).filter((v) => v.videoId));
       updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '200', last_error: '' });
     } catch (err) {
       updateFeedRow(feedsSheet, headers, rowNum, {
@@ -1215,12 +1331,14 @@ function fetchFeeds(fireTrigger) {
       });
     }
   });
-  // 各フィードの公開30日以内の最新3本 (音楽ジャンルは期間なしの
-  // 最新20本、常時対応チャンネルは全件) の音声抽出を ze へ依頼する
-  // (記事の保存が済んでから発火する)。
+  // 音声抽出は、実効スターの付いた動画だけを ze へ依頼する
+  // (スター制)。実効スターはシートの現在状態 (手動オーバーライド＋
+  // デフォルトルール) から計算するため、記事の保存が済んでから
+  // シートを読み直して計画する。
   // トリガーの成否は巡回結果に影響させない。
   try {
-    fireYouTubeAudioTriggers(feedVideos, fireTrigger);
+    const planned = planStarredAudioTriggers(feeds, readSheetAsObjects(ss, 'articles'));
+    fireYouTubeAudioTriggers(null, fireTrigger, undefined, planned);
   } catch (e) {
     // 依頼できなくても記事の取り込みは成功として扱う。
   }
@@ -1250,7 +1368,11 @@ function buildListPayload(body) {
   const feeds = readSheetAsObjects(ss, 'feeds');
   const feedById = {};
   feeds.forEach((f) => { feedById[f.id] = f; });
-  const merged = readSheetAsObjects(ss, 'articles').map((a) => {
+  const articleRows = readSheetAsObjects(ss, 'articles');
+  // スター制: 手動オーバーライド (star_state) と実効スター (starred)
+  // を記事ごとに付ける。実効スターは feeds と記事集合から計算する。
+  const starredIds = computeStarredArticleIds(feeds, articleRows);
+  const merged = articleRows.map((a) => {
     const feed = feedById[a.feed_id];
     return {
       id: a.id,
@@ -1264,6 +1386,8 @@ function buildListPayload(body) {
       // 既読は端末ローカル管理のため、サーバーは常に未読として返す
       // (フロントの既読の初回取り込みは「何も取り込まない」形で完了する)。
       isRead: false,
+      star_state: starOverrideOf(a),
+      starred: !!starredIds[String(a.id)],
     };
   });
   // isRead は常に false (既読は端末ローカル管理) のため、未読数は
@@ -1578,6 +1702,52 @@ function handleReorderFeeds(body) {
   return { ok: true };
 }
 
+// スターの手動オーバーライドを保存する (オーナー専用アクション
+// set_star の本体)。保存先は articles タブの star_override 列だけで、
+// 列が無いシート (移行前) ではヘッダーへ遅延追加する (既存行のセルは
+// 空のまま = '' 扱い)。on=true では保存に加えて、その動画の音声抽出
+// をその場で ze へ依頼する (毎時巡回を待たない)。依頼は
+// fire-and-forget で、失敗しても保存は成功として返す。
+// fireTrigger はテスト用の差し込み口 (省略時は fireYouTubeAudioTrigger)。
+function handleSetStar(body, fireTrigger) {
+  const id = String((body && body.id) || '');
+  if (!id) return { ok: false, error: 'invalid', message: 'id is required' };
+  const on = isTruthy(body && body.on);
+  const ss = openDataSpreadsheet();
+  const sheet = ss.getSheetByName('articles');
+  if (!sheet) return { ok: false, error: 'not_found' };
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { ok: false, error: 'not_found' };
+  const headers = values[0];
+  const idIdx = headers.indexOf('id');
+  if (idIdx < 0) return { ok: false, error: 'not_found' };
+  let rowNum = -1;
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][idIdx]) === id) { rowNum = i + 1; break; }
+  }
+  if (rowNum < 0) return { ok: false, error: 'not_found' };
+  let starIdx = headers.indexOf('star_override');
+  if (starIdx < 0) {
+    starIdx = headers.length;
+    sheet.getRange(1, starIdx + 1).setValue('star_override');
+  }
+  sheet.getRange(rowNum, starIdx + 1).setValue(on ? 'on' : 'off');
+  if (on) {
+    const linkIdx = headers.indexOf('link');
+    const videoId = linkIdx >= 0 ? videoIdFromLink(values[rowNum - 1][linkIdx]) : '';
+    const token = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
+    if (videoId && token) {
+      const fire = typeof fireTrigger === 'function' ? fireTrigger : fireYouTubeAudioTrigger;
+      try {
+        fire(videoId, token);
+      } catch (e) {
+        // 依頼できなくてもオーバーライドの保存は成功として扱う。
+      }
+    }
+  }
+  return { ok: true, id, star_state: on ? 'on' : 'off', starred: on };
+}
+
 // --- Web App entry points ---
 
 function jsonOutput(obj) {
@@ -1588,15 +1758,25 @@ function doGet(e) {
   const rssFeedId = e && e.parameter ? String(e.parameter.rss || '') : '';
   if (rssFeedId) {
     const ss = openDataSpreadsheet();
-    const feed = readSheetAsObjects(ss, 'feeds').filter((f) => String(f.id) === rssFeedId)[0] || null;
+    const feeds = readSheetAsObjects(ss, 'feeds');
+    const feed = feeds.filter((f) => String(f.id) === rssFeedId)[0] || null;
     if (!feed || !youtubeChannelIdFromUrl(feed.url)) {
       return jsonOutput({ ok: false, error: 'feed_not_found' });
     }
-    const rows = readSheetAsObjects(ss, 'articles').filter((a) => String(a.feed_id) === rssFeedId);
+    const allArticles = readSheetAsObjects(ss, 'articles');
+    const rows = allArticles.filter((a) => String(a.feed_id) === rssFeedId);
+    // enclosure は実効スターの付いた動画にだけ付ける (スター制)。
+    const starredIds = computeStarredArticleIds(feeds, allArticles);
+    const starredVideoIds = {};
+    rows.forEach((a) => {
+      if (!starredIds[String(a.id)]) return;
+      const videoId = videoIdFromLink(a.link);
+      if (videoId) starredVideoIds[videoId] = true;
+    });
     // MIME は付けない (取得側はプロキシ経由で本文だけを読むため)。
     // YT_PLAY_TOKEN が設定されていれば enclosure は中継 URL になる。
     const ytPlayToken = PropertiesService.getScriptProperties().getProperty('YT_PLAY_TOKEN');
-    return ContentService.createTextOutput(buildRssXml(feed, rows, fetchAudioUrlsMap(), ytPlayToken));
+    return ContentService.createTextOutput(buildRssXml(feed, rows, fetchAudioUrlsMap(), ytPlayToken, starredVideoIds));
   }
   return jsonOutput({ ok: true, service: 'reader-gas' });
 }
@@ -1633,6 +1813,7 @@ function doPost(e) {
       issueShareLink: () => issueShareLink(),
       getShareLinkStatus: () => getShareLinkStatus(),
       revokeShareLink: () => revokeShareLink(),
+      set_star: () => handleSetStar(body),
     };
     if (Object.prototype.hasOwnProperty.call(ownerActions, action)) {
       if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
@@ -1646,4 +1827,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, doGet, doPost };
