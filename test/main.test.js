@@ -2566,12 +2566,12 @@ test('fetchFeeds: 既定の抽出トリガーは a.ze.gs/yt-audio/<videoId> を�
   } finally { restore(); }
 });
 
-test('fireYouTubeAudioTriggers: 1回の巡回で最大100件まで (全体キャップ)', () => {
+test('fireYouTubeAudioTriggers: 1回の巡回で最大200件まで (全体キャップ)', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
   });
   const feedVideos = [];
-  for (let f = 0; f < 40; f++) {
+  for (let f = 0; f < 80; f++) {
     const videos = [];
     for (let i = 0; i < 10; i++) {
       videos.push({ videoId: 'vid' + f + '_' + i, publishedAt: '2026-11-14T00:00:00.000Z' });
@@ -2580,14 +2580,14 @@ test('fireYouTubeAudioTriggers: 1回の巡回で最大100件まで (全体キャ
   }
   let count = 0;
   try {
-    // 計画は 40フィード×3本 = 120件 → キャップで100件に絞られる
+    // 計画は 80フィード×3本 = 240件 → キャップで200件に絞られる
     const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, Date.parse('2026-11-15T00:00:00.000Z'));
-    assert.equal(fired, 100);
-    assert.equal(count, 100);
+    assert.equal(fired, 200);
+    assert.equal(count, 200);
   } finally { restore(); }
 });
 
-test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全体キャップ100件で収まる', () => {
+test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全体キャップ200件で収まる', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
   });
@@ -2598,7 +2598,7 @@ test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全
     special.push({ videoId: 'vidSp' + i, publishedAt: '2020-01-01T00:00:00.000Z', channelId: 'UCbiDZXbr391oT_vsRiqwPFg' });
   }
   const feedVideos = [special];
-  for (let f = 0; f < 27; f++) {
+  for (let f = 0; f < 61; f++) {
     const videos = [];
     for (let i = 0; i < 10; i++) {
       videos.push({ videoId: 'vidN' + f + '_' + i, publishedAt: '2026-11-14T00:00:00.000Z' });
@@ -2607,22 +2607,22 @@ test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全
   }
   let count = 0;
   try {
-    // 計画は 20 + 27フィード×3本 = 101件 → キャップで100件に絞られる
+    // 計画は 20 + 61フィード×3本 = 203件 → キャップで200件に絞られる
     const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, now);
-    assert.equal(fired, 100);
-    assert.equal(count, 100);
+    assert.equal(fired, 200);
+    assert.equal(count, 200);
   } finally { restore(); }
 });
 
-test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キャップ100件でフィード順に打ち切る', () => {
+test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キャップ200件でフィード順に打ち切る', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
   });
   const feedVideos = [];
-  for (let f = 0; f < 12; f++) {
+  for (let f = 0; f < 14; f++) {
     const videos = [];
     for (let i = 0; i < 15; i++) {
-      // 音楽は30日超でも計画に入るため、12フィード×15本 = 180件の計画になる
+      // 音楽は30日超でも計画に入るため、14フィード×15本 = 210件の計画になる
       videos.push({ videoId: 'vidMu' + f + '_' + i, publishedAt: '2025-06-01T00:00:00.000Z', category: '音楽' });
     }
     feedVideos.push(videos);
@@ -2630,8 +2630,8 @@ test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キ
   let count = 0;
   try {
     const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, Date.parse('2026-11-15T00:00:00.000Z'));
-    assert.equal(fired, 100);
-    assert.equal(count, 100);
+    assert.equal(fired, 200);
+    assert.equal(count, 200);
   } finally { restore(); }
 });
 
@@ -3309,7 +3309,7 @@ test('computeStarredArticleIds: 非YouTubeの記事は対象外、未知のオ�
   assert.deepEqual(Object.keys(starred), ['y1']);
 });
 
-test('planStarredAudioTriggers: フィード順に、デフォルト (off除く)＋手動 on を新しい順で足す', () => {
+test('planStarredAudioTriggers: 手動 on を先頭に寄せ、続いてデフォルト (off除く) をフィード順に並べる', () => {
   const articles = [
     starArticle('m1', 'yt-m', 'vidMu00001', '2024-05-01T00:00:00.000Z'),
     starArticle('v1', 'yt-n', 'vidNv00001', '2026-11-14T00:00:00.000Z', 'off'),
@@ -3320,9 +3320,79 @@ test('planStarredAudioTriggers: フィード順に、デフォルト (off除く)
     starArticle('vOld', 'yt-n', 'vidNv00006', '2026-08-01T00:00:00.000Z', 'on'),
   ];
   const planned = planStarredAudioTriggers([STAR_FEED_MUSIC, STAR_FEED_NORMAL], articles, STAR_NOW);
-  // 音楽 (先のフィード) のデフォルト → 通常のデフォルト (v1 は off で除く)
-  // → 手動 on の追加分 (新しい順: v5 → vOld)。v4 はどちらにも入らない。
-  assert.deepEqual(planned, ['vidMu00001', 'vidNv00002', 'vidNv00003', 'vidNv00005', 'vidNv00006']);
+  // 手動 on (新しい順: v5 → vOld) が全体の先頭。その後にデフォルト分を
+  // フィード順に並べる (音楽のデフォルト → 通常のデフォルト。v1 は
+  // off で除く)。v4 はどちらにも入らない。
+  assert.deepEqual(planned, ['vidNv00005', 'vidNv00006', 'vidMu00001', 'vidNv00002', 'vidNv00003']);
+});
+
+test('planStarredAudioTriggers + fire: 143本規模の計画は上限200に収まり全件が発火対象になる', () => {
+  // 実測の内訳に寄せた構成: 音楽4フィード×20本 + 通常21フィード×3本 = 143本。
+  // 旧上限100では後順位フィードが締め出されていた。
+  const feeds = [];
+  const articles = [];
+  for (let f = 0; f < 4; f++) {
+    const feedId = 'yt-cap-m' + f;
+    feeds.push({ id: feedId, title: '音楽' + f, url: 'https://www.youtube.com/channel/UCcapmusic' + f + 'abcdefghij', category: '音楽' });
+    for (let i = 0; i < 20; i++) {
+      const d = new Date(Date.parse('2024-12-31T00:00:00.000Z') - i * 24 * 60 * 60 * 1000).toISOString();
+      articles.push(starArticle(feedId + '-a' + i, feedId, 'vidCM' + f + '_' + String(i).padStart(2, '0'), d));
+    }
+  }
+  for (let f = 0; f < 21; f++) {
+    const feedId = 'yt-cap-n' + f;
+    feeds.push({ id: feedId, title: '通常' + f, url: 'https://www.youtube.com/channel/UCcapnormal' + f + 'abcdefghij', category: '' });
+    for (let i = 0; i < 3; i++) {
+      const d = new Date(STAR_NOW - (i + 1) * 24 * 60 * 60 * 1000).toISOString();
+      articles.push(starArticle(feedId + '-a' + i, feedId, 'vidCN' + f + '_' + i, d));
+    }
+  }
+  const planned = planStarredAudioTriggers(feeds, articles, STAR_NOW);
+  assert.equal(planned.length, 143);
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+  });
+  let count = 0;
+  try {
+    const fired = fireYouTubeAudioTriggers(null, () => { count++; }, STAR_NOW, planned);
+    assert.equal(fired, 143);
+    assert.equal(count, 143);
+  } finally { restore(); }
+});
+
+test('planStarredAudioTriggers + fire: 上限超過時は手動スターが残り、デフォルト分が末尾から切れる', () => {
+  // 音楽11フィード×20本 = デフォルト220本に、最後尾フィードの
+  // 手動 on 1本を加えた221本の計画。上限200で切られても、手動分は
+  // 先頭に寄せてあるため必ず残る。
+  const feeds = [];
+  const articles = [];
+  for (let f = 0; f < 11; f++) {
+    const feedId = 'yt-pri-m' + f;
+    feeds.push({ id: feedId, title: '音楽' + f, url: 'https://www.youtube.com/channel/UCprimusic' + f + 'abcdefghij', category: '音楽' });
+    for (let i = 0; i < 20; i++) {
+      const d = new Date(Date.parse('2024-12-31T00:00:00.000Z') - i * 24 * 60 * 60 * 1000).toISOString();
+      articles.push(starArticle(feedId + '-a' + i, feedId, 'vidPM' + f + '_' + String(i).padStart(2, '0'), d));
+    }
+  }
+  const lastFeed = { id: 'yt-pri-last', title: '最後尾', url: 'https://www.youtube.com/channel/UCprilastchannel00', category: '' };
+  feeds.push(lastFeed);
+  articles.push(starArticle('last-manual', 'yt-pri-last', 'vidPriManual1', '2023-01-01T00:00:00.000Z', 'on'));
+  const planned = planStarredAudioTriggers(feeds, articles, STAR_NOW);
+  assert.equal(planned.length, 221);
+  assert.equal(planned[0], 'vidPriManual1');
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+  });
+  const firedIds = [];
+  try {
+    const fired = fireYouTubeAudioTriggers(null, (videoId) => { firedIds.push(videoId); }, STAR_NOW, planned);
+    assert.equal(fired, 200);
+    assert.equal(firedIds.length, 200);
+    // 手動スターは発火対象に残り、切れたのは末尾のデフォルト分だけ
+    assert.ok(firedIds.includes('vidPriManual1'));
+    assert.deepEqual(firedIds, planned.slice(0, 200));
+    assert.ok(!firedIds.includes(planned[220]));
+  } finally { restore(); }
 });
 
 test('handleSetStar: on で star_override 列を遅延追加して保存し、その場で抽出を依頼する', () => {
