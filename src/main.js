@@ -851,11 +851,13 @@ const YT_AUDIO_TRIGGER_PER_FEED = 3;
 // 外して新しい順に YT_AUDIO_TRIGGER_MUSIC_PER_FEED 本まで選ぶ。
 const YT_AUDIO_TRIGGER_MUSIC_CATEGORY = '音楽';
 const YT_AUDIO_TRIGGER_MUSIC_PER_FEED = 20;
-// 全体キャップ。通常分 (最大23フィード×3本=69) と常時対応分
-// (最大20本) の合計89本に余裕を持たせた値。音楽フィードの枠が
-// 増えた分だけ合計が100を超える場合は、従来どおりフィード順の
-// 先頭から100件で打ち切る (後ろのフィードから省かれる)。
-const YT_AUDIO_TRIGGER_MAX_PER_RUN = 100;
+// 全体キャップ。計画合計は実測で143本 (通常フィード分 + 音楽フィード
+// の20本枠×4フィード分 + 常時対応分) まで増えており、100では後順位の
+// フィード (しほ・けこり等) が毎回締め出されていたため、余裕を持たせて
+// 200とする。200を超える場合はフィード順の先頭から打ち切るが、手動
+// スターは計画側 (planStarredAudioTriggers) で先頭に寄せるため、
+// 上限では落ちない。
+const YT_AUDIO_TRIGGER_MAX_PER_RUN = 200;
 const YT_AUDIO_TRIGGER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // 常時対応チャンネル (本人のチャンネル「藤原史和 川口を歩くQAエンジニア」)。
 // reader-gas が毎時、このチャンネルの動画をすべて yt-audio のキューへ
@@ -989,14 +991,26 @@ function computeStarredArticleIds(feeds, articles, nowMs) {
   return starred;
 }
 
-// 抽出トリガーの発火計画 (純関数): 実効スターが付いた動画IDを
-// フィード順に並べて返す。デフォルト分は planYouTubeAudioTriggers
-// の並びを保ち (手動で外した分は除く)、手動で付けた分 (デフォルト
-// に含まれないもの) はフィードごとに新しい順で後ろへ足す。
-// 全体キャップ (100件) は発火側 (fireYouTubeAudioTriggers) で付ける。
+// 抽出トリガーの発火計画 (純関数): 実効スターが付いた動画IDを返す。
+// 並びは、手動で付けた分 (star_override='on') を全体の先頭に寄せ
+// (フィード順・フィード内は新しい順)、続いてデフォルト分を
+// フィード順に並べる (デフォルトの並びは planYouTubeAudioTriggers
+// のまま。手動で外した分は除く)。全体キャップ
+// (YT_AUDIO_TRIGGER_MAX_PER_RUN) は発火側
+// (fireYouTubeAudioTriggers) で付けるが、手動スターが先頭に
+// あるため上限で落ちることはない。
 function planStarredAudioTriggers(feeds, articles, nowMs) {
   const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const { order, byFeedId } = groupStarCandidates(feeds, articles);
+  // フィードごとの材料 (デフォルト計画と動画ID→記事情報) を先に揃える。
+  const perFeed = order.map((feedId) => {
+    const group = byFeedId[feedId];
+    const infoByVideoId = {};
+    group.infos.forEach((info) => {
+      if (info.videoId && !infoByVideoId[info.videoId]) infoByVideoId[info.videoId] = info;
+    });
+    return { group, infoByVideoId, defaultIds: planYouTubeAudioTriggers([group.videos], now) };
+  });
   const seen = {};
   const ids = [];
   const push = (videoId) => {
@@ -1004,21 +1018,21 @@ function planStarredAudioTriggers(feeds, articles, nowMs) {
     seen[videoId] = true;
     ids.push(videoId);
   };
-  order.forEach((feedId) => {
-    const group = byFeedId[feedId];
-    const infoByVideoId = {};
-    group.infos.forEach((info) => {
-      if (info.videoId && !infoByVideoId[info.videoId]) infoByVideoId[info.videoId] = info;
-    });
-    planYouTubeAudioTriggers([group.videos], now).forEach((videoId) => {
-      const info = infoByVideoId[videoId];
-      if (info && info.override === 'off') return;
-      push(videoId);
-    });
+  // 1パス目: 手動で付けた分を先頭へ (フィード順・新しい順)。
+  perFeed.forEach(({ group }) => {
     group.infos
       .filter((info) => info.override === 'on' && info.videoId)
       .sort((a, b) => (Date.parse(b.publishedAt) || 0) - (Date.parse(a.publishedAt) || 0))
       .forEach((info) => { push(info.videoId); });
+  });
+  // 2パス目: デフォルト分をフィード順に (手動で外した分は除く。
+  // 手動で付けた分は seen 済みのため重複しない)。
+  perFeed.forEach(({ infoByVideoId, defaultIds }) => {
+    defaultIds.forEach((videoId) => {
+      const info = infoByVideoId[videoId];
+      if (info && info.override === 'off') return;
+      push(videoId);
+    });
   });
   return ids;
 }
