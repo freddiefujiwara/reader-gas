@@ -30,6 +30,10 @@
 // /@handle 形で登録されても保存時に正規形へ寄せる
 // (handleSaveFeed)。ハンドルは channels.list の forHandle で解決し、
 // タイトルも補完する。既存行の videos.xml 形は移行済みで、互換は持たない。
+// 視聴ログは events / weekly_stats の2タブに貯める (どちらも遅延
+// 作成)。クライアントが log_events (オーナー専用) で送るイベントを
+// events に一括追記し、週次集計 (weekly_stats) と90日超の生ログの
+// 間引きを、毎時 fetchFeeds に相乗りして週1回だけ行う。
 // 再生対象 (音声抽出トリガーと RSS の enclosure) はスター制:
 // 実効スターが付いた YouTube 動画だけを対象にする。シートに保存
 // するのは articles タブの star_override 列 (手動オーバーライド:
@@ -52,6 +56,24 @@ const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fet
 const RETENTION_DAYS = 60;
 const MAX_ARTICLES = 5000;
 const SUMMARY_MAX_CHARS = 500;
+// 視聴ログ (log_events / stats): クライアントが送るイベントを events
+// タブへ貯め、週次集計を weekly_stats タブへ畳む (どちらも遅延作成)。
+// 生ログは90日保持し、集計は無期限に残す。集計と間引きは毎時
+// fetchFeeds に相乗りし、最終実行 (スクリプトプロパティ
+// WEEKLY_ROLLUP_LAST_RUN_AT) から7日以上空いたときだけ走る。
+// 新しいトリガーは作らない。
+const EVENTS_SHEET_NAME = 'events';
+const WEEKLY_STATS_SHEET_NAME = 'weekly_stats';
+const EVENTS_HEADERS = ['ts', 'type', 'feed_id', 'feed_title', 'article_id', 'article_title', 'seconds'];
+const WEEKLY_STATS_HEADERS = ['week', 'feed_id', 'feed_title', 'views', 'opens', 'plays', 'seconds'];
+const EVENT_TYPES = { feed_view: true, article_open: true, play: true };
+const EVENT_LOG_MAX_PER_REQUEST = 50;
+const EVENT_ID_MAX_CHARS = 128;
+const EVENT_TITLE_MAX_CHARS = 200;
+const EVENT_RETENTION_DAYS = 90;
+const WEEKLY_ROLLUP_PROP = 'WEEKLY_ROLLUP_LAST_RUN_AT';
+const WEEKLY_ROLLUP_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+const WEEKLY_STATS_MAX_WEEKS = 26;
 
 // --- Sheets helpers (xuexi-gas と同型) ---
 
@@ -1357,6 +1379,13 @@ function fetchFeeds(fireTrigger) {
     // 依頼できなくても記事の取り込みは成功として扱う。
   }
   pruneArticles();
+  // 視聴ログの週次集計と間引きは週1回だけ、この巡回に相乗りする
+  // (新しいトリガーは作らない)。失敗しても巡回結果に影響させない。
+  try {
+    maybeRollupWeeklyEvents();
+  } catch (e) {
+    // 集計できなくても記事の取り込みは成功として扱う。
+  }
   return { ok: true, fetched: youtubeFeeds.length, added: addedTotal };
 }
 
@@ -1762,6 +1791,218 @@ function handleSetStar(body, fireTrigger) {
   return { ok: true, id, star_state: on ? 'on' : 'off', starred: on };
 }
 
+// --- Usage events (視聴ログ) ---
+// クライアントが log_events で送るイベントを events タブへ貯める。
+// 種類は feed_view (フィードを開いた) / article_open (記事を開いた) /
+// play (再生。停止時点で聴いた秒数を伴う) の3つだけ。週次集計は
+// weekly_stats タブへ畳み、生ログは90日で間引く。
+
+// Asia/Tokyo (UTC+9、夏時間なし) で見た週の開始日 (月曜) を
+// 'YYYY-MM-DD' で返す。文字列の辞書順がそのまま日付順になる。
+function weekStartKey(timeMs) {
+  const jst = new Date(timeMs + 9 * 60 * 60 * 1000);
+  const dow = jst.getUTCDay();
+  const monday = new Date(Date.UTC(
+    jst.getUTCFullYear(),
+    jst.getUTCMonth(),
+    jst.getUTCDate() - ((dow + 6) % 7)
+  ));
+  return monday.toISOString().slice(0, 10);
+}
+
+// イベント1件を検証して events タブの行 (配列) にする。不正なら null。
+// ts はクライアント値が解釈できればそれを ISO に正規化し、無ければ
+// 受付時刻 (nowIso) を使う。文字列は上限で切り、play 以外の seconds
+// は保存しない (空)。play の seconds が0以上の数値でない行は捨てる。
+function sanitizeEvent(raw, nowIso) {
+  if (!raw || typeof raw !== 'object') return null;
+  const type = String(raw.type || '');
+  if (!EVENT_TYPES[type]) return null;
+  const feedId = String(raw.feed_id || raw.feedId || '').slice(0, EVENT_ID_MAX_CHARS);
+  if (!feedId) return null;
+  const feedTitle = String(raw.feed_title || raw.feedTitle || '').slice(0, EVENT_TITLE_MAX_CHARS);
+  const articleId = String(raw.article_id || raw.articleId || '').slice(0, EVENT_ID_MAX_CHARS);
+  const articleTitle = String(raw.article_title || raw.articleTitle || '').slice(0, EVENT_TITLE_MAX_CHARS);
+  let seconds = '';
+  if (type === 'play') {
+    const s = Number(raw.seconds);
+    if (!Number.isFinite(s) || s < 0) return null;
+    seconds = Math.floor(s);
+  }
+  let ts = nowIso;
+  const parsed = Date.parse(String(raw.ts || ''));
+  if (Number.isFinite(parsed)) ts = new Date(parsed).toISOString();
+  return [ts, type, feedId, feedTitle, articleId, articleTitle, seconds];
+}
+
+// 1リクエスト分 (最大 EVENT_LOG_MAX_PER_REQUEST 件) を検証し、
+// 保存できる行だけを返す。
+function sanitizeEventBatch(input, nowIso) {
+  if (!Array.isArray(input)) return [];
+  const now = nowIso || new Date().toISOString();
+  const rows = [];
+  input.slice(0, EVENT_LOG_MAX_PER_REQUEST).forEach((raw) => {
+    const row = sanitizeEvent(raw, now);
+    if (row) rows.push(row);
+  });
+  return rows;
+}
+
+// log_events アクションの本体: 検証を通った行を events タブへ
+// setValues で一括追記し、保存できた件数を返す。
+function handleLogEvents(body, nowIso) {
+  const rows = sanitizeEventBatch(body && body.events, nowIso);
+  if (!rows.length) return { ok: true, saved: 0 };
+  const ss = openDataSpreadsheet();
+  const sheet = getSheetOrCreate(ss, EVENTS_SHEET_NAME, EVENTS_HEADERS);
+  const startRow = sheet.getDataRange().getValues().length + 1;
+  sheet.getRange(startRow, 1, rows.length, EVENTS_HEADERS.length).setValues(rows);
+  return { ok: true, saved: rows.length };
+}
+
+// events を (週, フィード) 単位に集計する純関数。weekFilter が
+// あたえられた週だけを対象にする (null なら全週)。
+// 戻り値は { map, order }: map は 'week\nfeed_id' → 集計オブジェクト、
+// order は出現順のキー配列。feed_title は最後に現れた非空の値を使う。
+function aggregateEventsByWeekFeed(events, weekFilter) {
+  const map = {};
+  const order = [];
+  (events || []).forEach((ev) => {
+    const t = Date.parse(cellIso(ev && ev.ts) || '');
+    if (!Number.isFinite(t)) return;
+    const week = weekStartKey(t);
+    if (weekFilter && week !== weekFilter) return;
+    const feedId = String((ev && ev.feed_id) || '');
+    const key = week + '\n' + feedId;
+    if (!map[key]) {
+      map[key] = { week, feed_id: feedId, feed_title: '', views: 0, opens: 0, plays: 0, seconds: 0 };
+      order.push(key);
+    }
+    const agg = map[key];
+    const title = String(ev.feed_title || '');
+    if (title) agg.feed_title = title;
+    if (ev.type === 'feed_view') agg.views += 1;
+    else if (ev.type === 'article_open') agg.opens += 1;
+    else if (ev.type === 'play') {
+      agg.plays += 1;
+      agg.seconds += Math.max(0, Number(ev.seconds) || 0);
+    }
+  });
+  return { map, order };
+}
+
+// 週次集計の計画を立てる純関数。完了した週 (現在の週より前の週) で
+// weekly_stats にまだ (week, feed_id) が無い分だけを集計し、
+// 追記行と、間引き対象の events 行インデックス (events 配列の
+// 0始まり) を返す。間引きは集計済みの週に属し、保持期間
+// (EVENT_RETENTION_DAYS) を過ぎた行だけ。
+function planWeeklyRollup(events, existingStats, nowIso) {
+  const nowMs = Date.parse(nowIso || '') || Date.now();
+  const currentWeek = weekStartKey(nowMs);
+  const existingKeys = {};
+  (existingStats || []).forEach((s) => {
+    existingKeys[String(s.week || '') + '\n' + String(s.feed_id || '')] = true;
+  });
+  const completed = (events || []).filter((ev) => {
+    const t = Date.parse(cellIso(ev && ev.ts) || '');
+    return Number.isFinite(t) && weekStartKey(t) < currentWeek;
+  });
+  const aggregated = aggregateEventsByWeekFeed(completed, null);
+  const rowsToAppend = [];
+  const aggregatedKeys = { ...existingKeys };
+  aggregated.order.forEach((key) => {
+    if (existingKeys[key]) return;
+    const a = aggregated.map[key];
+    rowsToAppend.push([a.week, a.feed_id, a.feed_title, a.views, a.opens, a.plays, a.seconds]);
+    aggregatedKeys[key] = true;
+  });
+  const cutoffMs = nowMs - EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const pruneIndexes = [];
+  (events || []).forEach((ev, i) => {
+    const t = Date.parse(cellIso(ev && ev.ts) || '');
+    if (!Number.isFinite(t) || t >= cutoffMs) return;
+    const key = weekStartKey(t) + '\n' + String((ev && ev.feed_id) || '');
+    if (aggregatedKeys[key]) pruneIndexes.push(i);
+  });
+  return { rowsToAppend, pruneIndexes, currentWeek };
+}
+
+// 週次集計と間引きを実行する。events の読みは行インデックスの対応を
+// 保つため、空行を飛ばす rowsToObjects ではなく値配列から直接作る。
+function rollupWeeklyEvents(nowIso) {
+  const now = nowIso || new Date().toISOString();
+  const ss = openDataSpreadsheet();
+  const eventsSheet = ss.getSheetByName(EVENTS_SHEET_NAME);
+  if (!eventsSheet) return { ok: true, appended: 0, pruned: 0 };
+  const values = eventsSheet.getDataRange().getValues();
+  if (values.length < 2) return { ok: true, appended: 0, pruned: 0 };
+  const headers = values[0];
+  const events = values.slice(1).map((row) => {
+    const obj = {};
+    headers.forEach((h, idx) => { obj[h] = row[idx] === undefined ? '' : row[idx]; });
+    return obj;
+  });
+  const stats = readSheetAsObjects(ss, WEEKLY_STATS_SHEET_NAME);
+  const plan = planWeeklyRollup(events, stats, now);
+  if (plan.rowsToAppend.length) {
+    const statsSheet = getSheetOrCreate(ss, WEEKLY_STATS_SHEET_NAME, WEEKLY_STATS_HEADERS);
+    const startRow = statsSheet.getDataRange().getValues().length + 1;
+    statsSheet.getRange(startRow, 1, plan.rowsToAppend.length, WEEKLY_STATS_HEADERS.length)
+      .setValues(plan.rowsToAppend);
+  }
+  if (plan.pruneIndexes.length) {
+    const drop = {};
+    plan.pruneIndexes.forEach((i) => { drop[i] = true; });
+    const remaining = [values[0]];
+    for (let i = 1; i < values.length; i++) {
+      if (!drop[i - 1]) remaining.push(values[i]);
+    }
+    eventsSheet.clearContents();
+    eventsSheet.getRange(1, 1, remaining.length, remaining[0].length).setValues(remaining);
+  }
+  return { ok: true, appended: plan.rowsToAppend.length, pruned: plan.pruneIndexes.length };
+}
+
+// 最終実行から WEEKLY_ROLLUP_INTERVAL_MS 以上空いているときだけ
+// rollupWeeklyEvents を走らせるゲート (fetchFeeds から相乗り)。
+function maybeRollupWeeklyEvents(nowMs) {
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  const props = PropertiesService.getScriptProperties();
+  const last = Number(props.getProperty(WEEKLY_ROLLUP_PROP) || 0);
+  if (Number.isFinite(last) && last > 0 && now - last < WEEKLY_ROLLUP_INTERVAL_MS) return false;
+  rollupWeeklyEvents(new Date(now).toISOString());
+  props.setProperty(WEEKLY_ROLLUP_PROP, String(now));
+  return true;
+}
+
+// stats アクションの本体: weekly_stats の直近 WEEKLY_STATS_MAX_WEEKS
+// 週分と、今週分 (未集計) を events からその場で集計したものを返す。
+function buildStatsPayload(nowIso) {
+  const now = nowIso || new Date().toISOString();
+  const ss = openDataSpreadsheet();
+  const stats = readSheetAsObjects(ss, WEEKLY_STATS_SHEET_NAME);
+  const weeksDesc = [...new Set(stats.map((s) => String(s.week || '')).filter(Boolean))].sort().reverse();
+  const keepWeeks = {};
+  weeksDesc.slice(0, WEEKLY_STATS_MAX_WEEKS).forEach((w) => { keepWeeks[w] = true; });
+  const normalize = (s) => ({
+    week: String(s.week || ''),
+    feed_id: String(s.feed_id || ''),
+    feed_title: String(s.feed_title || ''),
+    views: Number(s.views) || 0,
+    opens: Number(s.opens) || 0,
+    plays: Number(s.plays) || 0,
+    seconds: Number(s.seconds) || 0,
+  });
+  const weekly = stats
+    .filter((s) => keepWeeks[String(s.week || '')])
+    .map(normalize)
+    .sort((a, b) => (a.week < b.week ? -1 : a.week > b.week ? 1 : 0));
+  const currentWeek = weekStartKey(Date.parse(now) || Date.now());
+  const currentAgg = aggregateEventsByWeekFeed(readSheetAsObjects(ss, EVENTS_SHEET_NAME), currentWeek);
+  const current = currentAgg.order.map((key) => currentAgg.map[key]);
+  return { ok: true, weekly, currentWeek, current };
+}
+
 // --- Web App entry points ---
 
 function jsonOutput(obj) {
@@ -1828,6 +2069,8 @@ function doPost(e) {
       getShareLinkStatus: () => getShareLinkStatus(),
       revokeShareLink: () => revokeShareLink(),
       set_star: () => handleSetStar(body),
+      log_events: () => handleLogEvents(body),
+      stats: () => buildStatsPayload(),
     };
     if (Object.prototype.hasOwnProperty.call(ownerActions, action)) {
       if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
@@ -1841,4 +2084,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
