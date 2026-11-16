@@ -61,15 +61,15 @@ const SUMMARY_MAX_CHARS = 500;
 // 生ログは90日保持し、集計は無期限に残す。集計と間引きは毎時
 // fetchFeeds に相乗りし、最終実行 (スクリプトプロパティ
 // WEEKLY_ROLLUP_LAST_RUN_AT) から7日以上空いたときだけ走る。
-// 新しいトリガーは作らない。weekly_stats の scrolls 列は末尾に
-// 後付けした列で、列の無い既存タブには集計の追記時にヘッダーを
+// 新しいトリガーは作らない。weekly_stats の scrolls / expands 列は
+// 末尾に後付けした列で、列の無い既存タブには集計の追記時にヘッダーを
 // 遅延追加する (articles の star_override と同じ移行パターン)。
-// 既存行の scrolls は空 = 0 件扱いになる。
+// 既存行の scrolls / expands は空 = 0 件扱いになる。
 const EVENTS_SHEET_NAME = 'events';
 const WEEKLY_STATS_SHEET_NAME = 'weekly_stats';
 const EVENTS_HEADERS = ['ts', 'type', 'feed_id', 'feed_title', 'article_id', 'article_title', 'seconds'];
-const WEEKLY_STATS_HEADERS = ['week', 'feed_id', 'feed_title', 'views', 'opens', 'plays', 'seconds', 'scrolls'];
-const EVENT_TYPES = { feed_view: true, article_open: true, play: true, scroll: true };
+const WEEKLY_STATS_HEADERS = ['week', 'feed_id', 'feed_title', 'views', 'opens', 'plays', 'seconds', 'scrolls', 'expands'];
+const EVENT_TYPES = { feed_view: true, article_open: true, play: true, scroll: true, expand: true };
 const EVENT_LOG_MAX_PER_REQUEST = 50;
 const EVENT_ID_MAX_CHARS = 128;
 const EVENT_TITLE_MAX_CHARS = 200;
@@ -1799,8 +1799,9 @@ function handleSetStar(body, fireTrigger) {
 // 種類は feed_view (フィードを開いた) / article_open (記事を開いた) /
 // play (再生。停止時点で聴いた秒数を伴う) / scroll (そのフィードの
 // タイムラインをスクロールした。クリックより弱いシグナルで、
-// クライアントが訪問ごとに最大1回だけ送る) の4つだけ。週次集計は
-// weekly_stats タブへ畳み、生ログは90日で間引く。
+// クライアントが訪問ごとに最大1回だけ送る) / expand (記事カードの
+// 要約を「もっと見る」で展開した。記事への興味の強さを示すシグナル)
+// の5つだけ。週次集計は weekly_stats タブへ畳み、生ログは90日で間引く。
 
 // Asia/Tokyo (UTC+9、夏時間なし) で見た週の開始日 (月曜) を
 // 'YYYY-MM-DD' で返す。文字列の辞書順がそのまま日付順になる。
@@ -1880,7 +1881,7 @@ function aggregateEventsByWeekFeed(events, weekFilter) {
     const feedId = String((ev && ev.feed_id) || '');
     const key = week + '\n' + feedId;
     if (!map[key]) {
-      map[key] = { week, feed_id: feedId, feed_title: '', views: 0, opens: 0, plays: 0, seconds: 0, scrolls: 0 };
+      map[key] = { week, feed_id: feedId, feed_title: '', views: 0, opens: 0, plays: 0, seconds: 0, scrolls: 0, expands: 0 };
       order.push(key);
     }
     const agg = map[key];
@@ -1889,6 +1890,7 @@ function aggregateEventsByWeekFeed(events, weekFilter) {
     if (ev.type === 'feed_view') agg.views += 1;
     else if (ev.type === 'article_open') agg.opens += 1;
     else if (ev.type === 'scroll') agg.scrolls += 1;
+    else if (ev.type === 'expand') agg.expands += 1;
     else if (ev.type === 'play') {
       agg.plays += 1;
       agg.seconds += Math.max(0, Number(ev.seconds) || 0);
@@ -1919,7 +1921,7 @@ function planWeeklyRollup(events, existingStats, nowIso) {
   aggregated.order.forEach((key) => {
     if (existingKeys[key]) return;
     const a = aggregated.map[key];
-    rowsToAppend.push([a.week, a.feed_id, a.feed_title, a.views, a.opens, a.plays, a.seconds, a.scrolls]);
+    rowsToAppend.push([a.week, a.feed_id, a.feed_title, a.views, a.opens, a.plays, a.seconds, a.scrolls, a.expands]);
     aggregatedKeys[key] = true;
   });
   const cutoffMs = nowMs - EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -1953,12 +1955,17 @@ function rollupWeeklyEvents(nowIso) {
   if (plan.rowsToAppend.length) {
     const statsSheet = getSheetOrCreate(ss, WEEKLY_STATS_SHEET_NAME, WEEKLY_STATS_HEADERS);
     const statsValues = statsSheet.getDataRange().getValues();
-    // scrolls 列の無い既存タブ (列追加前) では、追記の前にヘッダーへ
-    // 遅延追加する (articles の star_override と同じ移行パターン)。
-    // 新規作成時は getSheetOrCreate が全列のヘッダーを入れるので何もしない。
+    // scrolls / expands 列の無い既存タブ (列追加前) では、追記の前に
+    // ヘッダーへ遅延追加する (articles の star_override と同じ移行
+    // パターン)。新規作成時は getSheetOrCreate が全列のヘッダーを
+    // 入れるので何もしない。
     const statsHeaders = statsValues[0] || [];
-    if (statsValues.length && statsHeaders.indexOf('scrolls') < 0) {
-      statsSheet.getRange(1, WEEKLY_STATS_HEADERS.indexOf('scrolls') + 1).setValue('scrolls');
+    if (statsValues.length) {
+      ['scrolls', 'expands'].forEach((name) => {
+        if (statsHeaders.indexOf(name) < 0) {
+          statsSheet.getRange(1, WEEKLY_STATS_HEADERS.indexOf(name) + 1).setValue(name);
+        }
+      });
     }
     const startRow = statsValues.length + 1;
     statsSheet.getRange(startRow, 1, plan.rowsToAppend.length, WEEKLY_STATS_HEADERS.length)
@@ -2007,6 +2014,7 @@ function buildStatsPayload(nowIso) {
     plays: Number(s.plays) || 0,
     seconds: Number(s.seconds) || 0,
     scrolls: Number(s.scrolls) || 0,
+    expands: Number(s.expands) || 0,
   });
   const weekly = stats
     .filter((s) => keepWeeks[String(s.week || '')])
