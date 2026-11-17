@@ -47,6 +47,8 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 
 `doGet` は `{ok:true, service:"reader-gas"}` のヘルスチェックと、YouTube フィードの RSS 2.0 出力 (`?rss=<フィードID>`、対象外のIDは `{ok:false, error:"feed_not_found"}`) を行う。
 
+`?rss=` は CacheService (スクリプトキャッシュ) で高速化している。生成済みの RSS 本文をフィード別に TTL 20分で載せ、ヒット時はシートを読まずに返す。スターの付け外し (`set_star`)・フィードの保存/削除では対象フィード分を即時に無効化する。あわせて `audio-urls.json` の本文 (実測100KB超のため、1値100KB制限に収まるよう文字列をチャンク分割する) も TTL 10分で載せ、フィードをまたいで取得を使い回す。キャッシュが無い・壊れている環境では従来どおり生成・取得にフォールバックし、応答内容は変わらない。
+
 認証に失敗した場合は `{ok:false, error:"unauthorized"}`、読み取り専用セッションでの書き込みは `{ok:false, error:"forbidden"}` を返す。
 
 ## セットアップ

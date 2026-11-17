@@ -402,6 +402,127 @@ function lookupYouTubeChannelByHandle(handle) {
   }
 }
 
+// --- CacheService による読み取りキャッシュ (?rss= の高速化) ---
+// ?rss= はリクエストのたびに、スプレッドシート全件読み (feeds と
+// 全フィード分の articles)・全フィード分のスター再計算・
+// audio-urls.json の外部取得・プロパティ参照 (enclosure のある
+// アイテムごとに中継ベース URL を引き直す) をやり直しており、
+// 応答が 7〜31KB と小さい割に実測 4〜10秒かかっていた。データが
+// 変わるのは毎時巡回 (fetchFeeds) と set_star / saveFeed /
+// deleteFeed のアクションだけなので、生成済みの RSS 本文と
+// audio-urls.json の本文をスクリプトキャッシュに載せて読み取りを
+// 飛ばす。キャッシュが無い・壊れている環境では従来どおり生成に
+// フォールバックし、応答内容は現行と同一に保つ。
+
+// CacheService の1値は100KBまで。文字数ではなく UTF-8 バイト数で
+// 数える (日本語は1文字3バイト)。上限に余裕を持たせた値。
+const CACHE_VALUE_MAX_BYTES = 90000;
+
+function utf8ByteLength(text) {
+  const s = String(text || '');
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const cp = s.codePointAt(i);
+    if (cp > 0xFFFF) { bytes += 4; i++; }
+    else if (cp > 0x7FF) bytes += 3;
+    else if (cp > 0x7F) bytes += 2;
+    else bytes += 1;
+  }
+  return bytes;
+}
+
+// スクリプトキャッシュの取得。CacheService が無い環境 (Node
+// テスト等) や取得自体が失敗した場合は null を返し、呼び出し側は
+// キャッシュ無しとして従来どおり動く。
+function scriptCache() {
+  try {
+    if (typeof CacheService === 'undefined' || !CacheService) return null;
+    return CacheService.getScriptCache() || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+const RSS_CACHE_KEY_PREFIX = 'rss:v1:';
+
+// RSS 本文の TTL (秒)。フィードのデータ自体は毎時巡回でしか
+// 変わらないが、enclosure は巡回後に非同期 (自宅サーバー側の
+// 10分間隔バッチ) で抽出される音声 URL に依存するため、丸ごと
+// 1時間は載せず20分に留める (再生ボタンが出るまでの遅れは
+// 抽出バッチの間隔と同程度に収まる)。スターの付け外し・
+// フィードの保存/削除は各ハンドラが即時に無効化するため、
+// この TTL の影響を受けない。
+const RSS_CACHE_TTL_SEC = 1200;
+
+function rssCacheKey(feedId) {
+  return RSS_CACHE_KEY_PREFIX + String(feedId || '');
+}
+
+// フィードのデータが変わるアクション (スター付け外し・保存・
+// 削除) から呼ぶ。キャッシュが無い環境では何もしない。
+function invalidateRssCache(feedId) {
+  if (!feedId) return;
+  const cache = scriptCache();
+  if (!cache) return;
+  try { cache.remove(rssCacheKey(feedId)); } catch (e) { /* 落とせなくても TTL で切れる */ }
+}
+
+// audio-urls.json 本文の TTL (秒)。エントリの鮮度 (抽出から
+// 5時間) は RSS 生成時に各エントリの ts で判定するため、
+// キャッシュが古くても鮮度判定自体は正しい。新規エントリの
+// 反映は最大でこの TTL だけ遅れる。
+const AUDIO_URLS_CACHE_TTL_SEC = 600;
+
+// audio-urls.json は実測で100KBを超える (2026-11-17 時点で
+// 約105KB・88エントリ) ため、1値には収まらない。本文を文字列の
+// まま等分して複数値に分け、個数を別キーに持つ。1チャンクは、
+// 全て3バイト文字でも CACHE_VALUE_MAX_BYTES に収まる文字数。
+const AUDIO_URLS_CACHE_KEY_PREFIX = 'audiomap:v1:';
+const AUDIO_URLS_CACHE_CHUNK_CHARS = 30000;
+const AUDIO_URLS_CACHE_MAX_CHUNKS = 20;
+
+// audio-urls.json の本文をチャンク分割でキャッシュへ書く。
+// 失敗は無視する (キャッシュは最適化専用で、書けなければ
+// 次回も取得し直すだけ)。
+function putAudioUrlsMapCache(cache, jsonText) {
+  try {
+    const text = String(jsonText || '');
+    if (!text) return;
+    const count = Math.ceil(text.length / AUDIO_URLS_CACHE_CHUNK_CHARS);
+    if (count < 1 || count > AUDIO_URLS_CACHE_MAX_CHUNKS) return;
+    for (let i = 0; i < count; i++) {
+      cache.put(
+        AUDIO_URLS_CACHE_KEY_PREFIX + i,
+        text.slice(i * AUDIO_URLS_CACHE_CHUNK_CHARS, (i + 1) * AUDIO_URLS_CACHE_CHUNK_CHARS),
+        AUDIO_URLS_CACHE_TTL_SEC
+      );
+    }
+    cache.put(AUDIO_URLS_CACHE_KEY_PREFIX + 'count', String(count), AUDIO_URLS_CACHE_TTL_SEC);
+  } catch (e) { /* 書けなくても応答には影響しない */ }
+}
+
+// キャッシュから audio-urls.json のマップを復元する。欠け・
+// 壊れ・想定外の形なら null (= ミスとして取得し直す)。
+// 検証は取得時と同じ parseAudioUrlsMap を通す。
+function getAudioUrlsMapFromCache(cache) {
+  try {
+    const count = Number(cache.get(AUDIO_URLS_CACHE_KEY_PREFIX + 'count'));
+    if (!Number.isFinite(count) || count < 1 || count > AUDIO_URLS_CACHE_MAX_CHUNKS) return null;
+    let text = '';
+    for (let i = 0; i < count; i++) {
+      const part = cache.get(AUDIO_URLS_CACHE_KEY_PREFIX + i);
+      if (typeof part !== 'string' || part === '') return null;
+      text += part;
+    }
+    let data;
+    try { data = JSON.parse(text); } catch (e) { return null; }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    return parseAudioUrlsMap(text);
+  } catch (e) {
+    return null;
+  }
+}
+
 // --- YouTube 音声ストリーム URL の配布 (ogp 方式) ---
 // 音声ファイルはどこにも置かない。reader-gas が毎時巡回で yt-audio
 // トリガー (後述) を叩くと、自宅サーバー側のバッチがストリーム URL を
@@ -469,14 +590,26 @@ let audioUrlsMapCache = null;
 // ベース URL (A_ZE_GS_BASE_URL) が未設定なら取得自体を省いて空マップ。
 // 失敗 (HTTPエラー・例外・UrlFetchApp 自体が無い環境) もすべて
 // 空マップとして扱い、RSS 出力自体は enclosure 無しで続ける。
+// 取得に成功した本文はスクリプトキャッシュにも載せ、TTL 内の
+// 後続リクエスト (別フィードの ?rss= 等) は取得を省く。
 function fetchAudioUrlsMap() {
   if (audioUrlsMapCache) return audioUrlsMapCache;
   const jsonUrl = audioUrlsJsonUrl();
   if (!jsonUrl) return {};
+  const cache = scriptCache();
+  if (cache) {
+    const cached = getAudioUrlsMapFromCache(cache);
+    if (cached) {
+      audioUrlsMapCache = cached;
+      return audioUrlsMapCache;
+    }
+  }
   try {
     const res = UrlFetchApp.fetch(jsonUrl, { method: 'get', muteHttpExceptions: true });
     if (res.getResponseCode() !== 200) return {};
-    audioUrlsMapCache = parseAudioUrlsMap(res.getContentText());
+    const text = res.getContentText();
+    audioUrlsMapCache = parseAudioUrlsMap(text);
+    if (cache) putAudioUrlsMapCache(cache, text);
     return audioUrlsMapCache;
   } catch (e) {
     return {};
@@ -1726,6 +1859,9 @@ function handleSaveFeed(body, resolveHandle) {
   const rowValues = feedRowValues(rowObj, headers);
   if (rowNum > 0) sheet.getRange(rowNum, 1, 1, headers.length).setValues([rowValues]);
   else sheet.appendRow(rowValues);
+  // タイトルは RSS 本文に、カテゴリはスターのデフォルト判定に
+  // 影響するため、そのフィードの RSS キャッシュを落とす。
+  invalidateRssCache(feed.id);
   const unreadByFeed = countUnreadByFeed(readSheetAsObjects(ss, 'articles'));
   return { ok: true, feed: feedToApiShape(rowObj, existing ? (unreadByFeed[feed.id] || 0) : 0) };
 }
@@ -1747,6 +1883,9 @@ function handleDeleteFeed(body) {
   if (rowNum < 0) return { ok: false, error: 'not_found' };
   deleteRowsById(ss, 'articles', 'feed_id', [feedId]);
   sheet.deleteRow(rowNum);
+  // 消えたフィードの RSS がキャッシュから出続けないように落とす
+  // (購読同期の削除もこのハンドラ経由)。
+  invalidateRssCache(feedId);
   return { ok: true };
 }
 
@@ -1809,6 +1948,10 @@ function handleSetStar(body, fireTrigger) {
     sheet.getRange(1, starIdx + 1).setValue('star_override');
   }
   sheet.getRange(rowNum, starIdx + 1).setValue(on ? 'on' : 'off');
+  // スター状態は ?rss= の enclosure に直結するため、その記事の
+  // フィードの RSS キャッシュを即時に落とす (次回 ?rss= で再生成)。
+  const feedIdx = headers.indexOf('feed_id');
+  invalidateRssCache(feedIdx >= 0 ? String(values[rowNum - 1][feedIdx] || '') : '');
   if (on) {
     const linkIdx = headers.indexOf('link');
     const videoId = linkIdx >= 0 ? videoIdFromLink(values[rowNum - 1][linkIdx]) : '';
@@ -2066,6 +2209,17 @@ function jsonOutput(obj) {
 function doGet(e) {
   const rssFeedId = e && e.parameter ? String(e.parameter.rss || '') : '';
   if (rssFeedId) {
+    // 生成済み RSS 本文のキャッシュ。ヒット時はシートを読まずに
+    // そのまま返す (スター変更・フィード保存/削除では無効化済み。
+    // RSS_CACHE_TTL_SEC のコメント参照)。キャッシュ側の障害時は
+    // 通常生成にフォールバックする。
+    const cache = scriptCache();
+    if (cache) {
+      try {
+        const hit = cache.get(rssCacheKey(rssFeedId));
+        if (hit) return ContentService.createTextOutput(hit);
+      } catch (err) { /* 通常生成へ */ }
+    }
     const ss = openDataSpreadsheet();
     const feeds = readSheetAsObjects(ss, 'feeds');
     const feed = feeds.filter((f) => String(f.id) === rssFeedId)[0] || null;
@@ -2085,7 +2239,15 @@ function doGet(e) {
     // MIME は付けない (取得側はプロキシ経由で本文だけを読むため)。
     // YT_PLAY_TOKEN が設定されていれば enclosure は中継 URL になる。
     const ytPlayToken = PropertiesService.getScriptProperties().getProperty('YT_PLAY_TOKEN');
-    return ContentService.createTextOutput(buildRssXml(feed, rows, fetchAudioUrlsMap(), ytPlayToken, starredVideoIds));
+    const xml = buildRssXml(feed, rows, fetchAudioUrlsMap(), ytPlayToken, starredVideoIds);
+    if (cache) {
+      try {
+        if (utf8ByteLength(xml) <= CACHE_VALUE_MAX_BYTES) {
+          cache.put(rssCacheKey(rssFeedId), xml, RSS_CACHE_TTL_SEC);
+        }
+      } catch (err) { /* 入らなければ次回も生成するだけ */ }
+    }
+    return ContentService.createTextOutput(xml);
   }
   return jsonOutput({ ok: true, service: 'reader-gas' });
 }
@@ -2138,4 +2300,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
