@@ -291,10 +291,13 @@ function youtubeChannelIdFromUrl(url) {
 // 出力・buildFetchUrl・タイトル空の例外判定・スター計算はすべて
 // この関数経由で判定する。登録時の入力 (余分なクエリ付き) からも
 // 抜けるよう、list= はクエリのどこにあっても拾う。
+// ID は英数・ハイフン・アンダースコアで10文字以上とする (クライアント
+// 側の検証規則に合わせたもの)。WL (後で見る) や LL (高評価) のような
+// 短い特殊 ID は、これで弾かれる (公式 API では取得できないため)。
 function youtubePlaylistIdFromUrl(url) {
   const s = String(url || '');
   if (!/^https:\/\/(?:www\.)?youtube\.com\/playlist\?/.test(s)) return '';
-  const m = /[?&]list=([\w-]{6,})/.exec(s.split('#')[0]);
+  const m = /[?&]list=([\w-]{10,})/.exec(s.split('#')[0]);
   return m ? m[1] : '';
 }
 

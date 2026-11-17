@@ -604,6 +604,12 @@ test('youtubePlaylistIdFromUrl: 保存形からプレイリスト ID を抜き�
   assert.equal(youtubePlaylistIdFromUrl('https://example.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00'), '');
   assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist'), '');
   assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list='), '');
+  // ID は10文字以上 (クライアント側の検証規則と一致)。短い特殊 ID
+  // (WL = 後で見る、LL = 高評価) や9文字以下は弾く
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=WL'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=LL'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=PL1234567'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=PL12345678'), 'PL12345678');
   assert.equal(youtubePlaylistIdFromUrl(''), '');
   assert.equal(youtubePlaylistIdFromUrl(null), '');
   // 正規形の組み立て (youtubeFeedUrlFromChannelId と対)
