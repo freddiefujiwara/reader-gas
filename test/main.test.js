@@ -30,6 +30,12 @@ import {
   parseChannelLookupResponse,
   youtubeApiErrorDetail,
   parseAudioUrlsMap,
+  utf8ByteLength,
+  scriptCache,
+  rssCacheKey,
+  invalidateRssCache,
+  getAudioUrlsMapFromCache,
+  putAudioUrlsMapCache,
   scriptBaseUrl,
   fetchAudioUrlsMap,
   ytPlayUrl,
@@ -864,6 +870,18 @@ function fakeContentService() {
       };
     },
   };
+}
+
+// CacheService のフェイク。store (Map) を直接のぞいて、書かれた
+// キーや無効化を確認できるようにする。
+function fakeCacheService(initial = {}) {
+  const store = new Map(Object.entries(initial));
+  const cache = {
+    get: (k) => (store.has(k) ? store.get(k) : null),
+    put: (k, v) => { store.set(k, String(v)); },
+    remove: (k) => { store.delete(k); },
+  };
+  return { store, cache, service: { getScriptCache: () => cache } };
 }
 
 // 指定した GAS グローバルを差し込み、復元関数を返す。
@@ -2142,6 +2160,100 @@ test('fetchAudioUrlsMap: HTTPエラーや例外は空マップ (RSS は enclosur
   } finally { restoreNoBase(); }
 });
 
+test('utf8ByteLength: ASCII は1バイト、日本語は3バイト、絵文字は4バイトで数える', () => {
+  assert.equal(utf8ByteLength(''), 0);
+  assert.equal(utf8ByteLength('abc'), 3);
+  assert.equal(utf8ByteLength('日本語'), 9);
+  assert.equal(utf8ByteLength('aあ😀'), 1 + 3 + 4);
+  assert.equal(utf8ByteLength(null), 0);
+});
+
+test('scriptCache: CacheService が無い環境では null、ある環境ではキャッシュを返す', () => {
+  const restoreNone = installGasGlobals({ CacheService: undefined });
+  try {
+    assert.equal(scriptCache(), null);
+  } finally { restoreNone(); }
+  const fake = fakeCacheService();
+  const restore = installGasGlobals({ CacheService: fake.service });
+  try {
+    assert.equal(scriptCache(), fake.cache);
+  } finally { restore(); }
+});
+
+test('rssCacheKey / invalidateRssCache: キーの形と、対象フィード分だけの削除', () => {
+  assert.equal(rssCacheKey('feed-x'), 'rss:v1:feed-x');
+  const fake = fakeCacheService({ 'rss:v1:feed-x': '<rss/>', 'rss:v1:feed-y': '<rss/>' });
+  const restore = installGasGlobals({ CacheService: fake.service });
+  try {
+    invalidateRssCache('feed-x');
+    assert.equal(fake.store.has('rss:v1:feed-x'), false);
+    assert.equal(fake.store.has('rss:v1:feed-y'), true);
+    invalidateRssCache(''); // 空 ID は何もしない
+  } finally { restore(); }
+  // CacheService が無い環境でも例外にしない
+  const restoreNone = installGasGlobals({ CacheService: undefined });
+  try {
+    invalidateRssCache('feed-x');
+  } finally { restoreNone(); }
+});
+
+test('audio-urls キャッシュ: 100KB超の本文をチャンク分割して読み戻せる', () => {
+  const fake = fakeCacheService();
+  const bigMap = { vidPad11111: { url: 'https://example.com/' + 'p'.repeat(65000), ts: 1700000000, dur: 42 } };
+  const bigText = JSON.stringify(bigMap);
+  assert.ok(bigText.length > 60000);
+  putAudioUrlsMapCache(fake.cache, bigText);
+  assert.equal(fake.store.get('audiomap:v1:count'), '3');
+  const joined = [0, 1, 2].map((i) => fake.store.get('audiomap:v1:' + i)).join('');
+  assert.equal(joined, bigText);
+  assert.deepEqual(getAudioUrlsMapFromCache(fake.cache), {
+    vidPad11111: { url: bigMap.vidPad11111.url, ts: 1700000000, dur: 42 },
+  });
+});
+
+test('audio-urls キャッシュ: 欠け・壊れ・想定外の形はミス (null) として扱う', () => {
+  assert.equal(getAudioUrlsMapFromCache(fakeCacheService().cache), null);
+  assert.equal(getAudioUrlsMapFromCache(fakeCacheService({ 'audiomap:v1:count': 'abc' }).cache), null);
+  // count はあるがチャンクが欠けている
+  assert.equal(getAudioUrlsMapFromCache(fakeCacheService({ 'audiomap:v1:count': '2', 'audiomap:v1:0': '{}' }).cache), null);
+  // JSON として壊れている
+  assert.equal(getAudioUrlsMapFromCache(fakeCacheService({ 'audiomap:v1:count': '1', 'audiomap:v1:0': 'not json' }).cache), null);
+  // オブジェクトでない JSON
+  assert.equal(getAudioUrlsMapFromCache(fakeCacheService({ 'audiomap:v1:count': '1', 'audiomap:v1:0': '[1,2]' }).cache), null);
+  // 上限を超えるチャンク数は書かない
+  const fake = fakeCacheService();
+  putAudioUrlsMapCache(fake.cache, 'x'.repeat(600001));
+  assert.equal(fake.store.size, 0);
+});
+
+// このテストは、モジュール内の実行内キャッシュ (audioUrlsMapCache) が
+// まだ温まっていない位置に置く必要がある (温まっているとそちらが
+// 先に返り、スクリプトキャッシュの読み取りを検証できない)。
+// ついでに、後続の doGet テストが使う vidAudio111 のエントリも
+// 含めておく (実行内キャッシュがこのマップで温まるため、後続の
+// doGet テストは従来どおり enclosure を受け取れる)。
+test('fetchAudioUrlsMap: スクリプトキャッシュにヒットすれば取得を省く', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const seeded = {
+    vidSeeded111: { url: 'https://stream.example.com/vidSeeded111', ts: nowSec - 30 },
+    vidAudio111: { url: 'https://stream.example.com/vidAudio111', ts: nowSec - 60, dur: 2297.4 },
+  };
+  const fake = fakeCacheService();
+  putAudioUrlsMapCache(fake.cache, JSON.stringify(seeded));
+  let fetchCalls = 0;
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
+    CacheService: fake.service,
+    UrlFetchApp: { fetch: () => { fetchCalls++; throw new Error('must not be called'); } },
+  });
+  try {
+    const map = fetchAudioUrlsMap();
+    assert.equal(fetchCalls, 0);
+    assert.equal(map.vidSeeded111.url, 'https://stream.example.com/vidSeeded111');
+    assert.equal(map.vidAudio111.dur, 2297.4);
+  } finally { restore(); }
+});
+
 function audioRssSpreadsheet(videoId) {
   return new FakeSpreadsheet({
     feeds: [FEED_HEADERS_ROW,
@@ -2213,6 +2325,136 @@ test('doGet: ?rss= は YT_PLAY_TOKEN があれば中継 URL の enclosure を配
     assert.ok(!xml.includes('stream.example.com'));
     assert.ok(xml.includes('<itunes:duration>2297</itunes:duration>'));
   } finally { restore(); }
+});
+
+// --- ?rss= の RSS 本文キャッシュ ---
+
+// doGet (?rss=) 用の環境。openById の呼び出し回数を数えられる。
+function rssCacheEnv(cacheFake) {
+  let opens = 0;
+  let ss = audioRssSpreadsheet('vidCache111');
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => { opens++; return ss; } },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
+    ContentService: fakeContentService(),
+    CacheService: cacheFake.service,
+    UrlFetchApp: { fetch: () => { throw new Error('no network in this test'); } },
+    Utilities: fakeUtilities,
+  });
+  return { restore, opens: () => opens, setSpreadsheet: (next) => { ss = next; } };
+}
+
+test('doGet: ?rss= の2回目は RSS キャッシュから返し、シートを読まない', () => {
+  const fake = fakeCacheService();
+  const env = rssCacheEnv(fake);
+  try {
+    const first = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.ok(first.includes('音声つき動画'));
+    assert.equal(env.opens(), 1);
+    assert.equal(fake.store.get('rss:v1:yt-audio-feed'), first);
+    const second = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.equal(second, first);
+    assert.equal(env.opens(), 1); // 2回目はシートを開いていない
+  } finally { env.restore(); }
+});
+
+test('doGet: feed_not_found はキャッシュせず、フィードができれば次回は RSS を返す', () => {
+  const fake = fakeCacheService();
+  const env = rssCacheEnv(fake);
+  const empty = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW],
+    articles: [ARTICLE_HEADERS_ROW],
+  });
+  env.setSpreadsheet(empty);
+  try {
+    const err = JSON.parse(doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent());
+    assert.deepEqual(err, { ok: false, error: 'feed_not_found' });
+    assert.equal(fake.store.has('rss:v1:yt-audio-feed'), false);
+    env.setSpreadsheet(audioRssSpreadsheet('vidCache111'));
+    const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.ok(xml.includes('音声つき動画'));
+  } finally { env.restore(); }
+});
+
+test('doGet: CacheService が例外を投げても通常生成にフォールバックする', () => {
+  const throwing = {
+    getScriptCache: () => ({
+      get: () => { throw new Error('cache get down'); },
+      put: () => { throw new Error('cache put down'); },
+      remove: () => { throw new Error('cache remove down'); },
+    }),
+  };
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => audioRssSpreadsheet('vidCache111') },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
+    ContentService: fakeContentService(),
+    CacheService: throwing,
+    UrlFetchApp: { fetch: () => { throw new Error('no network in this test'); } },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.ok(xml.includes('音声つき動画'));
+  } finally { restore(); }
+});
+
+test('doGet: 100KBを超える RSS 本文はキャッシュに入れない (応答自体は返す)', () => {
+  const fake = fakeCacheService();
+  const big = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['yt-audio-feed', '音声テスト', 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', '', 'FALSE', '', '', '', '200', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW,
+      ['rowBig', 'yt-audio-feed', '大きい動画', 'https://www.youtube.com/watch?v=vidCache111', '2026-11-14T01:00:00.000Z', '2026-11-14T02:00:00.000Z', 'x'.repeat(120000), '音声テスト'],
+    ],
+  });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => big },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
+    ContentService: fakeContentService(),
+    CacheService: fake.service,
+    UrlFetchApp: { fetch: () => { throw new Error('no network in this test'); } },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.ok(xml.includes('大きい動画'));
+    assert.equal(fake.store.has('rss:v1:yt-audio-feed'), false);
+  } finally { restore(); }
+});
+
+test('handleSetStar: スターを付け外しすると、そのフィードの RSS キャッシュが落ちる', () => {
+  const fake = fakeCacheService();
+  const env = rssCacheEnv(fake);
+  try {
+    doGet({ parameter: { rss: 'yt-audio-feed' } });
+    assert.equal(fake.store.has('rss:v1:yt-audio-feed'), true);
+    const res = handleSetStar({ id: 'rowA', on: false });
+    assert.equal(res.ok, true);
+    assert.equal(fake.store.has('rss:v1:yt-audio-feed'), false);
+    // 落ちたので次の ?rss= はシートを読み直して再生成する
+    const before = env.opens();
+    const xml = doGet({ parameter: { rss: 'yt-audio-feed' } }).getContent();
+    assert.ok(xml.includes('音声つき動画'));
+    assert.equal(env.opens(), before + 1);
+  } finally { env.restore(); }
+});
+
+test('handleDeleteFeed / handleSaveFeed: フィードの削除・保存でも RSS キャッシュが落ちる', () => {
+  const fake = fakeCacheService();
+  const env = rssCacheEnv(fake);
+  try {
+    doGet({ parameter: { rss: 'yt-audio-feed' } });
+    assert.equal(fake.store.has('rss:v1:yt-audio-feed'), true);
+    const saved = handleSaveFeed({ feed: { id: 'yt-audio-feed', title: '音声テスト', url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', category: '音楽' } });
+    assert.equal(saved.ok, true);
+    assert.equal(fake.store.has('rss:v1:yt-audio-feed'), false);
+    doGet({ parameter: { rss: 'yt-audio-feed' } });
+    assert.equal(fake.store.has('rss:v1:yt-audio-feed'), true);
+    const deleted = handleDeleteFeed({ feedId: 'yt-audio-feed' });
+    assert.deepEqual(deleted, { ok: true });
+    assert.equal(fake.store.has('rss:v1:yt-audio-feed'), false);
+  } finally { env.restore(); }
 });
 
 // --- 抽出トリガー (yt-audio) ---
