@@ -1710,6 +1710,23 @@ test('validateFeedInput: YouTube 疑似フィードだけタイトル空を許�
   assert.equal(validateFeedInput({ title: '', url: 'https://example.com/feed' }).ok, false);
 });
 
+test('validateFeedInput: 自動生成プレイリスト (LR/RD) は弾き、通常のプレイリスト (PL) は通る', () => {
+  const lrUrl = 'https://www.youtube.com/playlist?list=LRYRPO8Pv28j5-Rl0Vg4YL4w4Ck43RL4ZkJTF';
+  const rdUrl = 'https://www.youtube.com/playlist?list=RDxNfaRC6MbAnwSR1Dqqv69A00';
+  // 抽出自体は従来どおり (巡回側の判定に影響させない)
+  assert.equal(youtubePlaylistIdFromUrl(lrUrl), 'LRYRPO8Pv28j5-Rl0Vg4YL4w4Ck43RL4ZkJTF');
+  assert.equal(youtubePlaylistIdFromUrl(rdUrl), 'RDxNfaRC6MbAnwSR1Dqqv69A00');
+  // タイトル空 (プレイリストなら本来通る形) でも弾き、理由が分かるメッセージを返す
+  const lr = validateFeedInput({ title: '', url: lrUrl });
+  assert.equal(lr.ok, false);
+  assert.match(lr.message, /自動生成プレイリスト/);
+  assert.equal(validateFeedInput({ title: '', url: rdUrl }).ok, false);
+  // タイトルがあっても弾く
+  assert.equal(validateFeedInput({ title: 'ラジオ', url: lrUrl }).ok, false);
+  // 通常のプレイリストは従来どおり通る
+  assert.equal(validateFeedInput({ title: '', url: 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00' }).ok, true);
+});
+
 test('parseYouTubeChannelTitle: channels.list 応答からチャンネル名を取り出す', () => {
   const json = JSON.stringify({ items: [{ snippet: { title: '  楽天テック  ' } }] });
   assert.equal(parseYouTubeChannelTitle(json), '楽天テック');
@@ -1839,6 +1856,18 @@ test('handleSaveFeed: プレイリストはタイトル空で追加でき、保�
     assert.equal(again.feed.id, res.feed.id);
     assert.equal(ss.sheets['feeds'].rows.length, 2);
     assert.equal(ss.sheets['feeds'].rows[1][1], 'お気に入り');
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: 自動生成プレイリスト (LR) は invalid で弾き、何も書かない', () => {
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    const res = handleSaveFeed({ feed: { url: 'https://www.youtube.com/playlist?list=LRYRPO8Pv28j5-Rl0Vg4YL4w4Ck43RL4ZkJTF' } });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'invalid');
+    assert.match(res.message, /自動生成プレイリスト/);
+    // ヘッダー行だけで、フィードは追加されていない
+    assert.equal(ss.sheets['feeds'].rows.length, 1);
   } finally { restore(); }
 });
 

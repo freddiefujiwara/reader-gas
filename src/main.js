@@ -294,6 +294,9 @@ function youtubeChannelIdFromUrl(url) {
 // ID は英数・ハイフン・アンダースコアで10文字以上とする (クライアント
 // 側の検証規則に合わせたもの)。WL (後で見る) や LL (高評価) のような
 // 短い特殊 ID は、これで弾かれる (公式 API では取得できないため)。
+// LR (ラジオ) や RD (ミックス) のような自動生成 ID は抽出はするが、
+// validateFeedInput が保存時に弾く (この関数は巡回判定にも使うため、
+// 抽出の挙動自体は変えない)。
 function youtubePlaylistIdFromUrl(url) {
   const s = String(url || '');
   if (!/^https:\/\/(?:www\.)?youtube\.com\/playlist\?/.test(s)) return '';
@@ -1930,8 +1933,15 @@ function validateFeedInput(input) {
   if (id && !FEED_ID_PATTERN.test(id)) return { ok: false, message: 'id must be a slug (lowercase letters, digits, hyphens)' };
   const parsed = parseFeedUrl(input.url);
   if (!parsed.ok) return { ok: false, message: parsed.message };
+  const playlistId = youtubePlaylistIdFromUrl(parsed.url);
+  // 自動生成プレイリスト (LR = ラジオ、RD = ミックス) は playlistItems が
+  // 0件を返して取り込めないため、保存時に弾く。巡回側の判定
+  // (youtubePlaylistIdFromUrl の抽出) には影響させない。
+  if (/^(?:LR|RD)/.test(playlistId)) {
+    return { ok: false, message: '自動生成プレイリスト（ラジオ／ミックス）は取得できないため登録できません' };
+  }
   const title = String(input.title === undefined || input.title === null ? '' : input.title).trim();
-  if (!title && !youtubeChannelIdFromUrl(parsed.url) && !youtubePlaylistIdFromUrl(parsed.url)) {
+  if (!title && !youtubeChannelIdFromUrl(parsed.url) && !playlistId) {
     return { ok: false, message: 'title is required' };
   }
   let category = '';
