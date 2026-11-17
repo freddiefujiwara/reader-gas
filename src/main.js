@@ -26,7 +26,8 @@
 // 既存シートの ID 付け替え (slug → ハッシュ) は完了済みで、現在の行はすべてハッシュ ID。
 // 有効/無効 (enabled) は廃止し、feeds タブの列自体も撤去した。
 // 巡回・一覧・保存のどこでも参照しない。
-// YouTube の保存形はチャンネルページ URL (/channel/UC...) に統一する。
+// YouTube の保存形はチャンネルページ URL (/channel/UC...) と
+// プレイリスト URL (/playlist?list=...) に統一する。
 // /@handle 形で登録されても保存時に正規形へ寄せる
 // (handleSaveFeed)。ハンドルは channels.list の forHandle で解決し、
 // タイトルも補完する。既存行の videos.xml 形は移行済みで、互換は持たない。
@@ -52,7 +53,7 @@ const SHARE_EXPIRES_AT_PROP = 'SHARE_EXPIRES_AT';
 const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SESSION_HEADERS = ['token_hash', 'issued_at', 'expires_at', 'revoked_at', 'access_count', 'last_accessed_at', 'role'];
 const FEEDS_HEADERS = ['id', 'title', 'url', 'category', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'];
-const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author', 'star_override'];
+const ARTICLES_HEADERS = ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author', 'star_override', 'duration_sec'];
 const RETENTION_DAYS = 60;
 const MAX_ARTICLES = 5000;
 const SUMMARY_MAX_CHARS = 500;
@@ -285,6 +286,24 @@ function youtubeChannelIdFromUrl(url) {
   return page ? page[1] : '';
 }
 
+// 保存形 (/playlist?list=...) からプレイリスト ID を抜く
+// (youtubeChannelIdFromUrl と対になる判定関数)。巡回振り分け・?rss=
+// 出力・buildFetchUrl・タイトル空の例外判定・スター計算はすべて
+// この関数経由で判定する。登録時の入力 (余分なクエリ付き) からも
+// 抜けるよう、list= はクエリのどこにあっても拾う。
+function youtubePlaylistIdFromUrl(url) {
+  const s = String(url || '');
+  if (!/^https:\/\/(?:www\.)?youtube\.com\/playlist\?/.test(s)) return '';
+  const m = /[?&]list=([\w-]{6,})/.exec(s.split('#')[0]);
+  return m ? m[1] : '';
+}
+
+// シートに保存する正規形のプレイリストフィード URL をプレイリスト ID
+// から組み立てる (youtubeFeedUrlFromChannelId と対)。
+function youtubeFeedUrlFromPlaylistId(playlistId) {
+  return 'https://www.youtube.com/playlist?list=' + String(playlistId || '');
+}
+
 // シートに保存する正規形の YouTube フィード URL (チャンネルページ URL) を
 // チャンネルIDから組み立てる。フィードID (URL のハッシュ) はこの形から
 // 決めるため、登録経路が違っても保存形は必ずこれに寄せる。
@@ -364,9 +383,76 @@ function parseYouTubePlaylistItems(jsonText, feed) {
   return entries;
 }
 
+// playlistItems の応答から nextPageToken を取り出す (プレイリスト
+// フィードのページング用)。無ければ・壊れていれば空文字。
+function parseYouTubeNextPageToken(jsonText) {
+  try {
+    const data = JSON.parse(String(jsonText || ''));
+    return data && data.nextPageToken ? String(data.nextPageToken) : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// ISO 8601 duration (YouTube の contentDetails.duration 形式:
+// PT1H2M3S / PT45S / P1DT2H 等) を秒へ変換する (純関数)。
+// 読めなければ 0 (= 長さ不明)。
+function iso8601DurationToSec(text) {
+  const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(String(text || '').trim());
+  if (!m) return 0;
+  return (Number(m[1]) || 0) * 86400 + (Number(m[2]) || 0) * 3600
+    + (Number(m[3]) || 0) * 60 + (Number(m[4]) || 0);
+}
+
+// videos.list (part=contentDetails) の応答から { videoId: 秒 } を
+// 取り出す (純関数)。長さが読めない動画は含めない (= 不明のまま)。
+function parseYouTubeDurations(jsonText) {
+  const map = {};
+  jsonItems(jsonText).forEach((item) => {
+    const videoId = String((item && item.id) || '');
+    const sec = iso8601DurationToSec(item && item.contentDetails ? item.contentDetails.duration : '');
+    if (videoId && sec > 0) map[videoId] = sec;
+  });
+  return map;
+}
+
+// チャンネル取り込みのエントリへ動画の長さを videos.list で補う
+// (スター判定で90秒未満を除くため)。取得は候補をまとめて1回
+// (最大50本)。失敗しても例外を出さず、長さは不明のままにする
+// (fail-open: 判定側は不明を通常どおり数える)。
+function attachYouTubeDurations(entries, apiKey) {
+  try {
+    const ids = [];
+    (entries || []).forEach((entry) => {
+      if (entry && entry.guid) ids.push(entry.guid);
+    });
+    if (!ids.length || !apiKey) return;
+    const apiUrl = 'https://www.googleapis.com/youtube/v3/videos?part=contentDetails'
+      + '&id=' + encodeURIComponent(ids.slice(0, 50).join(','))
+      + '&key=' + encodeURIComponent(apiKey);
+    const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return;
+    const durations = parseYouTubeDurations(res.getContentText());
+    (entries || []).forEach((entry) => {
+      if (entry && durations[entry.guid]) entry.durationSec = durations[entry.guid];
+    });
+  } catch (e) {
+    // 長さが補えなくても取り込みは続ける (fail-open)。
+  }
+}
+
 // channels.list の応答からチャンネル名を取り出す。タイトル未設定の
 // YouTube フィード (登録時に空で入る) の補完に使う。取れなければ空文字。
 function parseYouTubeChannelTitle(jsonText) {
+  const items = jsonItems(jsonText);
+  const sn = (items[0] && items[0].snippet) || {};
+  return String(sn.title || '').trim();
+}
+
+// playlists.list の応答からプレイリスト名を取り出す
+// (parseYouTubeChannelTitle と対)。タイトル未設定のプレイリスト
+// フィードの補完に使う。取れなければ空文字。
+function parseYouTubePlaylistTitle(jsonText) {
   const items = jsonItems(jsonText);
   const sn = (items[0] && items[0].snippet) || {};
   return String(sn.title || '').trim();
@@ -699,6 +785,12 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken, starredVideoIds)
   const f = feed || {};
   const title = String(f.title || '');
   const channelId = youtubeChannelIdFromUrl(f.url);
+  const playlistId = youtubePlaylistIdFromUrl(f.url);
+  // チャンネルのリンクはフィード自身のページ (チャンネルページ or
+  // プレイリストページ) を指す。
+  const feedPageUrl = playlistId
+    ? youtubeFeedUrlFromPlaylistId(playlistId)
+    : 'https://www.youtube.com/channel/' + channelId;
   const sorted = (articleRows || []).slice()
     .sort((a, b) => articleTimeMs(b.published_at, b.fetched_at) - articleTimeMs(a.published_at, a.fetched_at))
     .slice(0, RSS_MAX_ITEMS);
@@ -707,7 +799,7 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken, starredVideoIds)
     '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">',
     '  <channel>',
     '    <title>' + escapeXml(title) + '</title>',
-    '    <link>' + escapeXml('https://www.youtube.com/channel/' + channelId) + '</link>',
+    '    <link>' + escapeXml(feedPageUrl) + '</link>',
     '    <description>' + escapeXml(title) + '</description>',
   ];
   sorted.forEach((a) => {
@@ -986,24 +1078,60 @@ function updateFeedRow(sheet, headers, rowNum, patch) {
 }
 
 // 正規化済みエントリを articles へ未登録分だけ追加し、追加件数を返す。
-function appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt) {
+// durationColIdx (>= 0) が渡されたら、エントリの長さ (durationSec) を
+// その列へ一緒に書く (列の位置はヘッダー名から決めるため、既存シートの
+// 列構成に依存しない)。長さ不明のエントリは空のまま。
+function appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt, durationColIdx) {
   let added = 0;
   (entries || []).forEach((entry) => {
     const id = articleId(feed.id, entry.guid || entry.link);
     if (existingIds[id]) return;
     existingIds[id] = true;
-    articlesSheet.appendRow([id, feed.id, entry.title, entry.link, entry.publishedAt, fetchedAt, entry.summary, entry.author]);
+    const row = [id, feed.id, entry.title, entry.link, entry.publishedAt, fetchedAt, entry.summary, entry.author];
+    if (typeof durationColIdx === 'number' && durationColIdx >= row.length) {
+      while (row.length < durationColIdx) row.push('');
+      row.push(entry.durationSec > 0 ? entry.durationSec : '');
+    }
+    articlesSheet.appendRow(row);
     added++;
   });
   return added;
+}
+
+// 既存の記事行のうち長さ (duration_sec) が空のものへ、今回取得した
+// 長さを埋め戻す。取り込みは既存記事を再追加しないため、これが無いと
+// 機能追加前に取り込んだ動画の長さが永久に不明のままになる。
+// durationColIdx は列位置 (0始まり)。対象が無ければ何もしない。
+function backfillArticleDurations(articlesSheet, feed, entries, durationColIdx) {
+  if (typeof durationColIdx !== 'number' || durationColIdx < 0) return;
+  const wanted = {};
+  (entries || []).forEach((entry) => {
+    if (entry && entry.guid && entry.durationSec > 0) {
+      wanted[articleId(feed.id, entry.guid)] = entry.durationSec;
+    }
+  });
+  if (!Object.keys(wanted).length) return;
+  const values = articlesSheet.getDataRange().getValues();
+  if (!values.length) return;
+  const idIdx = values[0].indexOf('id');
+  if (idIdx < 0) return;
+  for (let i = 1; i < values.length; i++) {
+    const sec = wanted[String(values[i][idIdx])];
+    if (sec && !(Number(values[i][durationColIdx]) > 0)) {
+      articlesSheet.getRange(i + 1, durationColIdx + 1).setValue(sec);
+    }
+  }
 }
 
 // サーバー側で巡回する対象を選ぶ。v2 では RSS フィードの巡回は
 // クライアント側で行うため、対象は YouTube フィードだけになる。
 // 非 YouTube フィードは行の更新も含めて一切触らない。
 // 有効/無効の概念は廃止したため、対象は YouTube フィードかどうかだけで決まる。
+// YouTube フィードにはチャンネル (保存形 /channel/UC...) とプレイリスト
+// (保存形 /playlist?list=...) の2種がある。
 function selectFetchTargets(feeds) {
-  return (feeds || []).filter((f) => f && f.id && f.url && youtubeChannelIdFromUrl(f.url));
+  return (feeds || []).filter((f) => f && f.id && f.url
+    && (youtubeChannelIdFromUrl(f.url) || youtubePlaylistIdFromUrl(f.url)));
 }
 
 // --- YouTube 音声抽出トリガー (自宅サーバー連携) ---
@@ -1012,36 +1140,38 @@ function selectFetchTargets(feeds) {
 // 自宅サーバーのバッチが音声ストリーム
 // URL を抽出して audio-urls.json として公開する (非同期)。
 // ?rss= はその JSON の新鮮なエントリを enclosure として配信する。
-// 発火対象は各 YouTube フィードの「公開から30日以内」の動画のうち
-// 最新3本で、新着かどうかは問わない (自宅サーバー側が抽出済みのものは
-// 重複排除するため、毎時叩き直しても安い)。更新の止まった
-// チャンネルは最新動画でも30日を超えていれば何も発火しない。
-// 例外は2種類ある:
-// - YT_AUDIO_ALWAYS_CHANNEL_ID のチャンネルは、30日制限も最新3本の
-//   上限も付けず、取得できた動画を毎時すべて依頼し直して常時再生
-//   可能な状態を保つ (下の定数のコメント参照)。
-// - ジャンルが「音楽」 (YT_AUDIO_TRIGGER_MUSIC_CATEGORY) のフィードは、
-//   30日制限を付けず、新しい順に最新20本までを対象にする。音楽は
-//   更新頻度が低くても過去分を再生したいため (本人の決定)。
-//   20本は YouTube の1回の取得上限 (最新20本) と揃えた値。
+// 発火対象は各 YouTube フィードの新しい順3本で、期間制限は無く、
+// 新着かどうかも問わない (自宅サーバー側が抽出済みのものは重複排除
+// するため、毎時叩き直しても安い)。ただし長さが90秒未満と分かって
+// いる動画は数えない (Shorts・短尺クリップ対策。本人の決定)。
+// 長さは取り込み時に videos.list で補って記事行へ保存しておき、
+// 長さ不明の動画は fail-open で通常どおり数える。
+// ジャンルによる特別扱いはしない (旧来のジャンル「音楽」の特別
+// ルールは廃止した。本人の決定。過去分を広く再生したい用途は、
+// 下記のプレイリストフィードでカバーする)。
+// 例外は「全件クラス」の2種類で、最新3本の上限も90秒未満の除外も付けない:
+// - YT_AUDIO_ALWAYS_CHANNEL_ID のチャンネルは、取得できた動画を
+//   毎時すべて依頼し直して常時再生可能な状態を保つ (下の定数の
+//   コメント参照)。
+// - プレイリストフィードは、本人が手で選んだ動画の集まりなので、
+//   取り込んだ記事すべてを対象にする (本人の決定)。
 // 失敗しても巡回自体は失敗にしない (fire-and-forget)。
 // スター制の導入後は、この選定規則は「デフォルトのスター判定」と
 // して computeStarredArticleIds / planStarredAudioTriggers から
 // 使われ、実際の発火対象は実効スターの付いた動画だけになる。
 
 const YT_AUDIO_TRIGGER_PER_FEED = 3;
-// 音楽ジャンルの特別扱い: このジャンルのフィードだけ、期間の縛りを
-// 外して新しい順に YT_AUDIO_TRIGGER_MUSIC_PER_FEED 本まで選ぶ。
-const YT_AUDIO_TRIGGER_MUSIC_CATEGORY = '音楽';
-const YT_AUDIO_TRIGGER_MUSIC_PER_FEED = 20;
-// 全体キャップ。計画合計は実測で143本 (通常フィード分 + 音楽フィード
-// の20本枠×4フィード分 + 常時対応分) まで増えており、100では後順位の
-// フィード (しほ・けこり等) が毎回締め出されていたため、余裕を持たせて
-// 200とする。200を超える場合はフィード順の先頭から打ち切るが、手動
-// スターは計画側 (planStarredAudioTriggers) で先頭に寄せるため、
-// 上限では落ちない。
+// 全体キャップ。計画合計は通常フィード分 (3本/フィード) + 全件
+// クラス分 (常時対応チャンネルとプレイリスト) で増えうるため、
+// 余裕を持たせて200とする (旧上限の100では合計が超過し、フィード
+// 順の後ろのフィードが毎回締め出されていた)。200を超える場合は
+// フィード順の先頭から打ち切るが、手動スターは計画側
+// (planStarredAudioTriggers) で先頭に寄せるため、上限では落ちない。
 const YT_AUDIO_TRIGGER_MAX_PER_RUN = 200;
-const YT_AUDIO_TRIGGER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+// 通常クラスで「短尺」として数えない長さの下限 (秒)。長さがこの値
+// 未満と分かっている動画は最新3本の枠に入れない。ちょうどこの値の
+// 動画は対象 (未満だけを除く)。
+const YT_AUDIO_TRIGGER_MIN_DURATION_SEC = 90;
 // 常時対応チャンネル (本人のチャンネル「藤原史和 川口を歩くQAエンジニア」)。
 // reader-gas が毎時、このチャンネルの動画をすべて yt-audio のキューへ
 // 入れ直し、自宅サーバー側のバッチは URL が4時間を超えたエントリを
@@ -1050,24 +1180,28 @@ const YT_AUDIO_TRIGGER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // 常に新鮮な enclosure が付く (= 常に再生可能)。自宅サーバー側の変更は不要。
 const YT_AUDIO_ALWAYS_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
 
-// 発火対象を選ぶ純関数: フィードごとに、まず公開日時が読めて
-// 30日以内 (ちょうど30日前を含む) の動画だけに絞り、その中で
-// 新しい順に最大 YT_AUDIO_TRIGGER_PER_FEED 本を選び、動画IDで
-// 重複を除いて並べる。公開日時が読めない動画は安全側で対象外。
-// 例外は2種類:
-// - 常時対応チャンネル (YT_AUDIO_ALWAYS_CHANNEL_ID) のフィードは、
-//   公開日時や件数に関係なく、動画IDのある全件を選ぶ
-//   (公開日時が読めない動画も対象。常時再生可能を保つため)。
-// - 音楽ジャンル (YT_AUDIO_TRIGGER_MUSIC_CATEGORY) のフィードは、
-//   期間では絞らず (公開日時が読めない動画は最も古いものとして
-//   並べる)、新しい順に最大 YT_AUDIO_TRIGGER_MUSIC_PER_FEED 本を選ぶ。
+// 発火対象を選ぶ純関数: フィードごとに、公開日時が読める動画を
+// 新しい順に並べ、長さが YT_AUDIO_TRIGGER_MIN_DURATION_SEC 未満と
+// 分かっている動画を数えずに (枠を消費せず次の動画へ進む)、最大
+// YT_AUDIO_TRIGGER_PER_FEED 本を選び、動画IDで重複を除いて並べる。
+// 期間制限は無い。公開日時が読めない動画は安全側で対象外。
+// 長さ不明 (durationSec が 0 以下・欠落) の動画は fail-open で
+// 通常どおり数える (長さを補う取得に失敗した回でも、通常の
+// 新しい順3本に倒れる)。
+// ジャンルによる特別扱いはしない (音楽ジャンルの特別ルールは廃止)。
+// 例外は「全件クラス」の2種類で、どちらも公開日時や件数・長さに
+// 関係なく動画IDのある全件を選ぶ (公開日時が読めない動画も対象):
+// - 常時対応チャンネル (YT_AUDIO_ALWAYS_CHANNEL_ID) のフィード
+//   (常時再生可能を保つため)。
+// - プレイリストフィード (playlist フラグ。本人が手で選んだ動画
+//   の集まりのため。手で選んだものを長さで落とさない)。
 // 上限件数の適用は発火側 (fireYouTubeAudioTriggers) で行う。
-// nowMs はテスト用の差し込み口 (省略時は現在時刻)。
+// nowMs は呼び出し側の互換のため残す (期間制限の廃止後は未使用)。
 // feedVideos はフィードごとの { videoId, publishedAt, channelId,
-// category } の配列の配列 (channelId は常時対応チャンネルの判定用、
-// category は音楽ジャンルの判定用)。
+// playlist, durationSec } の配列の配列 (channelId は常時対応
+// チャンネルの判定用、playlist はプレイリストフィードの印、
+// durationSec は動画の長さ (秒)。0以下・欠落は不明)。
 function planYouTubeAudioTriggers(feedVideos, nowMs) {
-  const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const seen = {};
   const ids = [];
   const push = (v) => {
@@ -1078,27 +1212,31 @@ function planYouTubeAudioTriggers(feedVideos, nowMs) {
   };
   (feedVideos || []).forEach((videos) => {
     const list = videos || [];
-    if (list.some((v) => v && v.channelId === YT_AUDIO_ALWAYS_CHANNEL_ID)) {
-      // 常時対応チャンネル: 取得できた順 (新しい順) に全件を選ぶ。
+    if (list.some((v) => v && (v.channelId === YT_AUDIO_ALWAYS_CHANNEL_ID || v.playlist))) {
+      // 全件クラス: 取得できた順 (新しい順) に全件を選ぶ。
       list.forEach(push);
       return;
     }
-    const isMusic = list.some((v) => v && v.category === YT_AUDIO_TRIGGER_MUSIC_CATEGORY);
     const candidates = list.filter((v) => {
       // 動画IDの無いものは件数上限の枠も使わないよう、最初に除く。
       if (!v || !String(v.videoId || '')) return false;
-      // 音楽ジャンルは期間の縛りなし (30日より古い動画も対象)。
-      if (isMusic) return true;
       const ts = Date.parse(v.publishedAt || '');
-      return !isNaN(ts) && now - ts <= YT_AUDIO_TRIGGER_MAX_AGE_MS;
+      return !isNaN(ts);
     });
     const sorted = candidates.slice().sort((a, b) => {
       const tb = Date.parse((b && b.publishedAt) || '') || 0;
       const ta = Date.parse((a && a.publishedAt) || '') || 0;
       return tb - ta;
     });
-    const perFeed = isMusic ? YT_AUDIO_TRIGGER_MUSIC_PER_FEED : YT_AUDIO_TRIGGER_PER_FEED;
-    sorted.slice(0, perFeed).forEach(push);
+    let picked = 0;
+    for (const v of sorted) {
+      if (picked >= YT_AUDIO_TRIGGER_PER_FEED) break;
+      const sec = Number(v.durationSec) || 0;
+      // 短尺と分かっている動画は数えない (枠を消費しない)。
+      if (sec > 0 && sec < YT_AUDIO_TRIGGER_MIN_DURATION_SEC) continue;
+      push(v);
+      picked += 1;
+    }
   });
   return ids;
 }
@@ -1118,18 +1256,19 @@ function starOverrideOf(article) {
 }
 
 // デフォルト評価の材料をフィード単位にまとめる (内部ヘルパー)。
-// 対象は YouTube フィードの記事だけで、フィードの並び (シートの
-// 行順) と記事の並び (シートの行順) を保つ。
+// 対象は YouTube フィード (チャンネル・プレイリスト) の記事だけで、
+// フィードの並び (シートの行順) と記事の並び (シートの行順) を保つ。
 function groupStarCandidates(feeds, articles) {
   const order = [];
   const byFeedId = {};
   (feeds || []).forEach((f) => {
     if (!f || !f.id) return;
     const channelId = youtubeChannelIdFromUrl(f.url);
-    if (!channelId) return;
+    const playlistId = youtubePlaylistIdFromUrl(f.url);
+    if (!channelId && !playlistId) return;
     const key = String(f.id);
     if (byFeedId[key]) return;
-    byFeedId[key] = { feed: f, channelId, videos: [], infos: [] };
+    byFeedId[key] = { feed: f, channelId, playlistId, videos: [], infos: [] };
     order.push(key);
   });
   (articles || []).forEach((a) => {
@@ -1142,7 +1281,9 @@ function groupStarCandidates(feeds, articles) {
       videoId,
       publishedAt,
       channelId: group.channelId,
-      category: String(group.feed.category || ''),
+      playlist: !!group.playlistId,
+      // 記事行に保存した動画の長さ (秒)。空・不正は 0 = 不明。
+      durationSec: Number(a.duration_sec) || 0,
     });
     group.infos.push({
       articleId: String(a.id || ''),
@@ -1470,6 +1611,98 @@ function lookupYouTubeChannelTitle(channelId, apiKey) {
   }
 }
 
+// playlists.list でプレイリスト名を引く (lookupYouTubeChannelTitle
+// と対。タイトル未設定のプレイリストフィードの補完用)。取れなければ
+// 空文字で、失敗は例外にしない。
+function lookupYouTubePlaylistTitle(playlistId, apiKey) {
+  try {
+    const apiUrl = 'https://www.googleapis.com/youtube/v3/playlists?part=snippet'
+      + '&id=' + encodeURIComponent(playlistId)
+      + '&key=' + encodeURIComponent(apiKey);
+    const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return '';
+    return parseYouTubePlaylistTitle(res.getContentText());
+  } catch (e) {
+    return '';
+  }
+}
+
+// --- プレイリストフィードの取り込みと削除同期 ---
+// プレイリストフィードは「プレイリストが正」: 巡回で取り込むだけで
+// なく、プレイリストから外れた動画の記事は削除する (購読同期と
+// 同じ思想)。安全策も購読同期に倣う:
+// - 全ページの取得が成功し、取得できた動画が1件以上あるときだけ
+//   削除を検討する。取得失敗 (例外) は呼び出し側で巡回エラーとして
+//   扱われ、その回は削除しない。取得0件は「プレイリストが空」と
+//   「取得異常 (非公開化など)」を区別できないため削除しない。
+// - 削除候補が1回の上限 (YT_PLAYLIST_SYNC_MAX_DELETES) を超えたら
+//   削除だけを中止し、警告ログを残す (追加は行う)。
+
+// プレイリスト1件の取り込み上限: 50件 × 最大2ページ = 100件。
+const YT_PLAYLIST_FETCH_MAX_PAGES = 2;
+// 1回の巡回でプレイリスト同期として削除する件数の上限。
+const YT_PLAYLIST_SYNC_MAX_DELETES = 20;
+
+// 削除同期の計画 (純関数)。existingArticles はそのフィードの既存
+// 記事行 (id / link を持つ行オブジェクト)、fetchedVideoIds は今回の
+// 取得で得た動画ID。取得集合に無い既存記事が削除候補で、上限を
+// 超えたら blocked を立てて deleteIds は空にする (削除しない)。
+// 取得集合が空なら (0件取得) 削除は検討しない。
+function planPlaylistArticleDeletions(existingArticles, fetchedVideoIds) {
+  const fetched = {};
+  (fetchedVideoIds || []).forEach((id) => {
+    const videoId = String(id || '');
+    if (videoId) fetched[videoId] = true;
+  });
+  if (!Object.keys(fetched).length) return { deleteIds: [], blocked: false, candidates: 0 };
+  const deleteIds = [];
+  (existingArticles || []).forEach((a) => {
+    if (!a || !a.id) return;
+    const videoId = videoIdFromLink(a.link);
+    if (videoId && !fetched[videoId]) deleteIds.push(String(a.id));
+  });
+  if (deleteIds.length > YT_PLAYLIST_SYNC_MAX_DELETES) {
+    return { deleteIds: [], blocked: true, candidates: deleteIds.length };
+  }
+  return { deleteIds, blocked: false, candidates: deleteIds.length };
+}
+
+// プレイリストフィード1件の取り込み (記事の追加＋削除同期) を行い、
+// 追加件数を返す。取得の HTTP エラーは例外として呼び出し側
+// (fetchFeeds の巡回エラー処理) へ伝える。
+// existingArticleRows は巡回開始時点の articles 全行 (削除候補の
+// 母集団。今回の追加分は取得集合に含まれるため候補にならない)。
+function fetchYouTubePlaylistFeed(ss, articlesSheet, feed, playlistId, apiKey, existingIds, existingArticleRows, fetchedAt, durationColIdx) {
+  const entries = [];
+  let pageToken = '';
+  for (let page = 0; page < YT_PLAYLIST_FETCH_MAX_PAGES; page++) {
+    const apiUrl = 'https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&maxResults=50'
+      + '&playlistId=' + encodeURIComponent(playlistId)
+      + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '')
+      + '&key=' + encodeURIComponent(apiKey);
+    const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
+    const code = res.getResponseCode();
+    if (code !== 200) throw new Error('YouTube API HTTP ' + code + youtubeApiErrorDetail(res.getContentText()));
+    const bodyText = res.getContentText();
+    parseYouTubePlaylistItems(bodyText, feed).forEach((entry) => { entries.push(entry); });
+    pageToken = parseYouTubeNextPageToken(bodyText);
+    if (!pageToken) break;
+  }
+  const added = appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt, durationColIdx);
+  // 削除同期: ここまで例外なく来た = 全ページの取得が成功している。
+  const ownArticles = (existingArticleRows || []).filter((a) => String(a.feed_id) === String(feed.id));
+  const plan = planPlaylistArticleDeletions(ownArticles, entries.map((e) => e.guid));
+  if (plan.blocked) {
+    console.log('youtube-playlist-sync: deletes skipped for feed ' + feed.id + ': '
+      + plan.candidates + ' candidates exceed the cap of ' + YT_PLAYLIST_SYNC_MAX_DELETES);
+  } else if (plan.deleteIds.length) {
+    deleteRowsById(ss, 'articles', 'id', plan.deleteIds);
+    // 消えた記事が RSS キャッシュから出続けないように落とす。
+    invalidateRssCache(feed.id);
+  }
+  return added;
+}
+
 // fireTrigger はテスト用の差し込み口 (音声抽出トリガー用)。
 // 時間ベーストリガーからは引数なし (実際はイベントオブジェクト) で呼ばれる。
 function fetchFeeds(fireTrigger) {
@@ -1496,8 +1729,19 @@ function fetchFeeds(fireTrigger) {
     if (id) rowNumById[id] = i + 1;
   }
   const youtubeFeeds = selectFetchTargets(feeds);
+  const existingArticleRows = readSheetAsObjects(ss, 'articles');
   const existingIds = {};
-  readSheetAsObjects(ss, 'articles').forEach((a) => { existingIds[a.id] = true; });
+  existingArticleRows.forEach((a) => { existingIds[a.id] = true; });
+  // duration_sec 列 (動画の長さ。スター判定で90秒未満を除く材料) の
+  // 位置を決める。既存シートに無ければ遅延追加する (star_override と
+  // 同じ移行パターン)。
+  const articleValuesForDuration = articlesSheet.getDataRange().getValues();
+  const articleHeaders = articleValuesForDuration.length ? articleValuesForDuration[0] : ARTICLES_HEADERS;
+  let durationColIdx = articleHeaders.indexOf('duration_sec');
+  if (durationColIdx < 0) {
+    durationColIdx = articleHeaders.length;
+    articlesSheet.getRange(1, durationColIdx + 1).setValue('duration_sec');
+  }
   const fetchedAt = new Date().toISOString();
   let addedTotal = 0;
   // YouTube フィードは公式APIから取り込む (RSS は 404 のため)。
@@ -1506,25 +1750,42 @@ function fetchFeeds(fireTrigger) {
     const rowNum = rowNumById[feed.id];
     try {
       if (!youtubeApiKey) throw new Error('YOUTUBE_API_KEY is not set');
-      // タイトル未設定なら channels.list でチャンネル名を補完する
-      // (YouTube フィードは登録時にタイトルを自動取得できないため空で入る)。
+      const channelId = youtubeChannelIdFromUrl(feed.url);
+      const playlistId = youtubePlaylistIdFromUrl(feed.url);
+      // タイトル未設定なら API で名前を補完する (YouTube フィードは
+      // 登録時にタイトルを自動取得できないため空で入る。チャンネルは
+      // channels.list、プレイリストは playlists.list で引く)。
       // 補完の失敗は巡回自体の失敗にせず、タイトルは空のまま続ける。
       if (!String(feed.title || '').trim()) {
-        const channelTitle = lookupYouTubeChannelTitle(youtubeChannelIdFromUrl(feed.url), youtubeApiKey);
-        if (channelTitle) {
-          updateFeedRow(feedsSheet, headers, rowNum, { title: channelTitle });
-          feed.title = channelTitle;
+        const foundTitle = channelId
+          ? lookupYouTubeChannelTitle(channelId, youtubeApiKey)
+          : lookupYouTubePlaylistTitle(playlistId, youtubeApiKey);
+        if (foundTitle) {
+          updateFeedRow(feedsSheet, headers, rowNum, { title: foundTitle });
+          feed.title = foundTitle;
         }
       }
-      const playlistId = youtubeUploadsPlaylistId(youtubeChannelIdFromUrl(feed.url));
-      const apiUrl = 'https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=20'
-        + '&playlistId=' + encodeURIComponent(playlistId)
-        + '&key=' + encodeURIComponent(youtubeApiKey);
-      const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
-      const code = res.getResponseCode();
-      if (code !== 200) throw new Error('YouTube API HTTP ' + code + youtubeApiErrorDetail(res.getContentText()));
-      const entries = parseYouTubePlaylistItems(res.getContentText(), feed);
-      addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt);
+      if (channelId) {
+        const uploadsId = youtubeUploadsPlaylistId(channelId);
+        const apiUrl = 'https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=20'
+          + '&playlistId=' + encodeURIComponent(uploadsId)
+          + '&key=' + encodeURIComponent(youtubeApiKey);
+        const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
+        const code = res.getResponseCode();
+        if (code !== 200) throw new Error('YouTube API HTTP ' + code + youtubeApiErrorDetail(res.getContentText()));
+        const entries = parseYouTubePlaylistItems(res.getContentText(), feed);
+        // 候補動画の長さを videos.list で補う (90秒未満の除外判定用)。
+        // 失敗時は長さ不明のまま取り込む (fail-open)。
+        attachYouTubeDurations(entries, youtubeApiKey);
+        addedTotal += appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt, durationColIdx);
+        // 既存記事 (再追加されない) の長さも埋め戻す。
+        backfillArticleDurations(articlesSheet, feed, entries, durationColIdx);
+      } else {
+        // プレイリストフィード: 取り込み＋削除同期 (プレイリストが正)。
+        addedTotal += fetchYouTubePlaylistFeed(
+          ss, articlesSheet, feed, playlistId, youtubeApiKey, existingIds, existingArticleRows, fetchedAt, durationColIdx
+        );
+      }
       updateFeedRow(feedsSheet, headers, rowNum, { last_fetched_at: fetchedAt, last_status: '200', last_error: '' });
     } catch (err) {
       updateFeedRow(feedsSheet, headers, rowNum, {
@@ -1667,7 +1928,9 @@ function validateFeedInput(input) {
   const parsed = parseFeedUrl(input.url);
   if (!parsed.ok) return { ok: false, message: parsed.message };
   const title = String(input.title === undefined || input.title === null ? '' : input.title).trim();
-  if (!title && !youtubeChannelIdFromUrl(parsed.url)) return { ok: false, message: 'title is required' };
+  if (!title && !youtubeChannelIdFromUrl(parsed.url) && !youtubePlaylistIdFromUrl(parsed.url)) {
+    return { ok: false, message: 'title is required' };
+  }
   let category = '';
   if (input.category !== undefined && input.category !== null) {
     if (typeof input.category !== 'string') return { ok: false, message: 'category must be a string' };
@@ -1715,14 +1978,15 @@ function getServiceUrl() {
   try { return String(ScriptApp.getService().getUrl() || ''); } catch (e) { return ''; }
 }
 
-// クライアントが実際に取得する URL。YouTube フィードは reader-gas の RSS
-// 出力 (?rss=<feedId>) を指し、それ以外はフィードの URL そのまま。
+// クライアントが実際に取得する URL。YouTube フィード (チャンネル・
+// プレイリスト) は reader-gas の RSS 出力 (?rss=<feedId>) を指し、
+// それ以外はフィードの URL そのまま。
 function buildFetchUrl(feed, serviceUrl) {
   const f = feed || {};
   const url = String(f.url || '');
   const id = String(f.id || '');
   const base = String(serviceUrl || '');
-  if (id && base && youtubeChannelIdFromUrl(url)) {
+  if (id && base && (youtubeChannelIdFromUrl(url) || youtubePlaylistIdFromUrl(url))) {
     return base + '?rss=' + encodeURIComponent(id);
   }
   return url;
@@ -1795,6 +2059,13 @@ function handleSaveFeed(body, resolveHandle) {
     }
     input.url = youtubeFeedUrlFromChannelId(channelId);
     if (resolvedTitle && !String(input.title || '').trim()) input.title = resolvedTitle;
+  }
+  // プレイリストの入力も保存形 (/playlist?list=...) へ寄せる
+  // (list= 以外のクエリは落とす)。保存形を一本化することで、
+  // 余分なクエリ付きで再登録しても重複判定が同じ行に当たる。
+  if (input && !channelRef) {
+    const playlistId = youtubePlaylistIdFromUrl(input.url);
+    if (playlistId) input.url = youtubeFeedUrlFromPlaylistId(playlistId);
   }
   const result = validateFeedInput(input);
   if (!result.ok) return { ok: false, error: 'invalid', message: result.message };
@@ -2223,7 +2494,7 @@ function doGet(e) {
     const ss = openDataSpreadsheet();
     const feeds = readSheetAsObjects(ss, 'feeds');
     const feed = feeds.filter((f) => String(f.id) === rssFeedId)[0] || null;
-    if (!feed || !youtubeChannelIdFromUrl(feed.url)) {
+    if (!feed || (!youtubeChannelIdFromUrl(feed.url) && !youtubePlaylistIdFromUrl(feed.url))) {
       return jsonOutput({ ok: false, error: 'feed_not_found' });
     }
     const allArticles = readSheetAsObjects(ss, 'articles');
@@ -2300,4 +2571,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
