@@ -1709,12 +1709,18 @@ function planPlaylistArticleDeletions(existingArticles, fetchedVideoIds) {
   return { deleteIds, blocked: false, candidates: deleteIds.length };
 }
 
-// プレイリストフィード1件の取り込み (記事の追加＋削除同期) を行い、
-// 追加件数を返す。取得の HTTP エラーは例外として呼び出し側
-// (fetchFeeds の巡回エラー処理) へ伝える。
+// プレイリストフィード1件の取り込み (記事の追加＋削除同期＋長さの
+// 保存) を行い、追加件数を返す。取得の HTTP エラーは例外として
+// 呼び出し側 (fetchFeeds の巡回エラー処理) へ伝える。
 // existingArticleRows は巡回開始時点の articles 全行 (削除候補の
 // 母集団。今回の追加分は取得集合に含まれるため候補にならない)。
 function fetchYouTubePlaylistFeed(ss, articlesSheet, feed, playlistId, apiKey, existingIds, existingArticleRows, fetchedAt, durationColIdx) {
+  // 既存記事の長さの有無 (長さ取得の対象を絞る材料)。記事IDは
+  // フィードIDから決まるため、このフィードの行だけが一致する。
+  const knownDurationById = {};
+  (existingArticleRows || []).forEach((a) => {
+    if (a && a.id) knownDurationById[String(a.id)] = Number(a.duration_sec) || 0;
+  });
   const entries = [];
   let pageToken = '';
   for (let page = 0; page < YT_PLAYLIST_FETCH_MAX_PAGES; page++) {
@@ -1726,11 +1732,22 @@ function fetchYouTubePlaylistFeed(ss, articlesSheet, feed, playlistId, apiKey, e
     const code = res.getResponseCode();
     if (code !== 200) throw new Error('YouTube API HTTP ' + code + youtubeApiErrorDetail(res.getContentText()));
     const bodyText = res.getContentText();
-    parseYouTubePlaylistItems(bodyText, feed).forEach((entry) => { entries.push(entry); });
+    const pageEntries = parseYouTubePlaylistItems(bodyText, feed);
+    // 動画の長さを videos.list で補う (チャンネル取り込みと対)。
+    // 単位数節約のため、対象は新規行と長さが空の既存行だけに絞り、
+    // ページ単位 (最大50件) でまとめて引く。失敗しても長さ不明の
+    // まま取り込みは続ける (fail-open)。
+    attachYouTubeDurations(pageEntries.filter((entry) => {
+      const id = articleId(feed.id, entry.guid);
+      return !existingIds[id] || !(knownDurationById[id] > 0);
+    }), apiKey);
+    pageEntries.forEach((entry) => { entries.push(entry); });
     pageToken = parseYouTubeNextPageToken(bodyText);
     if (!pageToken) break;
   }
   const added = appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt, durationColIdx);
+  // 既存記事 (再追加されない) の長さも埋め戻す (チャンネル側と対)。
+  backfillArticleDurations(articlesSheet, feed, entries, durationColIdx);
   // 削除同期: ここまで例外なく来た = 全ページの取得が成功している。
   const ownArticles = (existingArticleRows || []).filter((a) => String(a.feed_id) === String(feed.id));
   const plan = planPlaylistArticleDeletions(ownArticles, entries.map((e) => e.guid));
