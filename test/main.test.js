@@ -23,10 +23,15 @@ import {
   selectFetchTargets,
   youtubeChannelIdFromUrl,
   youtubeFeedUrlFromChannelId,
+  youtubePlaylistIdFromUrl,
+  youtubeFeedUrlFromPlaylistId,
   parseYouTubeChannelUrl,
   youtubeUploadsPlaylistId,
   parseYouTubePlaylistItems,
+  parseYouTubeNextPageToken,
   parseYouTubeChannelTitle,
+  parseYouTubePlaylistTitle,
+  parseYouTubeDurations,
   parseChannelLookupResponse,
   youtubeApiErrorDetail,
   parseAudioUrlsMap,
@@ -62,6 +67,7 @@ import {
   fetchMyYouTubeSubscriptions,
   planYouTubeSubscriptionSync,
   syncYouTubeSubscriptions,
+  planPlaylistArticleDeletions,
   fetchFeeds,
   issueSession,
   validateSession,
@@ -573,15 +579,100 @@ test('selectFetchTargets: YouTube フィードだけを巡回対象にする', (
   const feeds = [
     yt('yt-a'),
     yt('yt-b'),
+    // プレイリストフィードも巡回対象
+    { id: 'yt-pl', url: 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00' },
     { id: 'rss-on', url: 'https://example.com/feed.xml' },
     { id: 'priv-on', url: 'https://example.com/x.freddie.xml' },
     { id: '', url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A' },
     { id: 'yt-nourl', url: '' },
   ];
-  assert.deepEqual(selectFetchTargets(feeds).map((f) => f.id), ['yt-a', 'yt-b']);
+  assert.deepEqual(selectFetchTargets(feeds).map((f) => f.id), ['yt-a', 'yt-b', 'yt-pl']);
   assert.deepEqual(selectFetchTargets([]), []);
   assert.deepEqual(selectFetchTargets(null), []);
   assert.deepEqual(selectFetchTargets(undefined), []);
+});
+
+test('youtubePlaylistIdFromUrl: 保存形からプレイリスト ID を抜き、それ以外は空文字', () => {
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00'), 'PLxNfaRC6MbAnwSR1Dqqv69A00');
+  assert.equal(youtubePlaylistIdFromUrl('https://youtube.com/playlist?list=UUxNfaRC6MbAnwSR1Dqqv69A'), 'UUxNfaRC6MbAnwSR1Dqqv69A');
+  // 登録時の入力 (余分なクエリ付き・list= が先頭でない) からも抜ける
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?si=abc123&list=PLxNfaRC6MbAnwSR1Dqqv69A00'), 'PLxNfaRC6MbAnwSR1Dqqv69A00');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00&si=abc123'), 'PLxNfaRC6MbAnwSR1Dqqv69A00');
+  // チャンネル URL・watch URL・他サイト・list= 無しは対象外
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/watch?v=abc12345678&list=PLxNfaRC6MbAnwSR1Dqqv69A00'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://example.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list='), '');
+  // ID は10文字以上 (クライアント側の検証規則と一致)。短い特殊 ID
+  // (WL = 後で見る、LL = 高評価) や9文字以下は弾く
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=WL'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=LL'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=PL1234567'), '');
+  assert.equal(youtubePlaylistIdFromUrl('https://www.youtube.com/playlist?list=PL12345678'), 'PL12345678');
+  assert.equal(youtubePlaylistIdFromUrl(''), '');
+  assert.equal(youtubePlaylistIdFromUrl(null), '');
+  // 正規形の組み立て (youtubeFeedUrlFromChannelId と対)
+  assert.equal(youtubeFeedUrlFromPlaylistId('PLxNfaRC6MbAnwSR1Dqqv69A00'), 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00');
+});
+
+test('parseYouTubeNextPageToken / parseYouTubePlaylistTitle: 応答から抜き、壊れていれば空文字', () => {
+  assert.equal(parseYouTubeNextPageToken(JSON.stringify({ items: [], nextPageToken: 'tok2' })), 'tok2');
+  assert.equal(parseYouTubeNextPageToken(JSON.stringify({ items: [] })), '');
+  assert.equal(parseYouTubeNextPageToken('not json'), '');
+  assert.equal(parseYouTubeNextPageToken(''), '');
+  const json = JSON.stringify({ items: [{ snippet: { title: '  お気に入り曲  ' } }] });
+  assert.equal(parseYouTubePlaylistTitle(json), 'お気に入り曲');
+  assert.equal(parseYouTubePlaylistTitle(JSON.stringify({ items: [] })), '');
+  assert.equal(parseYouTubePlaylistTitle('not json'), '');
+});
+
+test('parseYouTubeDurations: videos.list 応答から { videoId: 秒 } を取り出す', () => {
+  const json = JSON.stringify({
+    items: [
+      { id: 'vidA', contentDetails: { duration: 'PT3M25S' } },
+      { id: 'vidB', contentDetails: { duration: 'PT45S' } },
+      { id: 'vidC', contentDetails: { duration: 'PT1H2M3S' } },
+      { id: 'vidD', contentDetails: { duration: 'P1DT1H0M10S' } },
+      { id: 'vidE', contentDetails: {} },
+      { id: 'vidF', contentDetails: { duration: 'PT0S' } },
+      { contentDetails: { duration: 'PT10M' } },
+    ],
+  });
+  // 読めない・0秒のものは含めない (= 長さ不明のまま fail-open 側に倒れる)
+  assert.deepEqual(parseYouTubeDurations(json), { vidA: 205, vidB: 45, vidC: 3723, vidD: 90010 });
+  assert.deepEqual(parseYouTubeDurations('not json'), {});
+  assert.deepEqual(parseYouTubeDurations(''), {});
+});
+
+test('planPlaylistArticleDeletions: 取得集合に無い既存記事だけを削除候補にする', () => {
+  const mk = (id, vid) => ({ id, link: 'https://www.youtube.com/watch?v=' + vid });
+  const existing = [mk('a1', 'vidKeep001'), mk('a2', 'vidGone001'), { id: 'a3', link: 'https://example.com/post' }];
+  const plan = planPlaylistArticleDeletions(existing, ['vidKeep001', 'vidNew0001']);
+  assert.equal(plan.blocked, false);
+  // a3 は YouTube 動画リンクでないため候補にしない
+  assert.deepEqual(plan.deleteIds, ['a2']);
+});
+
+test('planPlaylistArticleDeletions: 取得集合が空なら削除しない (安全策)', () => {
+  const existing = [{ id: 'a1', link: 'https://www.youtube.com/watch?v=vidKeep001' }];
+  assert.deepEqual(planPlaylistArticleDeletions(existing, []), { deleteIds: [], blocked: false, candidates: 0 });
+  assert.deepEqual(planPlaylistArticleDeletions(existing, null), { deleteIds: [], blocked: false, candidates: 0 });
+});
+
+test('planPlaylistArticleDeletions: 削除候補が上限 (20件) を超えたら削除自体を中止する', () => {
+  const existing = [];
+  for (let i = 1; i <= 21; i++) {
+    existing.push({ id: 'a' + i, link: 'https://www.youtube.com/watch?v=vidStale' + String(i).padStart(3, '0') });
+  }
+  const plan = planPlaylistArticleDeletions(existing, ['vidFresh001']);
+  assert.equal(plan.blocked, true);
+  assert.equal(plan.candidates, 21);
+  assert.deepEqual(plan.deleteIds, []);
+  // ちょうど上限なら削除する
+  const atCap = planPlaylistArticleDeletions(existing.slice(0, 20), ['vidFresh001']);
+  assert.equal(atCap.blocked, false);
+  assert.equal(atCap.deleteIds.length, 20);
 });
 
 test('youtubeUploadsPlaylistId: UC の先頭を UU に替える', () => {
@@ -674,6 +765,23 @@ test('buildRssXml: チャンネル情報とアイテムを RSS 2.0 で出す', (
   assert.ok(xml.indexOf('vidNew22222') < xml.indexOf('vidOld11111'));
 });
 
+test('buildRssXml: プレイリストフィードはチャンネルのリンクがプレイリストページになる', () => {
+  const feed = {
+    id: 'yt-pl',
+    title: 'お気に入り曲',
+    url: 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00',
+  };
+  const rows = [{
+    id: 'row-pl1', feed_id: 'yt-pl', title: '選んだ曲',
+    link: 'https://www.youtube.com/watch?v=vidPl111111',
+    published_at: '2026-11-14T01:00:00.000Z', fetched_at: '2026-11-14T02:00:00.000Z', summary: '', author: 'someone',
+  }];
+  const xml = buildRssXml(feed, rows);
+  assert.ok(xml.includes('<link>https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00</link>'));
+  assert.ok(xml.includes('<title>お気に入り曲</title>'));
+  assert.ok(xml.includes('<guid isPermaLink="false">vidPl111111</guid>'));
+});
+
 test('buildRssXml: 最大50件に絞る', () => {
   const rows = [];
   for (let i = 0; i < 55; i++) {
@@ -697,6 +805,9 @@ test('buildFetchUrl: YouTube は RSS 出力 URL、それ以外はフィード UR
   const base = 'https://script.google.com/macros/s/AKfycTEST/exec';
   const ytUrl = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
   assert.equal(buildFetchUrl({ id: 'yt-sample', url: ytUrl }, base), base + '?rss=yt-sample');
+  // プレイリストフィードも RSS 出力 URL を指す
+  const plUrl = 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00';
+  assert.equal(buildFetchUrl({ id: 'yt-pl', url: plUrl }, base), base + '?rss=yt-pl');
   assert.equal(buildFetchUrl({ id: 'zenn', url: 'https://zenn.dev/feed' }, base), 'https://zenn.dev/feed');
   // ベース URL が取れない環境ではフィード URL にフォールバックする
   assert.equal(buildFetchUrl({ id: 'yt-sample', url: ytUrl }, ''), ytUrl);
@@ -989,6 +1100,24 @@ test('doGet: ?rss= は対象フィードの記事だけを RSS で返す', () =>
     assert.ok(xml.includes('動画その1'));
     assert.ok(xml.includes('動画その2'));
     assert.ok(!xml.includes('別フィードの動画'));
+  } finally { restore(); }
+});
+
+test('doGet: ?rss= はプレイリストフィードの記事も RSS で返す', () => {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['yt-pl', 'お気に入り曲', 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00', '', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW,
+      ['rowpl1', 'yt-pl', '選んだ曲1', 'https://www.youtube.com/watch?v=vidPl111111', '2026-11-14T01:00:00.000Z', '2026-11-14T02:00:00.000Z', '概要', ''],
+    ],
+  });
+  const restore = installSpreadsheet(ss);
+  try {
+    const xml = doGet({ parameter: { rss: 'yt-pl' } }).getContent();
+    assert.ok(xml.startsWith('<?xml'));
+    assert.ok(xml.includes('選んだ曲1'));
+    assert.ok(xml.includes('<link>https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00</link>'));
   } finally { restore(); }
 });
 
@@ -1565,6 +1694,10 @@ test('validateFeedInput: YouTube 疑似フィードだけタイトル空を許�
   const yt = validateFeedInput({ title: '', url: ytUrl });
   assert.equal(yt.ok, true);
   assert.equal(yt.feed.title, '');
+  // プレイリストフィードもタイトル空を許可する (playlists.list で補完する)
+  const pl = validateFeedInput({ title: '', url: 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00' });
+  assert.equal(pl.ok, true);
+  assert.equal(pl.feed.title, '');
   // www 無し・タイトル未指定でも同じ
   const ytBare = validateFeedInput({ url: 'https://youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A' });
   assert.equal(ytBare.ok, true);
@@ -1682,6 +1815,30 @@ test('handleSaveFeed: YouTube はタイトル空で追加でき、通常フィ�
     const rss = handleSaveFeed({ feed: { url: 'https://example.com/feed' } });
     assert.equal(rss.ok, false);
     assert.equal(ss.sheets['feeds'].rows.length, 2);
+  } finally { restore(); }
+});
+
+test('handleSaveFeed: プレイリストはタイトル空で追加でき、保存形に寄せて ID を決める', () => {
+  const canonical = 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00';
+  const { ss, restore } = saveFeedEnv([]);
+  try {
+    // 余分なクエリ付きで登録しても保存形 (/playlist?list=...) に寄る
+    const res = handleSaveFeed({ feed: { url: canonical + '&si=sharetoken' } });
+    assert.equal(res.ok, true);
+    assert.equal(res.feed.title, '');
+    assert.equal(res.feed.url, canonical);
+    assert.equal(res.feed.id, feedIdFromUrl(canonical));
+    const rows = ss.sheets['feeds'].rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1][2], canonical);
+    // 巡回対象 (YouTube) になる
+    assert.deepEqual(selectFetchTargets([{ id: res.feed.id, url: canonical }]).map((f) => f.id), [res.feed.id]);
+    // 別形 (クエリ違い) で再登録しても同じ行の更新になる (冪等)
+    const again = handleSaveFeed({ feed: { url: 'https://www.youtube.com/playlist?si=x&list=PLxNfaRC6MbAnwSR1Dqqv69A00', title: 'お気に入り' } });
+    assert.equal(again.ok, true);
+    assert.equal(again.feed.id, res.feed.id);
+    assert.equal(ss.sheets['feeds'].rows.length, 2);
+    assert.equal(ss.sheets['feeds'].rows[1][1], 'お気に入り');
   } finally { restore(); }
 });
 
@@ -2514,20 +2671,47 @@ test('planYouTubeAudioTriggers: フィードごとに新しい順の最大3本�
   assert.deepEqual(planYouTubeAudioTriggers([null, []]), []);
 });
 
-test('planYouTubeAudioTriggers: 公開30日以内の動画だけが対象 (境界は含む)', () => {
+test('planYouTubeAudioTriggers: 期間制限は無く、古い動画も新しい順3本の対象になる', () => {
   const now = Date.parse('2026-11-15T12:00:00.000Z');
   const videos = [[
     { videoId: 'vidFresh001', publishedAt: '2026-11-15T00:00:00.000Z' },
-    // ちょうど30日前は対象に含む
     { videoId: 'vidEdge0001', publishedAt: '2026-10-16T12:00:00.000Z' },
-    // 30日を1ミリ秒でも超えたら対象外
     { videoId: 'vidStale001', publishedAt: '2026-10-16T11:59:59.999Z' },
     { videoId: 'vidOld00001', publishedAt: '2026-09-01T00:00:00.000Z' },
   ]];
-  assert.deepEqual(planYouTubeAudioTriggers(videos, now), ['vidFresh001', 'vidEdge0001']);
+  // 旧来の30日制限は廃止した。年齢に関係なく新しい順の3本だけ。
+  assert.deepEqual(planYouTubeAudioTriggers(videos, now), ['vidFresh001', 'vidEdge0001', 'vidStale001']);
 });
 
-test('planYouTubeAudioTriggers: 30日超の動画は最新3本の選定でも選ばない', () => {
+test('planYouTubeAudioTriggers: 90秒未満と分かっている動画は数えず、次の動画が繰り上がる', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const videos = [[
+    { videoId: 'vidShort001', publishedAt: '2026-11-15T00:00:00.000Z', durationSec: 45 },
+    { videoId: 'vidShort002', publishedAt: '2026-11-14T00:00:00.000Z', durationSec: 89 },
+    // ちょうど90秒は対象 (未満だけを除く)
+    { videoId: 'vidExact090', publishedAt: '2026-11-13T00:00:00.000Z', durationSec: 90 },
+    { videoId: 'vidLong0001', publishedAt: '2026-11-12T00:00:00.000Z', durationSec: 240 },
+    // 長さ不明は fail-open で通常どおり数える
+    { videoId: 'vidUnknown1', publishedAt: '2026-11-11T00:00:00.000Z' },
+    { videoId: 'vidLong0002', publishedAt: '2026-11-10T00:00:00.000Z', durationSec: 300 },
+  ]];
+  assert.deepEqual(planYouTubeAudioTriggers(videos, now), ['vidExact090', 'vidLong0001', 'vidUnknown1']);
+});
+
+test('planYouTubeAudioTriggers: 全件クラス (常時対応・プレイリスト) には90秒未満の除外を適用しない', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const own = [
+    { videoId: 'vidOwnShort', publishedAt: '2026-11-14T00:00:00.000Z', durationSec: 30, channelId: 'UCbiDZXbr391oT_vsRiqwPFg' },
+  ];
+  const playlist = [
+    { videoId: 'vidPlShort1', publishedAt: '2026-11-14T00:00:00.000Z', durationSec: 30, playlist: true },
+  ];
+  // 手で選んだものは長さで落とさない。
+  assert.deepEqual(planYouTubeAudioTriggers([own], now), ['vidOwnShort']);
+  assert.deepEqual(planYouTubeAudioTriggers([playlist], now), ['vidPlShort1']);
+});
+
+test('planYouTubeAudioTriggers: 新しい順3本だけを選ぶ (古い動画は順位で落ちる)', () => {
   const now = Date.parse('2026-11-15T00:00:00.000Z');
   // 12本中9本が30日以内、3本が30日超 → 30日以内の新しい順3本だけ
   const feed = [];
@@ -2541,13 +2725,13 @@ test('planYouTubeAudioTriggers: 30日超の動画は最新3本の選定でも選
   assert.deepEqual(plan, ['vidIn15', 'vidIn14', 'vidIn13']);
 });
 
-test('planYouTubeAudioTriggers: 更新の止まったチャンネル (全て30日超) は何も選ばない', () => {
+test('planYouTubeAudioTriggers: 更新の止まったチャンネルでも最新3本は選ぶ (期間制限なし)', () => {
   const now = Date.parse('2026-11-15T00:00:00.000Z');
   const staleFeed = [1, 2, 3].map((i) => ({
     videoId: 'vidStale00' + i,
     publishedAt: '2026-08-0' + i + 'T00:00:00.000Z',
   }));
-  assert.deepEqual(planYouTubeAudioTriggers([staleFeed], now), []);
+  assert.deepEqual(planYouTubeAudioTriggers([staleFeed], now), ['vidStale003', 'vidStale002', 'vidStale001']);
 });
 
 test('planYouTubeAudioTriggers: 公開日時が読めない動画は対象外', () => {
@@ -2583,7 +2767,7 @@ test('planYouTubeAudioTriggers: 常時対応チャンネルは30日超・3本超
   assert.ok(plan.includes('vidSNoDate1'));
 });
 
-test('planYouTubeAudioTriggers: 常時対応と通常フィードが混ざっても通常分は30日で絞る', () => {
+test('planYouTubeAudioTriggers: 常時対応と通常フィードが混ざっても通常分は新しい順3本のまま', () => {
   const now = Date.parse('2026-11-15T00:00:00.000Z');
   const special = [
     { videoId: 'vidSOld0001', publishedAt: '2024-05-01T00:00:00.000Z', channelId: 'UCbiDZXbr391oT_vsRiqwPFg' },
@@ -2592,19 +2776,17 @@ test('planYouTubeAudioTriggers: 常時対応と通常フィードが混ざって
     { videoId: 'vidNOld0001', publishedAt: '2024-05-01T00:00:00.000Z', channelId: 'UCsomeOtherCh' },
     { videoId: 'vidNNew0001', publishedAt: '2026-11-14T00:00:00.000Z', channelId: 'UCsomeOtherCh' },
   ];
-  assert.deepEqual(planYouTubeAudioTriggers([special, normal], now), ['vidSOld0001', 'vidNNew0001']);
+  // 通常分は2本しかないので、古い方も含めて両方選ばれる (期間制限なし)。
+  assert.deepEqual(planYouTubeAudioTriggers([special, normal], now), ['vidSOld0001', 'vidNNew0001', 'vidNOld0001']);
 });
 
-test('planYouTubeAudioTriggers: 音楽ジャンルは期間の縛りなしで新しい順20本まで選ぶ (30日超も対象)', () => {
+test('planYouTubeAudioTriggers: ジャンルが音楽でも特別扱いはなく、期間なし・新しい順3本だけ選ぶ', () => {
   const now = Date.parse('2026-11-15T00:00:00.000Z');
-  // 25本: 新しい順で vidM25 (2026-11-14) 〜 vidM01 (2023-01-01)。
-  // 大半は30日より古いが、音楽ジャンルでは期間で絞らない。
+  // 旧来の音楽ジャンル特別ルール (期間なし・20本) は廃止した。
+  // category は判定に使わないため、音楽ジャンルの材料でも通常ルール。
   const dates = [
-    '2023-01-01', '2023-04-01', '2023-07-01', '2023-10-01', '2024-01-01',
-    '2024-04-01', '2024-07-01', '2024-10-01', '2025-01-01', '2025-03-01',
-    '2025-05-01', '2025-07-01', '2025-09-01', '2025-11-01', '2026-01-01',
-    '2026-03-01', '2026-05-01', '2026-07-01', '2026-09-01', '2026-10-01',
-    '2026-10-20', '2026-11-10', '2026-11-12', '2026-11-13', '2026-11-14',
+    '2023-01-01', '2024-01-01', '2025-01-01', '2026-01-01', '2026-09-01',
+    '2026-10-01', '2026-10-20', '2026-11-10', '2026-11-12', '2026-11-13', '2026-11-14',
   ];
   const music = dates.map((d, i) => ({
     videoId: 'vidM' + String(i + 1).padStart(2, '0'),
@@ -2612,50 +2794,47 @@ test('planYouTubeAudioTriggers: 音楽ジャンルは期間の縛りなしで新
     category: '音楽',
   }));
   const plan = planYouTubeAudioTriggers([music], now);
-  assert.equal(plan.length, 20);
-  assert.equal(plan[0], 'vidM25');
-  assert.equal(plan[19], 'vidM06'); // 2024-04-01 (30日超) まで入る
-  assert.ok(!plan.includes('vidM05'));
+  // 旧来の音楽特別ルール (期間なし・20本) ではなく、通常と同じ
+  // 「期間なし・新しい順3本」。
+  assert.deepEqual(plan, ['vidM11', 'vidM10', 'vidM09']);
 });
 
-test('planYouTubeAudioTriggers: 音楽ジャンルでも動画IDの無いものは除き、日時不明は最も古い扱いで最後に並ぶ', () => {
+test('planYouTubeAudioTriggers: プレイリストフィードは30日超・3本超・日時不明でも全件選ぶ (全件クラス)', () => {
   const now = Date.parse('2026-11-15T00:00:00.000Z');
-  const music = [
-    { videoId: '', publishedAt: '2026-11-14T00:00:00.000Z', category: '音楽' },
-    { videoId: 'vidMNoDate1', publishedAt: '', category: '音楽' },
-    { videoId: 'vidMDated01', publishedAt: '2024-01-01T00:00:00.000Z', category: '音楽' },
-  ];
-  assert.deepEqual(planYouTubeAudioTriggers([music], now), ['vidMDated01', 'vidMNoDate1']);
-});
-
-test('planYouTubeAudioTriggers: 音楽と通常が混ざっても通常分は3本・30日以内のまま', () => {
-  const now = Date.parse('2026-11-15T00:00:00.000Z');
-  const music = [1, 2, 3, 4, 5].map((i) => ({
-    videoId: 'vidMOld000' + i,
-    publishedAt: '2025-06-0' + i + 'T00:00:00.000Z',
-    category: '音楽',
-  }));
-  const normal = [
-    { videoId: 'vidNOld0001', publishedAt: '2025-06-01T00:00:00.000Z', category: '教養・ラジオ' },
-    { videoId: 'vidNNew0001', publishedAt: '2026-11-14T00:00:00.000Z', category: '教養・ラジオ' },
-  ];
-  const plan = planYouTubeAudioTriggers([music, normal], now);
-  assert.deepEqual(plan, ['vidMOld0005', 'vidMOld0004', 'vidMOld0003', 'vidMOld0002', 'vidMOld0001', 'vidNNew0001']);
-});
-
-test('planYouTubeAudioTriggers: 常時対応チャンネルは音楽ジャンルでも全件扱いが優先される', () => {
-  const now = Date.parse('2026-11-15T00:00:00.000Z');
-  const special = [];
+  const playlist = [];
   for (let i = 1; i <= 15; i++) {
-    special.push({
-      videoId: 'vidSM' + String(i).padStart(4, '0'),
-      publishedAt: '2025-01-10T00:00:00.000Z',
-      channelId: 'UCbiDZXbr391oT_vsRiqwPFg',
-      category: '音楽',
+    playlist.push({
+      videoId: 'vidP' + String(i).padStart(5, '0'),
+      // 後半は30日より古い日付にする
+      publishedAt: i <= 7 ? '2026-11-10T00:00:00.000Z' : '2023-01-10T00:00:00.000Z',
+      playlist: true,
     });
   }
-  const plan = planYouTubeAudioTriggers([special], now);
-  assert.equal(plan.length, 15); // 音楽の20本枠ではなく全件
+  // 公開日時が読めない動画も全件クラスでは対象 (通常フィードとは逆)
+  playlist.push({ videoId: 'vidPNoDate1', publishedAt: '', playlist: true });
+  // 動画IDが無いものだけは除く
+  playlist.push({ videoId: '', publishedAt: '2026-11-10T00:00:00.000Z', playlist: true });
+  const plan = planYouTubeAudioTriggers([playlist], now);
+  assert.equal(plan.length, 16); // 15本 + 日時不明1本
+  assert.equal(plan[0], 'vidP00001');
+  assert.ok(plan.includes('vidP00015'));
+  assert.ok(plan.includes('vidPNoDate1'));
+});
+
+test('planYouTubeAudioTriggers: プレイリストと通常が混ざっても通常分は新しい順3本のまま', () => {
+  const now = Date.parse('2026-11-15T00:00:00.000Z');
+  const playlist = [1, 2, 3, 4, 5].map((i) => ({
+    videoId: 'vidPOld000' + i,
+    publishedAt: '2025-06-0' + i + 'T00:00:00.000Z',
+    playlist: true,
+  }));
+  const normal = [
+    { videoId: 'vidNOld0001', publishedAt: '2025-06-01T00:00:00.000Z' },
+    { videoId: 'vidNNew0001', publishedAt: '2026-11-14T00:00:00.000Z' },
+  ];
+  const plan = planYouTubeAudioTriggers([playlist, normal], now);
+  // 通常分は2本しかないので古い方も選ばれる (期間制限なし)。
+  assert.deepEqual(plan, ['vidPOld0001', 'vidPOld0002', 'vidPOld0003', 'vidPOld0004', 'vidPOld0005', 'vidNNew0001', 'vidNOld0001']);
 });
 
 test('fetchFeeds: 抽出トリガーは各フィードの最新3本に発火する', () => {
@@ -2707,7 +2886,7 @@ test('fetchFeeds: 抽出トリガーは新着でなくても発火する (既存
   } finally { restore(); }
 });
 
-test('fetchFeeds: 最新動画でも公開30日を超えていれば抽出トリガーは発火しない', () => {
+test('fetchFeeds: 公開から時間が経った動画でも最新3本は抽出トリガーが発火する (期間制限なし)', () => {
   const body = playlistBodyWith([
     ['vidStale001', '2026-08-01T00:00:00Z'],
     ['vidStale002', '2026-08-02T00:00:00Z'],
@@ -2722,7 +2901,8 @@ test('fetchFeeds: 最新動画でも公開30日を超えていれば抽出トリ
     const result = fetchFeeds((videoId) => { calls.push(videoId); });
     assert.equal(result.ok, true);
     assert.equal(result.added, 2); // 記事の取り込み自体は行われる
-    assert.deepEqual(calls, []);
+    // 旧来の30日制限は廃止した。古くても新しい順に発火する。
+    assert.deepEqual(calls, ['vidStale002', 'vidStale001']);
   } finally { restore(); }
 });
 
@@ -2775,11 +2955,13 @@ test('fetchFeeds: 常時対応チャンネルは30日超でも取得できた全
   } finally { restore(); }
 });
 
-test('fetchFeeds: 音楽ジャンルのフィードは30日超でも新しい順20本まで発火する', () => {
+test('fetchFeeds: 音楽ジャンルのフィードでも特別扱いはなく、通常と同じ新しい順3本だけ発火する', () => {
+  // 旧来の音楽ジャンル特別ルール (期間なし・20本) は廃止した。
+  // ジャンルが「音楽」でも通常チャンネルと同じく新しい順3本だけ。
   const rowMusic = ['yt-music', '音楽チャンネル', 'https://www.youtube.com/channel/UCmusicchanneL1', '音楽', '', '', '', '', ''];
   const items = [];
   for (let i = 1; i <= 15; i++) {
-    // 全て公開から30日を大きく超えた日付にする (月をずらして新しい順を付ける)
+    // 全て公開から30日を大きく超えた日付にする (期間制限が無いことの確認)
     const y = 2024 + Math.floor((i - 1) / 12);
     const m = String(((i - 1) % 12) + 1).padStart(2, '0');
     items.push(['vidMu' + String(i).padStart(5, '0'), y + '-' + m + '-15T00:00:00Z']);
@@ -2794,10 +2976,276 @@ test('fetchFeeds: 音楽ジャンルのフィードは30日超でも新しい順
   try {
     const result = fetchFeeds((videoId) => { calls.push(videoId); });
     assert.equal(result.ok, true);
-    assert.equal(result.added, 15);
-    assert.equal(calls.length, 15); // 音楽は20本まで (取得15本すべて発火。通常は30日超なら0本)
-    assert.equal(calls[0], 'vidMu00015'); // 新しい順
-    assert.equal(calls[14], 'vidMu00001');
+    assert.equal(result.added, 15); // 記事の取り込み自体は行われる
+    // 最新は 2025-03-15 (i=15)、続いて 2025-02-15、2025-01-15。
+    assert.deepEqual(calls, ['vidMu00015', 'vidMu00014', 'vidMu00013']);
+  } finally { restore(); }
+});
+
+// --- プレイリストフィードの取り込み (fetchFeeds 統合) ---
+
+const PL_FEED_ID = 'PLtestlist00000001';
+const PL_FEED_ROW = ['yt-pl', 'お気に入り', 'https://www.youtube.com/playlist?list=' + PL_FEED_ID, '', '', '', '', '', ''];
+
+function playlistPageBody(items, nextPageToken) {
+  const body = {
+    items: items.map(([videoId, publishedAt]) => ({
+      snippet: { title: '動画 ' + videoId, description: '', publishedAt, channelTitle: 'ch', resourceId: { videoId } },
+    })),
+  };
+  if (nextPageToken) body.nextPageToken = nextPageToken;
+  return JSON.stringify(body);
+}
+
+function plArticleRow(vid, published) {
+  return [articleId('yt-pl', vid), 'yt-pl', '動画 ' + vid, 'https://www.youtube.com/watch?v=' + vid,
+    published, '2026-11-14T01:00:00.000Z', '', 'ch'];
+}
+
+test('fetchFeeds: プレイリストは最大2ページ (100件) まで取り込み、published_at は追加日時になる', () => {
+  const requested = [];
+  const page1 = playlistPageBody([
+    ['vidPl00001', '2026-11-10T00:00:00Z'],
+    ['vidPl00002', '2026-11-09T00:00:00Z'],
+  ], 'tok2');
+  const page2 = playlistPageBody([
+    ['vidPl00003', '2026-11-08T00:00:00Z'],
+  ], 'tok3'); // まだ次があるが、2ページで打ち切る
+  const { ss, restore } = fetchAudioEnv({
+    feedsRows: [PL_FEED_ROW],
+    responder: (url) => {
+      requested.push(String(url));
+      return {
+        getResponseCode: () => 200,
+        getContentText: () => (String(url).includes('pageToken=tok2') ? page2 : page1),
+      };
+    },
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 3);
+    const itemRequests = requested.filter((u) => u.includes('playlistId=' + PL_FEED_ID));
+    assert.equal(itemRequests.length, 2); // 3ページ目は引かない
+    assert.ok(itemRequests[0].includes('part=snippet,contentDetails'));
+    assert.ok(itemRequests[0].includes('maxResults=50'));
+    assert.ok(itemRequests[1].includes('pageToken=tok2'));
+    const rows = ss.sheets['articles'].rows;
+    assert.equal(rows.length, 4); // ヘッダー + 3件
+    // published_at は snippet.publishedAt (= プレイリストへの追加日時)
+    assert.equal(rows[1][4], '2026-11-10T00:00:00.000Z');
+    assert.equal(rows[3][4], '2026-11-08T00:00:00.000Z');
+  } finally { restore(); }
+});
+
+test('fetchFeeds: プレイリストのタイトルが空なら playlists.list で補完する', () => {
+  const rowNoTitle = ['yt-pl', '', 'https://www.youtube.com/playlist?list=' + PL_FEED_ID, '', '', '', '', '', ''];
+  const { ss, restore } = fetchAudioEnv({
+    feedsRows: [rowNoTitle],
+    responder: (url) => ({
+      getResponseCode: () => 200,
+      getContentText: () => (String(url).includes('v3/playlists?')
+        ? JSON.stringify({ items: [{ snippet: { title: 'お気に入り曲' } }] })
+        : playlistPageBody([['vidPl00001', '2026-11-10T00:00:00Z']])),
+    }),
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(ss.sheets['feeds'].rows[1][1], 'お気に入り曲');
+  } finally { restore(); }
+});
+
+test('fetchFeeds: プレイリストから外れた記事は削除同期で消え、残る記事と新規記事は残る', () => {
+  const { ss, restore } = fetchAudioEnv({
+    feedsRows: [PL_FEED_ROW],
+    articlesRows: [plArticleRow('vidKeepPl01', '2026-11-01T00:00:00.000Z'), plArticleRow('vidGonePl01', '2026-10-01T00:00:00.000Z')],
+    responder: () => ({
+      getResponseCode: () => 200,
+      getContentText: () => playlistPageBody([
+        ['vidKeepPl01', '2026-11-01T00:00:00Z'],
+        ['vidNewPl001', '2026-11-12T00:00:00Z'],
+      ]),
+    }),
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 1);
+    const links = ss.sheets['articles'].rows.slice(1).map((r) => r[3]);
+    assert.deepEqual(links.sort(), [
+      'https://www.youtube.com/watch?v=vidKeepPl01',
+      'https://www.youtube.com/watch?v=vidNewPl001',
+    ]);
+  } finally { restore(); }
+});
+
+test('fetchFeeds: プレイリストの取得が失敗したら削除同期はせず、既存記事は残る', () => {
+  const { ss, restore } = fetchAudioEnv({
+    feedsRows: [PL_FEED_ROW],
+    articlesRows: [plArticleRow('vidKeepPl01', '2026-11-01T00:00:00.000Z')],
+    responder: () => ({ getResponseCode: () => 500, getContentText: () => '{}' }),
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(ss.sheets['feeds'].rows[1][7], 'error');
+    assert.equal(ss.sheets['articles'].rows.length, 2); // ヘッダー + 既存1件
+  } finally { restore(); }
+});
+
+test('fetchFeeds: プレイリストの取得が0件なら削除同期はせず、既存記事は残る', () => {
+  const { ss, restore } = fetchAudioEnv({
+    feedsRows: [PL_FEED_ROW],
+    articlesRows: [plArticleRow('vidKeepPl01', '2026-11-01T00:00:00.000Z')],
+    responder: () => ({ getResponseCode: () => 200, getContentText: () => JSON.stringify({ items: [] }) }),
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(ss.sheets['feeds'].rows[1][7], '200');
+    assert.equal(ss.sheets['articles'].rows.length, 2);
+  } finally { restore(); }
+});
+
+test('fetchFeeds: プレイリストの削除候補が上限を超えたら削除だけ中止する', () => {
+  const staleRows = [];
+  for (let i = 1; i <= 21; i++) {
+    staleRows.push(plArticleRow('vidStalePl' + String(i).padStart(2, '0'), '2026-10-01T00:00:00.000Z'));
+  }
+  const { ss, restore } = fetchAudioEnv({
+    feedsRows: [PL_FEED_ROW],
+    articlesRows: staleRows,
+    responder: () => ({
+      getResponseCode: () => 200,
+      getContentText: () => playlistPageBody([['vidFreshPl1', '2026-11-12T00:00:00Z']]),
+    }),
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 1); // 追加は行われる
+    assert.equal(ss.sheets['articles'].rows.length, 1 + 21 + 1); // 削除はされない
+  } finally { restore(); }
+});
+
+test('fetchFeeds: プレイリストの記事は古くても全件に抽出トリガーが発火する (全件クラス)', () => {
+  const { restore } = fetchAudioEnv({
+    props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [PL_FEED_ROW],
+    responder: () => ({
+      getResponseCode: () => 200,
+      getContentText: () => playlistPageBody([
+        ['vidPlOld001', '2023-05-01T00:00:00Z'],
+        ['vidPlOld002', '2023-04-01T00:00:00Z'],
+        ['vidPlOld003', '2023-03-01T00:00:00Z'],
+        ['vidPlOld004', '2023-02-01T00:00:00Z'],
+      ]),
+    }),
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.deepEqual(calls, ['vidPlOld001', 'vidPlOld002', 'vidPlOld003', 'vidPlOld004']);
+  } finally { restore(); }
+});
+
+// --- 動画の長さ (duration) の取り込みとスター判定への反映 ---
+
+function durationsBody(map) {
+  return JSON.stringify({
+    items: Object.entries(map).map(([id, duration]) => ({ id, contentDetails: { duration } })),
+  });
+}
+
+test('fetchFeeds: チャンネル取り込みで長さを保存し、90秒未満は発火対象から数えない', () => {
+  const body = playlistBodyWith([
+    ['vidDuraNew1', '2026-11-14T00:00:00Z'],
+    ['vidDuraShrt', '2026-11-13T00:00:00Z'],
+    ['vidDuraOld1', '2026-11-12T00:00:00Z'],
+    ['vidDuraOld2', '2026-11-11T00:00:00Z'],
+  ]);
+  const { ss, restore } = fetchAudioEnv({
+    props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [YT_FEED_ROW_X],
+    responder: (url) => ({
+      getResponseCode: () => 200,
+      getContentText: () => (String(url).includes('v3/videos?')
+        ? durationsBody({ vidDuraNew1: 'PT3M10S', vidDuraShrt: 'PT30S', vidDuraOld1: 'PT4M00S', vidDuraOld2: 'PT5M00S' })
+        : body),
+    }),
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 4);
+    // duration_sec 列が遅延追加され、長さが秒で保存される
+    const rows = ss.sheets['articles'].rows;
+    const durIdx = rows[0].indexOf('duration_sec');
+    assert.ok(durIdx >= 0);
+    const byLink = {};
+    rows.slice(1).forEach((r) => { byLink[r[3]] = r[durIdx]; });
+    assert.equal(byLink['https://www.youtube.com/watch?v=vidDuraShrt'], 30);
+    assert.equal(byLink['https://www.youtube.com/watch?v=vidDuraNew1'], 190);
+    // 短尺 (30秒) は数えず、次の動画が繰り上がって3本発火する
+    assert.deepEqual(calls, ['vidDuraNew1', 'vidDuraOld1', 'vidDuraOld2']);
+  } finally { restore(); }
+});
+
+test('fetchFeeds: 既存記事の長さは再追加されなくても埋め戻される', () => {
+  const existing = [articleId('yt-x', 'vidBackfil1'), 'yt-x', '既存動画', 'https://www.youtube.com/watch?v=vidBackfil1',
+    '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '', 'YT チャンネル'];
+  const body = playlistBodyWith([['vidBackfil1', '2026-11-14T00:00:00Z']]);
+  const { ss, restore } = fetchAudioEnv({
+    props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [YT_FEED_ROW_X],
+    articlesRows: [existing],
+    responder: (url) => ({
+      getResponseCode: () => 200,
+      getContentText: () => (String(url).includes('v3/videos?')
+        ? durationsBody({ vidBackfil1: 'PT4M00S' })
+        : body),
+    }),
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 0); // 既存なので再追加はされない
+    const rows = ss.sheets['articles'].rows;
+    const durIdx = rows[0].indexOf('duration_sec');
+    assert.ok(durIdx >= 0);
+    assert.equal(rows[1][durIdx], 240);
+    assert.deepEqual(calls, ['vidBackfil1']);
+  } finally { restore(); }
+});
+
+test('fetchFeeds: 長さの取得に失敗しても取り込みは進み、発火は通常の新しい順3本に倒れる (fail-open)', () => {
+  const body = playlistBodyWith([
+    ['vidFailNew1', '2026-11-14T00:00:00Z'],
+    ['vidFailShrt', '2026-11-13T00:00:00Z'],
+    ['vidFailOld1', '2026-11-12T00:00:00Z'],
+  ]);
+  const { ss, restore } = fetchAudioEnv({
+    props: { A_ZE_GS_TOKEN: 'fake-ze-token' },
+    feedsRows: [YT_FEED_ROW_X],
+    responder: (url) => (String(url).includes('v3/videos?')
+      ? { getResponseCode: () => 500, getContentText: () => '{}' }
+      : { getResponseCode: () => 200, getContentText: () => body }),
+  });
+  const calls = [];
+  try {
+    const result = fetchFeeds((videoId) => { calls.push(videoId); });
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 3);
+    // 長さ不明のため短尺らしい動画も含めて新しい順3本が発火する
+    assert.deepEqual(calls, ['vidFailNew1', 'vidFailShrt', 'vidFailOld1']);
+    const rows = ss.sheets['articles'].rows;
+    const durIdx = rows[0].indexOf('duration_sec');
+    assert.ok(durIdx >= 0);
+    assert.ok(rows.slice(1).every((r) => r[durIdx] === '' || r[durIdx] === undefined));
   } finally { restore(); }
 });
 
@@ -2908,7 +3356,7 @@ test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全
   } finally { restore(); }
 });
 
-test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キャップ200件でフィード順に打ち切る', () => {
+test('fireYouTubeAudioTriggers: プレイリスト (全件クラス) が増えても全体キャップ200件でフィード順に打ち切る', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
   });
@@ -2916,8 +3364,8 @@ test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キ
   for (let f = 0; f < 14; f++) {
     const videos = [];
     for (let i = 0; i < 15; i++) {
-      // 音楽は30日超でも計画に入るため、14フィード×15本 = 210件の計画になる
-      videos.push({ videoId: 'vidMu' + f + '_' + i, publishedAt: '2025-06-01T00:00:00.000Z', category: '音楽' });
+      // プレイリストは30日超でも全件が計画に入るため、14フィード×15本 = 210件の計画になる
+      videos.push({ videoId: 'vidPl' + f + '_' + i, publishedAt: '2025-06-01T00:00:00.000Z', playlist: true });
     }
     feedVideos.push(videos);
   }
@@ -3071,6 +3519,19 @@ test('planYouTubeSubscriptionSync: 本人のチャンネル (ピン留め) は�
   assert.deepEqual(plan2.toAdd.map((a) => a.channelId), [CH_KEEP]);
 });
 
+test('planYouTubeSubscriptionSync: プレイリストフィードには触らない (購読に無くても削除しない)', () => {
+  const feeds = [
+    { id: 'yt-keep', title: 'A', url: 'https://www.youtube.com/channel/' + CH_KEEP, category: '' },
+    { id: 'yt-pl', title: 'PL', url: 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00', category: '' },
+  ];
+  const plan = planYouTubeSubscriptionSync(feeds, [{ channelId: CH_KEEP, title: 'A' }]);
+  assert.equal(plan.ok, true);
+  // 同期対象はチャンネル正規形のフィードだけ。プレイリスト行は
+  // チャンネルIDが抜けないため、削除候補にも追加候補にも入らない。
+  assert.deepEqual(plan.toDelete, []);
+  assert.deepEqual(plan.toAdd, []);
+});
+
 test('planYouTubeSubscriptionSync: 購読が空・不正なら中止 (ok:false) で何も計画しない', () => {
   const feeds = [
     { id: 'yt-gone', title: 'G', url: 'https://www.youtube.com/channel/' + CH_GONE, category: '' },
@@ -3207,6 +3668,22 @@ test('syncYouTubeSubscriptions: 本人のチャンネル (ピン留め) は購�
     assert.equal(result.ok, true);
     assert.equal(result.deleted, 0);
     assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'own', 'yt-keep']);
+  } finally { restore(); }
+});
+
+test('syncYouTubeSubscriptions: プレイリストフィードは購読に無くても残る', () => {
+  const { ss, restore } = syncTestEnv({
+    feedsRows: [
+      ytFeedRow('yt-keep', CH_KEEP, 'A'),
+      ['yt-pl', 'お気に入り', 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00', '', '', '', '', '', ''],
+    ],
+    pages: [{ items: [subscriptionItem(CH_KEEP, 'A')] }],
+  });
+  try {
+    const result = syncYouTubeSubscriptions();
+    assert.equal(result.ok, true);
+    assert.equal(result.deleted, 0);
+    assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'yt-keep', 'yt-pl']);
   } finally { restore(); }
 });
 
@@ -3544,6 +4021,7 @@ const STAR_NOW = Date.parse('2026-11-15T00:00:00.000Z');
 const STAR_FEED_NORMAL = { id: 'yt-n', title: '通常', url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A', category: '' };
 const STAR_FEED_MUSIC = { id: 'yt-m', title: '音楽', url: 'https://www.youtube.com/channel/UCmusicchanneL1', category: '音楽' };
 const STAR_FEED_OWN = { id: 'yt-own', title: '本人', url: 'https://www.youtube.com/channel/UCbiDZXbr391oT_vsRiqwPFg', category: '' };
+const STAR_FEED_PLAYLIST = { id: 'yt-pl', title: 'お気に入り', url: 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00', category: '' };
 
 function starArticle(id, feedId, videoId, publishedAt, override) {
   const a = {
@@ -3555,7 +4033,7 @@ function starArticle(id, feedId, videoId, publishedAt, override) {
   return a;
 }
 
-test('computeStarredArticleIds: デフォルトは通常フィードで30日以内・新しい順3本だけ', () => {
+test('computeStarredArticleIds: デフォルトは通常フィードで期間なし・新しい順3本だけ', () => {
   const articles = [
     starArticle('a1', 'yt-n', 'vidS00001', '2026-11-14T00:00:00.000Z'),
     starArticle('a2', 'yt-n', 'vidS00002', '2026-11-13T00:00:00.000Z'),
@@ -3568,7 +4046,8 @@ test('computeStarredArticleIds: デフォルトは通常フィードで30日以�
   assert.deepEqual(Object.keys(starred).sort(), ['a1', 'a2', 'a3']);
 });
 
-test('computeStarredArticleIds: 音楽は期間なしの新しい順20本、常時対応チャンネルは全件', () => {
+test('computeStarredArticleIds: 音楽ジャンルのチャンネルも通常ルール (期間なし・新しい順3本)、常時対応チャンネルは全件', () => {
+  // 旧来の音楽ジャンル特別ルール (期間なし・20本) は廃止した。
   const music = [];
   for (let i = 1; i <= 25; i++) {
     // 2024年の日付を新しい順に25本 (すべて30日より古い)
@@ -3580,12 +4059,44 @@ test('computeStarredArticleIds: 音楽は期間なしの新しい順20本、常�
     starArticle('o2', 'yt-own', 'vidO00002', '2023-06-01T00:00:00.000Z'),
   ];
   const starred = computeStarredArticleIds([STAR_FEED_MUSIC, STAR_FEED_OWN], [...music, ...own], STAR_NOW);
-  // 音楽は新しい順20本まで (m1..m20)、古い5本 (m21..m25) は入らない
-  assert.equal(Object.keys(starred).filter((id) => id.startsWith('m')).length, 20);
-  assert.ok(starred['m20']);
-  assert.ok(!starred['m21']);
+  // 音楽ジャンルでも通常ルール: 期間制限は無いので古くても新しい順3本
+  // (m1 が最新) だけが付き、4本目以降は付かない (旧特別ルールの20本ではない)。
+  assert.deepEqual(Object.keys(starred).filter((id) => id.startsWith('m')).sort(), ['m1', 'm2', 'm3']);
   // 常時対応チャンネルは古くても全件
   assert.ok(starred['o1'] && starred['o2']);
+});
+
+test('computeStarredArticleIds: duration_sec が90秒未満の記事はデフォルトで付かず、次の記事が繰り上がる', () => {
+  const mk = (id, vid, date, sec) => {
+    const a = starArticle(id, 'yt-n', vid, date);
+    if (sec !== undefined) a.duration_sec = sec;
+    return a;
+  };
+  const articles = [
+    mk('s1', 'vidD00001', '2026-11-14T00:00:00.000Z', 45),
+    mk('s2', 'vidD00002', '2026-11-13T00:00:00.000Z', 200),
+    mk('s3', 'vidD00003', '2026-11-12T00:00:00.000Z', ''),
+    mk('s4', 'vidD00004', '2026-11-11T00:00:00.000Z', 300),
+    mk('s5', 'vidD00005', '2026-11-10T00:00:00.000Z', 400),
+  ];
+  const starred = computeStarredArticleIds([STAR_FEED_NORMAL], articles, STAR_NOW);
+  // s1 (45秒) は数えず、s2・s3 (長さ不明=fail-open)・s4 の3本。
+  assert.deepEqual(Object.keys(starred).sort(), ['s2', 's3', 's4']);
+});
+
+test('computeStarredArticleIds: プレイリストフィードの記事は全件がデフォルトで付く (手動 off は外れる)', () => {
+  const articles = [];
+  for (let i = 1; i <= 25; i++) {
+    // すべて30日より古い日付でも、プレイリストは全件クラス
+    const d = new Date(Date.parse('2024-12-31T00:00:00.000Z') - (i - 1) * 24 * 60 * 60 * 1000).toISOString();
+    articles.push(starArticle('p' + i, 'yt-pl', 'vidP' + String(i).padStart(5, '0'), d));
+  }
+  // 手動で外した1本だけは全件クラスでも外れる
+  articles.push(starArticle('pOff', 'yt-pl', 'vidPOff0001', '2024-01-01T00:00:00.000Z', 'off'));
+  const starred = computeStarredArticleIds([STAR_FEED_PLAYLIST], articles, STAR_NOW);
+  assert.equal(Object.keys(starred).length, 25);
+  assert.ok(starred['p25']);
+  assert.ok(!starred['pOff']);
 });
 
 test('computeStarredArticleIds: 手動オーバーライドが優先され、外した枠への繰り上げは起きない', () => {
@@ -3620,7 +4131,7 @@ test('computeStarredArticleIds: 非YouTubeの記事は対象外、未知のオ�
 
 test('planStarredAudioTriggers: 手動 on を先頭に寄せ、続いてデフォルト (off除く) をフィード順に並べる', () => {
   const articles = [
-    starArticle('m1', 'yt-m', 'vidMu00001', '2024-05-01T00:00:00.000Z'),
+    starArticle('m1', 'yt-pl', 'vidMu00001', '2024-05-01T00:00:00.000Z'),
     starArticle('v1', 'yt-n', 'vidNv00001', '2026-11-14T00:00:00.000Z', 'off'),
     starArticle('v2', 'yt-n', 'vidNv00002', '2026-11-13T00:00:00.000Z'),
     starArticle('v3', 'yt-n', 'vidNv00003', '2026-11-12T00:00:00.000Z'),
@@ -3628,21 +4139,21 @@ test('planStarredAudioTriggers: 手動 on を先頭に寄せ、続いてデフ�
     starArticle('v5', 'yt-n', 'vidNv00005', '2026-11-10T00:00:00.000Z', 'on'),
     starArticle('vOld', 'yt-n', 'vidNv00006', '2026-08-01T00:00:00.000Z', 'on'),
   ];
-  const planned = planStarredAudioTriggers([STAR_FEED_MUSIC, STAR_FEED_NORMAL], articles, STAR_NOW);
+  const planned = planStarredAudioTriggers([STAR_FEED_PLAYLIST, STAR_FEED_NORMAL], articles, STAR_NOW);
   // 手動 on (新しい順: v5 → vOld) が全体の先頭。その後にデフォルト分を
-  // フィード順に並べる (音楽のデフォルト → 通常のデフォルト。v1 は
-  // off で除く)。v4 はどちらにも入らない。
+  // フィード順に並べる (プレイリストのデフォルト (全件クラス) → 通常の
+  // デフォルト。v1 は off で除く)。v4 はどちらにも入らない。
   assert.deepEqual(planned, ['vidNv00005', 'vidNv00006', 'vidMu00001', 'vidNv00002', 'vidNv00003']);
 });
 
 test('planStarredAudioTriggers + fire: 143本規模の計画は上限200に収まり全件が発火対象になる', () => {
-  // 実測の内訳に寄せた構成: 音楽4フィード×20本 + 通常21フィード×3本 = 143本。
+  // 構成: プレイリスト4フィード×20本 (全件クラス) + 通常21フィード×3本 = 143本。
   // 旧上限100では後順位フィードが締め出されていた。
   const feeds = [];
   const articles = [];
   for (let f = 0; f < 4; f++) {
-    const feedId = 'yt-cap-m' + f;
-    feeds.push({ id: feedId, title: '音楽' + f, url: 'https://www.youtube.com/channel/UCcapmusic' + f + 'abcdefghij', category: '音楽' });
+    const feedId = 'yt-cap-p' + f;
+    feeds.push({ id: feedId, title: 'プレイリスト' + f, url: 'https://www.youtube.com/playlist?list=PLcaplist' + f + 'abcdefghij00', category: '' });
     for (let i = 0; i < 20; i++) {
       const d = new Date(Date.parse('2024-12-31T00:00:00.000Z') - i * 24 * 60 * 60 * 1000).toISOString();
       articles.push(starArticle(feedId + '-a' + i, feedId, 'vidCM' + f + '_' + String(i).padStart(2, '0'), d));
@@ -3670,14 +4181,14 @@ test('planStarredAudioTriggers + fire: 143本規模の計画は上限200に収�
 });
 
 test('planStarredAudioTriggers + fire: 上限超過時は手動スターが残り、デフォルト分が末尾から切れる', () => {
-  // 音楽11フィード×20本 = デフォルト220本に、最後尾フィードの
-  // 手動 on 1本を加えた221本の計画。上限200で切られても、手動分は
-  // 先頭に寄せてあるため必ず残る。
+  // プレイリスト11フィード×20本 (全件クラス) = デフォルト220本に、
+  // 最後尾フィードの手動 on 1本を加えた221本の計画。上限200で
+  // 切られても、手動分は先頭に寄せてあるため必ず残る。
   const feeds = [];
   const articles = [];
   for (let f = 0; f < 11; f++) {
-    const feedId = 'yt-pri-m' + f;
-    feeds.push({ id: feedId, title: '音楽' + f, url: 'https://www.youtube.com/channel/UCprimusic' + f + 'abcdefghij', category: '音楽' });
+    const feedId = 'yt-pri-p' + f;
+    feeds.push({ id: feedId, title: 'プレイリスト' + f, url: 'https://www.youtube.com/playlist?list=PLprilist' + f + 'abcdefghij00', category: '' });
     for (let i = 0; i < 20; i++) {
       const d = new Date(Date.parse('2024-12-31T00:00:00.000Z') - i * 24 * 60 * 60 * 1000).toISOString();
       articles.push(starArticle(feedId + '-a' + i, feedId, 'vidPM' + f + '_' + String(i).padStart(2, '0'), d));
