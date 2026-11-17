@@ -30,6 +30,7 @@ import {
   parseChannelLookupResponse,
   youtubeApiErrorDetail,
   parseAudioUrlsMap,
+  scriptBaseUrl,
   fetchAudioUrlsMap,
   ytPlayUrl,
   planYouTubeAudioTriggers,
@@ -200,7 +201,7 @@ test('filterArticles: 新しい順にソートする (publishedAt 優先、無�
 
 test('parseFeedUrl: https のみ許可しホストを返す', () => {
   assert.deepEqual(parseFeedUrl('https://zenn.dev/feed'), { ok: true, url: 'https://zenn.dev/feed', host: 'zenn.dev' });
-  assert.equal(parseFeedUrl('https://a.ze.gs:443/mfcf.xml').host, 'a.ze.gs');
+  assert.equal(parseFeedUrl('https://example.com:443/mfcf.xml').host, 'example.com');
   assert.equal(parseFeedUrl('http://example.com/feed').ok, false);
   assert.equal(parseFeedUrl('ftp://example.com/feed').ok, false);
   assert.equal(parseFeedUrl('not a url').ok, false);
@@ -286,11 +287,11 @@ test('buildFeedRow: 行は9列 (enabled / is_private 列は撤去済み)', () =>
 
 test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
   const shaped = feedToApiShape({
-    id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', category: 'private',
+    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', category: 'private',
     last_status: '200', last_error: '', last_fetched_at: new Date('2026-11-14T00:15:30.088Z'),
   }, 7);
   assert.deepEqual(shaped, {
-    id: 'x-freddie', title: 'X freddie', url: 'https://a.ze.gs/x.freddie.xml', fetchUrl: 'https://a.ze.gs/x.freddie.xml', category: 'private',
+    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private',
     lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
@@ -567,7 +568,7 @@ test('selectFetchTargets: YouTube フィードだけを巡回対象にする', (
     yt('yt-a'),
     yt('yt-b'),
     { id: 'rss-on', url: 'https://example.com/feed.xml' },
-    { id: 'priv-on', url: 'https://a.ze.gs/x.freddie.xml' },
+    { id: 'priv-on', url: 'https://example.com/x.freddie.xml' },
     { id: '', url: 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A' },
     { id: 'yt-nourl', url: '' },
   ];
@@ -2036,15 +2037,40 @@ test('buildRssXml: enclosure に dur があれば実尺を itunes:duration (整�
 });
 
 test('ytPlayUrl: 合言葉と動画IDから中継 URL を組み立て、欠ければ空', () => {
-  assert.equal(
-    ytPlayUrl('secret-token', 'vidFresh111'),
-    'https://y.ze.gs/secret-token/vidFresh111',
-  );
-  assert.equal(ytPlayUrl('', 'vidFresh111'), '');
-  assert.equal(ytPlayUrl(null, 'vidFresh111'), '');
-  assert.equal(ytPlayUrl(undefined, 'vidFresh111'), '');
-  assert.equal(ytPlayUrl('secret-token', ''), '');
-  assert.equal(ytPlayUrl('secret-token', null), '');
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ Y_ZE_GS_BASE_URL: 'https://y.ze.gs' }).service,
+  });
+  try {
+    assert.equal(
+      ytPlayUrl('secret-token', 'vidFresh111'),
+      'https://y.ze.gs/secret-token/vidFresh111',
+    );
+    assert.equal(ytPlayUrl('', 'vidFresh111'), '');
+    assert.equal(ytPlayUrl(null, 'vidFresh111'), '');
+    assert.equal(ytPlayUrl(undefined, 'vidFresh111'), '');
+    assert.equal(ytPlayUrl('secret-token', ''), '');
+    assert.equal(ytPlayUrl('secret-token', null), '');
+  } finally { restore(); }
+});
+
+test('scriptBaseUrl: プロパティを末尾スラッシュなしで返し、未設定・異常時は空', () => {
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({
+      A_ZE_GS_BASE_URL: 'https://a.ze.gs/', Y_ZE_GS_BASE_URL: 'https://y.ze.gs',
+    }).service,
+  });
+  try {
+    assert.equal(scriptBaseUrl('A_ZE_GS_BASE_URL'), 'https://a.ze.gs');
+    assert.equal(scriptBaseUrl('Y_ZE_GS_BASE_URL'), 'https://y.ze.gs');
+    assert.equal(scriptBaseUrl('NO_SUCH_PROP'), '');
+  } finally { restore(); }
+  // PropertiesService 自体が無い環境でも例外にせず空を返す
+  const restoreNone = installGasGlobals({ PropertiesService: undefined });
+  try {
+    assert.equal(scriptBaseUrl('A_ZE_GS_BASE_URL'), '');
+    // 中継 URL も組み立てない (= 直接 URL にフォールバックする)
+    assert.equal(ytPlayUrl('secret-token', 'vidFresh111'), '');
+  } finally { restoreNone(); }
 });
 
 test('buildRssXml: 合言葉があれば enclosure は中継 URL になり、直接 URL は出ない', () => {
@@ -2058,7 +2084,13 @@ test('buildRssXml: 合言葉があれば enclosure は中継 URL になり、直
     vidFresh111: { url: 'https://stream.example.com/play?vid=1&sig=abc', ts: nowSec - 60, dur: 104.234 },
     vidStale111: { url: 'https://stream.example.com/stale', ts: nowSec - 6 * 3600 },
   };
-  const xml = buildRssXml(YT_FEED_FOR_RSS, rows, audioUrls, 'secret-token');
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ Y_ZE_GS_BASE_URL: 'https://y.ze.gs' }).service,
+  });
+  let xml;
+  try {
+    xml = buildRssXml(YT_FEED_FOR_RSS, rows, audioUrls, 'secret-token');
+  } finally { restore(); }
   assert.ok(xml.includes('<enclosure url="https://y.ze.gs/secret-token/vidFresh111" type="audio/x-m4a" length="0"/>'));
   // 直接のストリーム URL はどこにも出ない
   assert.ok(!xml.includes('stream.example.com'));
@@ -2087,17 +2119,27 @@ test('buildRssXml: 合言葉が未設定・空なら従来どおり直接 URL �
 
 test('fetchAudioUrlsMap: HTTPエラーや例外は空マップ (RSS は enclosure 無しで続く)', () => {
   const restore500 = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
     UrlFetchApp: { fetch: () => ({ getResponseCode: () => 500, getContentText: () => '' }) },
   });
   try {
     assert.deepEqual(fetchAudioUrlsMap(), {});
   } finally { restore500(); }
   const restoreThrow = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
     UrlFetchApp: { fetch: () => { throw new Error('network down'); } },
   });
   try {
     assert.deepEqual(fetchAudioUrlsMap(), {});
   } finally { restoreThrow(); }
+  // ベース URL が未設定なら取得自体を省いて空マップ (fetch は呼ばれない)
+  const restoreNoBase = installGasGlobals({
+    PropertiesService: fakePropertiesService({}).service,
+    UrlFetchApp: { fetch: () => { throw new Error('must not be called'); } },
+  });
+  try {
+    assert.deepEqual(fetchAudioUrlsMap(), {});
+  } finally { restoreNoBase(); }
 });
 
 function audioRssSpreadsheet(videoId) {
@@ -2116,7 +2158,7 @@ test('doGet: ?rss= は audio-urls.json の新鮮なエントリを enclosure と
   const mapJson = JSON.stringify({ vidAudio111: { url: 'https://stream.example.com/vidAudio111', ts: nowSec - 60, dur: 2297.4 } });
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => audioRssSpreadsheet('vidAudio111') },
-    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
     ContentService: fakeContentService(),
     UrlFetchApp: {
       fetch: (url) => {
@@ -2137,7 +2179,7 @@ test('doGet: ?rss= は audio-urls.json の新鮮なエントリを enclosure と
 test('doGet: audio-urls.json の取得に失敗しても RSS は enclosure 無しで配信される', () => {
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => audioRssSpreadsheet('vidAudioFail') },
-    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
     ContentService: fakeContentService(),
     UrlFetchApp: { fetch: () => { throw new Error('ze unreachable'); } },
     Utilities: fakeUtilities,
@@ -2154,7 +2196,7 @@ test('doGet: ?rss= は YT_PLAY_TOKEN があれば中継 URL の enclosure を配
   const mapJson = JSON.stringify({ vidAudio111: { url: 'https://stream.example.com/vidAudio111', ts: nowSec - 60, dur: 2297.4 } });
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => audioRssSpreadsheet('vidAudio111') },
-    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', YT_PLAY_TOKEN: 'secret-token' }).service,
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id', YT_PLAY_TOKEN: 'secret-token', A_ZE_GS_BASE_URL: 'https://a.ze.gs', Y_ZE_GS_BASE_URL: 'https://y.ze.gs' }).service,
     ContentService: fakeContentService(),
     UrlFetchApp: {
       fetch: (url) => {
@@ -2197,7 +2239,8 @@ function fetchAudioEnv({ props = {}, feedsRows, articlesRows = [], responder }) 
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => ss },
     PropertiesService: fakePropertiesService({
-      SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key', ...props,
+      SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key',
+      A_ZE_GS_BASE_URL: 'https://a.ze.gs', Y_ZE_GS_BASE_URL: 'https://y.ze.gs', ...props,
     }).service,
     UrlFetchApp: { fetch: (url, params) => responder(url, params) },
     Utilities: fakeUtilities,
@@ -2549,7 +2592,7 @@ test('fetchFeeds: 抽出トリガーが例外を投げても巡回は成功す�
   } finally { restore(); }
 });
 
-test('fetchFeeds: 既定の抽出トリガーは a.ze.gs/yt-audio/<videoId> をトークンヘッダー付きで叩く', () => {
+test('fetchFeeds: 既定の抽出トリガーは自宅サーバーの公開ホストの yt-audio/<videoId> をトークンヘッダー付きで叩く', () => {
   const body = playlistBodyWith([['vidNew12345', '2026-11-14T00:00:00Z']]);
   const requests = [];
   const { restore } = fetchAudioEnv({
@@ -2568,7 +2611,7 @@ test('fetchFeeds: 既定の抽出トリガーは a.ze.gs/yt-audio/<videoId> を�
     assert.equal(result.ok, true);
     assert.equal(result.added, 1);
     const triggerReq = requests.find(([url]) => url.startsWith('https://a.ze.gs/'));
-    assert.ok(triggerReq, 'a.ze.gs へのリクエストがある');
+    assert.ok(triggerReq, '自宅サーバーの公開ホストへのリクエストがある');
     assert.equal(triggerReq[0], 'https://a.ze.gs/yt-audio/vidNew12345');
     assert.equal(triggerReq[1].headers['X-Api-Token'], 'fake-ze-token');
     assert.equal(triggerReq[1].muteHttpExceptions, true);
@@ -2577,7 +2620,7 @@ test('fetchFeeds: 既定の抽出トリガーは a.ze.gs/yt-audio/<videoId> を�
 
 test('fireYouTubeAudioTriggers: 1回の巡回で最大200件まで (全体キャップ)', () => {
   const restore = installGasGlobals({
-    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
   });
   const feedVideos = [];
   for (let f = 0; f < 80; f++) {
@@ -2598,7 +2641,7 @@ test('fireYouTubeAudioTriggers: 1回の巡回で最大200件まで (全体キャ
 
 test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全体キャップ200件で収まる', () => {
   const restore = installGasGlobals({
-    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
   });
   const now = Date.parse('2026-11-15T00:00:00.000Z');
   const special = [];
@@ -2625,7 +2668,7 @@ test('fireYouTubeAudioTriggers: 常時対応分 (最大20本) を含んでも全
 
 test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キャップ200件でフィード順に打ち切る', () => {
   const restore = installGasGlobals({
-    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
   });
   const feedVideos = [];
   for (let f = 0; f < 14; f++) {
@@ -2641,6 +2684,21 @@ test('fireYouTubeAudioTriggers: 音楽フィードの枠が増えても全体キ
     const fired = fireYouTubeAudioTriggers(feedVideos, () => { count++; }, Date.parse('2026-11-15T00:00:00.000Z'));
     assert.equal(fired, 200);
     assert.equal(count, 200);
+  } finally { restore(); }
+});
+
+test('fireYouTubeAudioTriggers: ベース URL が未設定ならトークンがあっても差し込み口は呼ばれない', () => {
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+  });
+  let called = 0;
+  try {
+    const fired = fireYouTubeAudioTriggers(
+      [[{ videoId: 'vidNew12345', publishedAt: '2026-11-14T00:00:00.000Z' }]],
+      () => { called++; }
+    );
+    assert.equal(fired, 0);
+    assert.equal(called, 0);
   } finally { restore(); }
 });
 
@@ -3359,7 +3417,7 @@ test('planStarredAudioTriggers + fire: 143本規模の計画は上限200に収�
   const planned = planStarredAudioTriggers(feeds, articles, STAR_NOW);
   assert.equal(planned.length, 143);
   const restore = installGasGlobals({
-    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
   });
   let count = 0;
   try {
@@ -3390,7 +3448,7 @@ test('planStarredAudioTriggers + fire: 上限超過時は手動スターが残�
   assert.equal(planned.length, 221);
   assert.equal(planned[0], 'vidPriManual1');
   const restore = installGasGlobals({
-    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token' }).service,
+    PropertiesService: fakePropertiesService({ A_ZE_GS_TOKEN: 'fake-ze-token', A_ZE_GS_BASE_URL: 'https://a.ze.gs' }).service,
   });
   const firedIds = [];
   try {
@@ -3594,7 +3652,7 @@ test('fetchFeeds: スター制で、off の最新動画は発火せず、on の�
   const restore = installGasGlobals({
     SpreadsheetApp: { openById: () => ss },
     PropertiesService: fakePropertiesService({
-      SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key', A_ZE_GS_TOKEN: 'fake-ze-token',
+      SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key', A_ZE_GS_TOKEN: 'fake-ze-token', A_ZE_GS_BASE_URL: 'https://a.ze.gs',
     }).service,
     UrlFetchApp: { fetch: () => ({ getResponseCode: () => 200, getContentText: () => body }) },
     Utilities: fakeUtilities,

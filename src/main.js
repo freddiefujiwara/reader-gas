@@ -404,8 +404,9 @@ function lookupYouTubeChannelByHandle(handle) {
 
 // --- YouTube 音声ストリーム URL の配布 (ogp 方式) ---
 // 音声ファイルはどこにも置かない。reader-gas が毎時巡回で yt-audio
-// トリガー (後述) を叩くと、ze 側のバッチがストリーム URL を非同期に
-// 抽出し、a.ze.gs/audio-urls.json に videoId -> { url, ts, dur } の形で
+// トリガー (後述) を叩くと、自宅サーバー側のバッチがストリーム URL を
+// 非同期に抽出し、自宅サーバーの公開ホスト上の audio-urls.json に
+// videoId -> { url, ts, dur } の形で
 // 公開する (dur は実尺・秒で、エントリによっては無い)。?rss= の出力では
 // この JSON を読み、抽出から5時間以内のエントリがあるアイテムにだけ、
 // その URL を enclosure として付ける (ストリーム URL は短命なので、
@@ -414,8 +415,27 @@ function lookupYouTubeChannelByHandle(handle) {
 // あれば itunes:duration としても付ける (理由は buildRssXml の
 // コメント参照)。
 
-const AUDIO_URLS_JSON_URL = 'https://a.ze.gs/audio-urls.json';
 const AUDIO_URL_FRESH_MS = 5 * 60 * 60 * 1000;
+
+// スクリプトプロパティに置いたベース URL (末尾スラッシュなし) を読む。
+// 自宅サーバーの公開ホスト名はコードに直書きせず、プロパティ
+// A_ZE_GS_BASE_URL / Y_ZE_GS_BASE_URL から読む。未設定・空・
+// PropertiesService 自体が無い環境では空文字を返し、呼び出し側は
+// 機能だけを穏当に無効化する (トークン未設定時と同じ扱い)。
+function scriptBaseUrl(propName) {
+  try {
+    const value = PropertiesService.getScriptProperties().getProperty(propName);
+    return String(value || '').trim().replace(/\/+$/, '');
+  } catch (e) {
+    return '';
+  }
+}
+
+// audio-urls.json の URL。ベース URL が未設定なら空文字 (= 取得しない)。
+function audioUrlsJsonUrl() {
+  const base = scriptBaseUrl('A_ZE_GS_BASE_URL');
+  return base ? base + '/audio-urls.json' : '';
+}
 
 // audio-urls.json の本文を videoId -> { url, ts, dur? } のマップとして
 // 読む (純関数)。JSON でない・オブジェクトでない場合は空マップにする。
@@ -445,13 +465,16 @@ function parseAudioUrlsMap(jsonText) {
 // 取得に成功したときだけ保持し、失敗時は毎回引き直す。
 let audioUrlsMapCache = null;
 
-// a.ze.gs/audio-urls.json を取得する。失敗 (HTTPエラー・例外・
-// UrlFetchApp 自体が無い環境) はすべて空マップとして扱い、
-// RSS 出力自体は enclosure 無しで続ける。
+// 自宅サーバーの公開ホスト上の audio-urls.json を取得する。
+// ベース URL (A_ZE_GS_BASE_URL) が未設定なら取得自体を省いて空マップ。
+// 失敗 (HTTPエラー・例外・UrlFetchApp 自体が無い環境) もすべて
+// 空マップとして扱い、RSS 出力自体は enclosure 無しで続ける。
 function fetchAudioUrlsMap() {
   if (audioUrlsMapCache) return audioUrlsMapCache;
+  const jsonUrl = audioUrlsJsonUrl();
+  if (!jsonUrl) return {};
   try {
-    const res = UrlFetchApp.fetch(AUDIO_URLS_JSON_URL, { method: 'get', muteHttpExceptions: true });
+    const res = UrlFetchApp.fetch(jsonUrl, { method: 'get', muteHttpExceptions: true });
     if (res.getResponseCode() !== 200) return {};
     audioUrlsMapCache = parseAudioUrlsMap(res.getContentText());
     return audioUrlsMapCache;
@@ -474,24 +497,26 @@ function freshAudioEntry(audioUrls, videoId, nowMs) {
 // --- YouTube 音声の中継 URL (yt-play) ---
 // 抽出済みストリーム URL (googlevideo) は通常の GET が約31KB/秒まで
 // 絞られるため、長編動画では再生開始まで約40秒かかる問題がある。
-// その対策として ze には中継 (yt-play) があり、Range 取得で
+// その対策として自宅サーバーには中継 (yt-play) があり、Range 取得で
 // ストリームを引き直してそのまま流す (ファイルは置かない)。
 // スクリプトプロパティ YT_PLAY_TOKEN (中継の合言葉) が設定されて
 // いれば、?rss= の enclosure は直接 URL ではなく中継 URL
-// (https://y.ze.gs/<token>/<videoId>) にする。中継側も
+// (<Y_ZE_GS_BASE_URL>/<token>/<videoId>) にする。中継側も
 // audio-urls.json の鮮度をもとに実 URL を解決する前提のため、
 // enclosure を付ける条件 (抽出から5時間以内のエントリがあること)
 // は従来どおり。プロパティ未設定・空なら従来の直接 URL のまま。
+// 中継ホストのベース URL (Y_ZE_GS_BASE_URL) が未設定の場合も
+// 中継 URL は組み立てず、直接 URL にフォールバックする。
 
-const YT_PLAY_BASE_URL = 'https://y.ze.gs/';
-
-// 中継 URL の組み立て (純関数)。token が空、または videoId が
-// 無ければ空文字 (= 中継しない) を返す。
+// 中継 URL の組み立て。token が空、videoId が無い、または
+// ベース URL (Y_ZE_GS_BASE_URL) が未設定なら空文字
+// (= 中継しない) を返す。
 function ytPlayUrl(token, videoId) {
   const t = String(token || '').trim();
   const id = String(videoId || '');
-  if (!t || !id) return '';
-  return YT_PLAY_BASE_URL + encodeURIComponent(t) + '/' + encodeURIComponent(id);
+  const base = scriptBaseUrl('Y_ZE_GS_BASE_URL');
+  if (!t || !id || !base) return '';
+  return base + '/' + encodeURIComponent(t) + '/' + encodeURIComponent(id);
 }
 
 // --- YouTube RSS 出力 (v2: 取得をクライアントへ寄せるための出口) ---
@@ -848,13 +873,14 @@ function selectFetchTargets(feeds) {
   return (feeds || []).filter((f) => f && f.id && f.url && youtubeChannelIdFromUrl(f.url));
 }
 
-// --- YouTube 音声抽出トリガー (ze 連携) ---
-// ogp のフォールバックと同じ形: reader-gas が a.ze.gs の altd コマンド
-// yt-audio を叩くと ze 側のキューに積まれ、ze のバッチが音声ストリーム
+// --- YouTube 音声抽出トリガー (自宅サーバー連携) ---
+// ogp のフォールバックと同じ形: reader-gas が自宅サーバーの公開ホストの
+// altd コマンド yt-audio を叩くと自宅サーバー側のキューに積まれ、
+// 自宅サーバーのバッチが音声ストリーム
 // URL を抽出して audio-urls.json として公開する (非同期)。
 // ?rss= はその JSON の新鮮なエントリを enclosure として配信する。
 // 発火対象は各 YouTube フィードの「公開から30日以内」の動画のうち
-// 最新3本で、新着かどうかは問わない (ze 側が抽出済みのものは
+// 最新3本で、新着かどうかは問わない (自宅サーバー側が抽出済みのものは
 // 重複排除するため、毎時叩き直しても安い)。更新の止まった
 // チャンネルは最新動画でも30日を超えていれば何も発火しない。
 // 例外は2種類ある:
@@ -870,7 +896,6 @@ function selectFetchTargets(feeds) {
 // して computeStarredArticleIds / planStarredAudioTriggers から
 // 使われ、実際の発火対象は実効スターの付いた動画だけになる。
 
-const YT_AUDIO_TRIGGER_BASE_URL = 'https://a.ze.gs/yt-audio/';
 const YT_AUDIO_TRIGGER_PER_FEED = 3;
 // 音楽ジャンルの特別扱い: このジャンルのフィードだけ、期間の縛りを
 // 外して新しい順に YT_AUDIO_TRIGGER_MUSIC_PER_FEED 本まで選ぶ。
@@ -886,9 +911,10 @@ const YT_AUDIO_TRIGGER_MAX_PER_RUN = 200;
 const YT_AUDIO_TRIGGER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // 常時対応チャンネル (本人のチャンネル「藤原史和 川口を歩くQAエンジニア」)。
 // reader-gas が毎時、このチャンネルの動画をすべて yt-audio のキューへ
-// 入れ直し、ze 側のバッチは URL が4時間を超えたエントリを取り直す。
+// 入れ直し、自宅サーバー側のバッチは URL が4時間を超えたエントリを
+// 取り直す。
 // そのため、このチャンネルの音声 URL は失効前に更新され続け、
-// 常に新鮮な enclosure が付く (= 常に再生可能)。ze 側の変更は不要。
+// 常に新鮮な enclosure が付く (= 常に再生可能)。自宅サーバー側の変更は不要。
 const YT_AUDIO_ALWAYS_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
 
 // 発火対象を選ぶ純関数: フィードごとに、まず公開日時が読めて
@@ -1063,8 +1089,11 @@ function planStarredAudioTriggers(feeds, articles, nowMs) {
 }
 
 // 実際のトリガー発火 (1件分)。応答は待たない (muteHttpExceptions)。
+// ベース URL (A_ZE_GS_BASE_URL) が未設定なら何もしない。
 function fireYouTubeAudioTrigger(videoId, token) {
-  UrlFetchApp.fetch(YT_AUDIO_TRIGGER_BASE_URL + encodeURIComponent(String(videoId || '')), {
+  const base = scriptBaseUrl('A_ZE_GS_BASE_URL');
+  if (!base) return;
+  UrlFetchApp.fetch(base + '/yt-audio/' + encodeURIComponent(String(videoId || '')), {
     method: 'get',
     headers: { 'X-Api-Token': String(token || '') },
     muteHttpExceptions: true,
@@ -1073,6 +1102,7 @@ function fireYouTubeAudioTrigger(videoId, token) {
 
 // 発火対象ぶんのトリガーをまとめて発火し、発火件数を返す。
 // A_ZE_GS_TOKEN が未設定なら何もしない (エラーにもしない)。
+// ベース URL (A_ZE_GS_BASE_URL) が未設定の場合も同様に省く。
 // 1回の巡回では最大 YT_AUDIO_TRIGGER_MAX_PER_RUN 件までとし、
 // 残りはログに残して省く。fireTrigger はテスト用の差し込み口
 // (省略時は fireYouTubeAudioTrigger)。時間ベーストリガーから呼ばれる
@@ -1083,6 +1113,7 @@ function fireYouTubeAudioTrigger(videoId, token) {
 function fireYouTubeAudioTriggers(feedVideos, fireTrigger, nowMs, plannedIds) {
   const token = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
   if (!token) return 0;
+  if (!scriptBaseUrl('A_ZE_GS_BASE_URL')) return 0;
   const fire = typeof fireTrigger === 'function' ? fireTrigger : fireYouTubeAudioTrigger;
   const planned = Array.isArray(plannedIds) ? plannedIds : planYouTubeAudioTriggers(feedVideos, nowMs);
   const targets = planned.slice(0, YT_AUDIO_TRIGGER_MAX_PER_RUN);
@@ -2107,4 +2138,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeChannelTitle, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
