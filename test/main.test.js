@@ -62,6 +62,8 @@ import {
   remainingRowsAfterDelete,
   reorderRowsByIds,
   validateFeedOrder,
+  groupRowsByCategory,
+  regroupFeedsByCategory,
   appendNewEntries,
   parseYouTubeSubscriptionsPage,
   fetchMyYouTubeSubscriptions,
@@ -1563,6 +1565,125 @@ test('reorderRowsByIds: feedIds に無い行は元の順で末尾に残り、重
     ['b', 'B'],
     ['c', 'C'],
   ]);
+});
+
+test('groupRowsByCategory: バラバラな並びをカテゴリ出現順に安定グループ化する', () => {
+  const values = [
+    FEED_HEADERS_ROW,
+    ['a', 'A', 'https://a.example/feed', '個人', '', '', '', '', ''],
+    ['b', 'B', 'https://b.example/feed', '音楽', '', '', '', '', ''],
+    ['c', 'C', 'https://c.example/feed', '個人', '', '', '', '', ''],
+    ['d', 'D', 'https://d.example/feed', '川口', '', '', '', '', ''],
+    ['e', 'E', 'https://e.example/feed', '音楽', '', '', '', '', ''],
+  ];
+  const grouped = groupRowsByCategory(values, 3);
+  // カテゴリの出現順は 個人 → 音楽 → 川口。カテゴリ内は元の順序を維持する
+  assert.deepEqual(grouped.map((r) => r[0]), ['id', 'a', 'c', 'b', 'e', 'd']);
+  // 行の追加・削除はなく、全列の値も保持される (行そのものが同じ参照)
+  assert.equal(grouped.length, values.length);
+  assert.equal(grouped[1], values[1]);
+  assert.equal(grouped[2], values[3]);
+  assert.equal(grouped[3], values[2]);
+  assert.equal(grouped[5], values[4]);
+});
+
+test('groupRowsByCategory: グループ化済みなら並びは変わらない', () => {
+  const values = [
+    FEED_HEADERS_ROW,
+    ['a', 'A', 'https://a.example/feed', '個人', '', '', '', '', ''],
+    ['c', 'C', 'https://c.example/feed', '個人', '', '', '', '', ''],
+    ['b', 'B', 'https://b.example/feed', '音楽', '', '', '', '', ''],
+  ];
+  const grouped = groupRowsByCategory(values, 3);
+  assert.deepEqual(grouped.map((r) => r[0]), ['id', 'a', 'c', 'b']);
+  for (let i = 0; i < values.length; i++) assert.equal(grouped[i], values[i]);
+});
+
+test('groupRowsByCategory: 新しいカテゴリのフィードは末尾側のブロックに残る', () => {
+  const values = [
+    FEED_HEADERS_ROW,
+    ['a', 'A', 'https://a.example/feed', '音楽', '', '', '', '', ''],
+    ['b', 'B', 'https://b.example/feed', '個人', '', '', '', '', ''],
+    ['c', 'C', 'https://c.example/feed', '音楽', '', '', '', '', ''],
+    // 新規追加されたフィード (新しいカテゴリ) は末尾に付いている
+    ['z', 'Z', 'https://z.example/feed', 'ゲーム', '', '', '', '', ''],
+  ];
+  const grouped = groupRowsByCategory(values, 3);
+  // 音楽 (a, c) → 個人 (b) → ゲーム (z) で、新カテゴリは末尾側に残る
+  assert.deepEqual(grouped.map((r) => r[0]), ['id', 'a', 'c', 'b', 'z']);
+});
+
+test('groupRowsByCategory: カテゴリ列が無い・行が無い入力はそのまま返す', () => {
+  const noCat = [['id', 'title'], ['a', 'A']];
+  assert.equal(groupRowsByCategory(noCat, -1), noCat);
+  const headerOnly = [FEED_HEADERS_ROW];
+  assert.equal(groupRowsByCategory(headerOnly, 3), headerOnly);
+  assert.equal(groupRowsByCategory(null, 3), null);
+});
+
+test('regroupFeedsByCategory: 散らかった feeds を書き戻し、2回目は書き込まない', () => {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['a', 'A', 'https://a.example/feed', '個人', 'etag-a', '', '2026-11-17T00:00:00.000Z', '200', ''],
+      ['b', 'B', 'https://b.example/feed', '音楽', '', '', '', '', ''],
+      ['c', 'C', 'https://c.example/feed', '個人', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW],
+  });
+  let clears = 0;
+  const sheet = ss.sheets['feeds'];
+  const origClear = sheet.clearContents.bind(sheet);
+  sheet.clearContents = () => { clears++; return origClear(); };
+  const restore = installSpreadsheet(ss);
+  try {
+    assert.deepEqual(regroupFeedsByCategory(), { ok: true, changed: true });
+    assert.equal(clears, 1);
+    // 全列の値が保持されたまま、個人 (a, c) → 音楽 (b) の順になる
+    assert.deepEqual(sheet.rows, [
+      FEED_HEADERS_ROW,
+      ['a', 'A', 'https://a.example/feed', '個人', 'etag-a', '', '2026-11-17T00:00:00.000Z', '200', ''],
+      ['c', 'C', 'https://c.example/feed', '個人', '', '', '', '', ''],
+      ['b', 'B', 'https://b.example/feed', '音楽', '', '', '', '', ''],
+    ]);
+    // すでにまとまっているので2回目は書き込まない
+    assert.deepEqual(regroupFeedsByCategory(), { ok: true, changed: false });
+    assert.equal(clears, 1);
+  } finally { restore(); }
+});
+
+test('regroupFeedsByCategory: feeds タブが無い・ヘッダーだけなら何もしない', () => {
+  const ss = new FakeSpreadsheet({});
+  const restore = installSpreadsheet(ss);
+  try {
+    assert.deepEqual(regroupFeedsByCategory(), { ok: true, changed: false });
+    assert.equal(ss.sheets['feeds'], undefined);
+  } finally { restore(); }
+  const ss2 = new FakeSpreadsheet({ feeds: [FEED_HEADERS_ROW] });
+  const restore2 = installSpreadsheet(ss2);
+  try {
+    assert.deepEqual(regroupFeedsByCategory(), { ok: true, changed: false });
+    assert.equal(ss2.sheets['feeds'].rows.length, 1);
+  } finally { restore2(); }
+});
+
+test('fetchFeeds: 巡回の保守処理で feeds がカテゴリごとにまとまる', () => {
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW,
+      ['a', 'A', 'https://a.example/feed', '個人', '', '', '', '', ''],
+      ['b', 'B', 'https://b.example/feed', '音楽', '', '', '', '', ''],
+      ['c', 'C', 'https://c.example/feed', '個人', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW],
+  });
+  const restore = installSpreadsheet(ss);
+  try {
+    const result = fetchFeeds();
+    assert.equal(result.ok, true);
+    // YouTube フィードは無いので取得対象は0件。それでも保守処理で
+    // feeds の並びが 個人 (a, c) → 音楽 (b) にまとまる
+    assert.equal(result.fetched, 0);
+    assert.deepEqual(ss.sheets['feeds'].rows.map((r) => r[0]), ['id', 'a', 'c', 'b']);
+  } finally { restore(); }
 });
 
 test('youtubeApiErrorDetail: message が空なら reason にフォールバックし、詳細は200字で切る', () => {

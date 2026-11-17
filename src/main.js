@@ -35,6 +35,10 @@
 // 作成)。クライアントが log_events (オーナー専用) で送るイベントを
 // events に一括追記し、週次集計 (weekly_stats) と90日超の生ログの
 // 間引きを、毎時 fetchFeeds に相乗りして週1回だけ行う。
+// feeds の並び (表示順 = 行順) も毎時 fetchFeeds の保守処理で
+// カテゴリごとに安定グループ化する。新規フィードは末尾に付くため
+// 放っておくとカテゴリが散らかる。順序が変わるときだけ書き戻す
+// ので、相乗りしても通常は読み取り1回で済む。
 // 再生対象 (音声抽出トリガーと RSS の enclosure) はスター制:
 // 実効スターが付いた YouTube 動画だけを対象にする。シートに保存
 // するのは articles タブの star_override 列 (手動オーバーライド:
@@ -955,6 +959,35 @@ function validateFeedOrder(feedIds, currentIds) {
   return { ok: true };
 }
 
+// Stably groups the data rows of a sheet-values array by category: rows
+// sharing a category become one contiguous block, blocks follow the
+// order in which each category first appears in the current rows, and
+// rows inside a block keep their current relative order. A feed in a
+// brand-new category therefore stays on the tail side (its block takes
+// the position where the category first appeared). The header row stays
+// first and row arrays are reused untouched, so callers can detect
+// "no change" by row identity (same convention as reorderRowsByIds).
+// Defensively, a missing category column (categoryIdx < 0) and inputs
+// with fewer than 2 rows are returned unchanged.
+function groupRowsByCategory(values, categoryIdx) {
+  if (!values || values.length < 2 || categoryIdx < 0) return values;
+  const order = [];
+  const rowsByCategory = new Map();
+  for (let i = 1; i < values.length; i++) {
+    const category = String(values[i][categoryIdx] || '');
+    if (!rowsByCategory.has(category)) {
+      rowsByCategory.set(category, []);
+      order.push(category);
+    }
+    rowsByCategory.get(category).push(values[i]);
+  }
+  const grouped = [values[0]];
+  order.forEach((category) => {
+    rowsByCategory.get(category).forEach((row) => grouped.push(row));
+  });
+  return grouped;
+}
+
 // --- Auth (tweet-gas pattern, simplified for reader) ---
 
 function isAllowedIdTokenPayload(json, clientId) {
@@ -1820,6 +1853,16 @@ function fetchFeeds(fireTrigger) {
   } catch (e) {
     // 集計できなくても記事の取り込みは成功として扱う。
   }
+  // feeds の並び (表示順) をカテゴリごとにまとめる保守処理も、この
+  // 巡回に相乗りする (新しいトリガーは作らない)。巡回の最後に置く
+  // ことで、購読同期の追加・タイトル補完・行更新が済んだ最終状態を
+  // まとめ直す。順序が変わるときだけ書き戻すため、まとまっている
+  // 間は読み取り1回で済む。失敗しても巡回結果に影響させない。
+  try {
+    regroupFeedsByCategory();
+  } catch (e) {
+    // まとめ直しができなくても記事の取り込みは成功として扱う。
+  }
   return { ok: true, fetched: youtubeFeeds.length, added: addedTotal };
 }
 
@@ -2200,6 +2243,29 @@ function handleReorderFeeds(body) {
     sheet.getRange(1, 1, reordered.length, reordered[0].length).setValues(reordered);
   }
   return { ok: true };
+}
+
+// feeds の並び (表示順 = 行順) をカテゴリごとにまとめる保守処理
+// (fetchFeeds から相乗り)。新規フィードは末尾に追加されるため、
+// 放っておくとカテゴリが散らかったままになる。行の全列の値を
+// 保持したまま行順だけを変え (行の追加・削除はしない)、すでに
+// まとまっている場合は書き戻しを省く (行参照の同一性で判定する)。
+function regroupFeedsByCategory() {
+  const sheet = openDataSpreadsheet().getSheetByName('feeds');
+  if (!sheet) return { ok: true, changed: false };
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { ok: true, changed: false };
+  const categoryIdx = values[0].indexOf('category');
+  if (categoryIdx < 0) return { ok: true, changed: false };
+  const grouped = groupRowsByCategory(values, categoryIdx);
+  let changed = false;
+  for (let i = 0; i < values.length; i++) {
+    if (grouped[i] !== values[i]) { changed = true; break; }
+  }
+  if (!changed) return { ok: true, changed: false };
+  sheet.clearContents();
+  sheet.getRange(1, 1, grouped.length, grouped[0].length).setValues(grouped);
+  return { ok: true, changed: true };
 }
 
 // スターの手動オーバーライドを保存する (オーナー専用アクション
@@ -2584,4 +2650,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
