@@ -3301,6 +3301,115 @@ test('fetchFeeds: プレイリストの記事は古くても全件に抽出ト�
   } finally { restore(); }
 });
 
+test('fetchFeeds: プレイリスト取り込みでも新規記事に長さが保存される', () => {
+  const requested = [];
+  const { ss, restore } = fetchAudioEnv({
+    feedsRows: [PL_FEED_ROW],
+    responder: (url) => {
+      requested.push(String(url));
+      return {
+        getResponseCode: () => 200,
+        getContentText: () => (String(url).includes('v3/videos?')
+          ? durationsBody({ vidPlNew001: 'PT4M38S', vidPlNew002: 'PT30S' })
+          : playlistPageBody([
+            ['vidPlNew001', '2026-11-12T00:00:00Z'],
+            ['vidPlNew002', '2026-11-11T00:00:00Z'],
+          ])),
+      };
+    },
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 2);
+    const rows = ss.sheets['articles'].rows;
+    const durIdx = rows[0].indexOf('duration_sec');
+    assert.ok(durIdx >= 0);
+    const byLink = {};
+    rows.slice(1).forEach((r) => { byLink[r[3]] = r[durIdx]; });
+    assert.equal(byLink['https://www.youtube.com/watch?v=vidPlNew001'], 278);
+    assert.equal(byLink['https://www.youtube.com/watch?v=vidPlNew002'], 30);
+    // 長さは videos.list へページ単位でまとめて1回だけ引かれる
+    const videoRequests = requested.filter((u) => u.includes('v3/videos?'));
+    assert.equal(videoRequests.length, 1);
+    assert.ok(videoRequests[0].includes('vidPlNew001'));
+    assert.ok(videoRequests[0].includes('vidPlNew002'));
+  } finally { restore(); }
+});
+
+test('fetchFeeds: プレイリストの既存記事は長さが空の行だけ埋め戻され、入っている行は引き直さない', () => {
+  const requested = [];
+  const ss = new FakeSpreadsheet({
+    feeds: [FEED_HEADERS_ROW, PL_FEED_ROW],
+    articles: [
+      [...ARTICLE_HEADERS_ROW, 'star_override', 'duration_sec'],
+      [...plArticleRow('vidPlFill01', '2026-11-01T00:00:00.000Z'), '', ''],
+      [...plArticleRow('vidPlKnow01', '2026-11-02T00:00:00.000Z'), '', 321],
+    ],
+  });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({
+      SPREADSHEET_ID: 'fake-spreadsheet-id', YOUTUBE_API_KEY: 'fake-api-key',
+      A_ZE_GS_BASE_URL: 'https://a.ze.gs', Y_ZE_GS_BASE_URL: 'https://y.ze.gs',
+    }).service,
+    UrlFetchApp: {
+      fetch: (url) => {
+        requested.push(String(url));
+        return {
+          getResponseCode: () => 200,
+          getContentText: () => (String(url).includes('v3/videos?')
+            ? durationsBody({ vidPlFill01: 'PT4M00S', vidPlKnow01: 'PT10M39S' })
+            : playlistPageBody([
+              ['vidPlFill01', '2026-11-01T00:00:00Z'],
+              ['vidPlKnow01', '2026-11-02T00:00:00Z'],
+            ])),
+        };
+      },
+    },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 0); // どちらも既存なので再追加はされない
+    const rows = ss.sheets['articles'].rows;
+    const durIdx = rows[0].indexOf('duration_sec');
+    assert.equal(rows[1][durIdx], 240); // 空だった行は埋め戻される
+    assert.equal(rows[2][durIdx], 321); // 入っていた行は上書きされない
+    // 引き直しの対象は長さが空だった行だけに絞られる
+    const videoRequests = requested.filter((u) => u.includes('v3/videos?'));
+    assert.equal(videoRequests.length, 1);
+    assert.ok(videoRequests[0].includes('vidPlFill01'));
+    assert.ok(!videoRequests[0].includes('vidPlKnow01'));
+  } finally { restore(); }
+});
+
+test('fetchFeeds: プレイリストで長さの取得に失敗しても取り込みは完了する (fail-open)', () => {
+  const { ss, restore } = fetchAudioEnv({
+    feedsRows: [PL_FEED_ROW],
+    responder: (url) => (String(url).includes('v3/videos?')
+      ? { getResponseCode: () => 500, getContentText: () => '{}' }
+      : {
+        getResponseCode: () => 200,
+        getContentText: () => playlistPageBody([
+          ['vidPlFail01', '2026-11-12T00:00:00Z'],
+          ['vidPlFail02', '2026-11-11T00:00:00Z'],
+        ]),
+      }),
+  });
+  try {
+    const result = fetchFeeds(() => {});
+    assert.equal(result.ok, true);
+    assert.equal(result.added, 2);
+    assert.equal(ss.sheets['feeds'].rows[1][7], '200'); // 巡回自体は成功扱い
+    const rows = ss.sheets['articles'].rows;
+    const durIdx = rows[0].indexOf('duration_sec');
+    assert.ok(durIdx >= 0);
+    assert.ok(rows.slice(1).every((r) => r[durIdx] === '' || r[durIdx] === undefined));
+  } finally { restore(); }
+});
+
 // --- 動画の長さ (duration) の取り込みとスター判定への反映 ---
 
 function durationsBody(map) {
