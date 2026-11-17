@@ -4629,6 +4629,37 @@ test('sanitizeEvent: 5種のイベントを行にし、不正な行は捨てる'
   assert.equal(sanitizeEvent('feed_view', now), null);
 });
 
+test('sanitizeEvent: 再生診断の5種も行にし、stall は seconds を持つ', () => {
+  const now = '2026-11-17T00:00:00.000Z';
+  // 診断イベントは記事の文脈を保持し、stall 以外は seconds を
+  // 持たない (渡されても保存しない)
+  assert.deepEqual(
+    sanitizeEvent({ type: 'preload_error', feed_id: 'feed-a', article_id: 'art-1', article_title: '記事1', seconds: 10 }, now),
+    [now, 'preload_error', 'feed-a', '', 'art-1', '記事1', '']
+  );
+  assert.deepEqual(
+    sanitizeEvent({ type: 'advance_swap', feed_id: 'feed-a', article_id: 'art-2' }, now),
+    [now, 'advance_swap', 'feed-a', '', 'art-2', '', '']
+  );
+  assert.deepEqual(
+    sanitizeEvent({ type: 'advance_load', feed_id: 'feed-a', article_id: 'art-2' }, now),
+    [now, 'advance_load', 'feed-a', '', 'art-2', '', '']
+  );
+  assert.deepEqual(
+    sanitizeEvent({ type: 'recover', feed_id: 'feed-a', article_id: 'art-1' }, now),
+    [now, 'recover', 'feed-a', '', 'art-1', '', '']
+  );
+  // stall は play と同じく seconds (止まった位置) を整数化して持ち、
+  // 不正なら行を捨てる
+  assert.deepEqual(
+    sanitizeEvent({ type: 'stall', feed_id: 'feed-a', article_id: 'art-1', seconds: 19.8 }, now),
+    [now, 'stall', 'feed-a', '', 'art-1', '', 19]
+  );
+  assert.equal(sanitizeEvent({ type: 'stall', feed_id: 'feed-a', seconds: -1 }, now), null);
+  assert.equal(sanitizeEvent({ type: 'stall', feed_id: 'feed-a', seconds: 'abc' }, now), null);
+  assert.equal(sanitizeEvent({ type: 'stall', feed_id: 'feed-a' }, now), null);
+});
+
 test('sanitizeEventBatch: 文字列は上限で切り、1リクエスト最大50件', () => {
   const now = '2026-11-17T00:00:00.000Z';
   const rows = sanitizeEventBatch([
