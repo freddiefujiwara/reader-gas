@@ -4738,7 +4738,7 @@ test('sanitizeEvent: 5種のイベントを行にし、不正な行は捨てる'
   assert.equal(sanitizeEvent('feed_view', now), null);
 });
 
-test('sanitizeEvent: 再生診断の5種も行にし、stall は seconds を持つ', () => {
+test('sanitizeEvent: 再生診断の種別も行にし、stall は seconds を持つ', () => {
   const now = '2026-11-17T00:00:00.000Z';
   // 診断イベントは記事の文脈を保持し、stall 以外は seconds を
   // 持たない (渡されても保存しない)
@@ -4767,6 +4767,26 @@ test('sanitizeEvent: 再生診断の5種も行にし、stall は seconds を持�
   assert.equal(sanitizeEvent({ type: 'stall', feed_id: 'feed-a', seconds: -1 }, now), null);
   assert.equal(sanitizeEvent({ type: 'stall', feed_id: 'feed-a', seconds: 'abc' }, now), null);
   assert.equal(sanitizeEvent({ type: 'stall', feed_id: 'feed-a' }, now), null);
+});
+
+test('sanitizeEvent: deck_overlap は seconds (待機側の止めた位置) を任意で持つ', () => {
+  const now = '2026-11-18T00:00:00.000Z';
+  // 待機側に載っていた曲の文脈を保持し、seconds は0以上の数値なら
+  // 整数化して持つ
+  assert.deepEqual(
+    sanitizeEvent({ type: 'deck_overlap', feed_id: 'feed-a', article_id: 'art-9', article_title: '次曲', seconds: 42.7 }, now),
+    [now, 'deck_overlap', 'feed-a', '', 'art-9', '次曲', 42]
+  );
+  // seconds が無くても行は捨てない (位置は任意の手がかり)。
+  // 不正な seconds は空にするだけで、行自体は残す
+  assert.deepEqual(
+    sanitizeEvent({ type: 'deck_overlap', feed_id: 'feed-a', article_id: 'art-9' }, now),
+    [now, 'deck_overlap', 'feed-a', '', 'art-9', '', '']
+  );
+  assert.deepEqual(
+    sanitizeEvent({ type: 'deck_overlap', feed_id: 'feed-a', article_id: 'art-9', seconds: 'abc' }, now),
+    [now, 'deck_overlap', 'feed-a', '', 'art-9', '', '']
+  );
 });
 
 test('sanitizeEventBatch: 文字列は上限で切り、1リクエスト最大50件', () => {
