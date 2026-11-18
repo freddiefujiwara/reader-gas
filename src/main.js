@@ -77,6 +77,7 @@ const WEEKLY_STATS_HEADERS = ['week', 'feed_id', 'feed_title', 'views', 'opens',
 const EVENT_TYPES = {
   feed_view: true, article_open: true, play: true, scroll: true, expand: true,
   preload_error: true, advance_swap: true, advance_load: true, stall: true, recover: true,
+  deck_overlap: true,
 };
 const EVENT_LOG_MAX_PER_REQUEST = 50;
 const EVENT_ID_MAX_CHARS = 128;
@@ -2346,13 +2347,15 @@ function handleSetStar(body, fireTrigger) {
 // クライアントが訪問ごとに最大1回だけ送る) / expand (記事カードの
 // 要約を「もっと見る」で展開した。記事への興味の強さを示すシグナル)
 // の5つだけ。週次集計は weekly_stats タブへ畳み、生ログは90日で間引く。
-// 再生診断の5種も同じ経路で受ける (週次集計の対象外で、生ログとして
+// 再生診断の6種も同じ経路で受ける (週次集計の対象外で、生ログとして
 // だけ残る): preload_error (次曲の先読みでエラーが起きた) /
 // advance_swap (曲の終了で、待機側への役割交代で次へ進んだ) /
 // advance_load (曲の終了で、従来経路の新規読み込みで次へ進んだ) /
 // stall (再生中に位置が進まない状態を検知した。seconds は止まった
 // 位置) / recover (フォアグラウンド復帰時の回復が、止まっていた
-// 再生を再開・前進させた)。
+// 再生を再開・前進させた) / deck_overlap (待機側の要素が再生状態
+// になっているのをクライアントが検出して止めた。対象は待機側に
+// 載っていた曲、seconds は待機側の止めた位置)。
 
 // Asia/Tokyo (UTC+9、夏時間なし) で見た週の開始日 (月曜) を
 // 'YYYY-MM-DD' で返す。文字列の辞書順がそのまま日付順になる。
@@ -2369,9 +2372,10 @@ function weekStartKey(timeMs) {
 
 // イベント1件を検証して events タブの行 (配列) にする。不正なら null。
 // ts はクライアント値が解釈できればそれを ISO に正規化し、無ければ
-// 受付時刻 (nowIso) を使う。文字列は上限で切り、play と stall 以外の
-// seconds は保存しない (空)。play と stall の seconds が0以上の
-// 数値でない行は捨てる。
+// 受付時刻 (nowIso) を使う。文字列は上限で切り、play と stall と
+// deck_overlap 以外の seconds は保存しない (空)。play と stall の
+// seconds が0以上の数値でない行は捨てる (deck_overlap の seconds は
+// 任意で、数値でなければ空にする)。
 function sanitizeEvent(raw, nowIso) {
   if (!raw || typeof raw !== 'object') return null;
   const type = String(raw.type || '');
@@ -2382,6 +2386,10 @@ function sanitizeEvent(raw, nowIso) {
   const articleId = String(raw.article_id || raw.articleId || '').slice(0, EVENT_ID_MAX_CHARS);
   const articleTitle = String(raw.article_title || raw.articleTitle || '').slice(0, EVENT_TITLE_MAX_CHARS);
   let seconds = '';
+  if (type === 'deck_overlap') {
+    const s = Number(raw.seconds);
+    if (Number.isFinite(s) && s >= 0) seconds = Math.floor(s);
+  }
   if (type === 'play' || type === 'stall') {
     const s = Number(raw.seconds);
     if (!Number.isFinite(s) || s < 0) return null;
