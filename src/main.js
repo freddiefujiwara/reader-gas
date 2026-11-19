@@ -79,6 +79,8 @@ const EVENT_TYPES = {
   preload_error: true, advance_swap: true, advance_load: true, stall: true, recover: true,
   deck_overlap: true,
 };
+// 件数だけを数えるイベント種別と、weekly_stats 側のフィールド名の対応。
+const EVENT_COUNTER_FIELDS = { feed_view: 'views', article_open: 'opens', scroll: 'scrolls', expand: 'expands' };
 const EVENT_LOG_MAX_PER_REQUEST = 50;
 const EVENT_ID_MAX_CHARS = 128;
 const EVENT_TITLE_MAX_CHARS = 200;
@@ -89,6 +91,15 @@ const WEEKLY_STATS_MAX_WEEKS = 26;
 
 // --- Sheets helpers (xuexi-gas と同型) ---
 
+// 値配列の1行をヘッダー名キーのオブジェクトにする。行に無いセルは ''。
+function rowObject(headers, row) {
+  const obj = {};
+  (headers || []).forEach((h, idx) => {
+    obj[h] = row && row[idx] !== undefined ? row[idx] : '';
+  });
+  return obj;
+}
+
 function rowsToObjects(values) {
   if (!values || values.length < 2) return [];
   const headers = values[0];
@@ -96,13 +107,52 @@ function rowsToObjects(values) {
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
     if (!row || row.every((c) => c === '' || c === null || c === undefined)) continue;
-    const obj = {};
-    headers.forEach((h, idx) => {
-      obj[h] = row[idx] === undefined ? '' : row[idx];
-    });
-    out.push(obj);
+    out.push(rowObject(headers, row));
   }
   return out;
+}
+
+// データ行 (添字1始まり) から条件に合う最初の行の添字を探す。無ければ -1。
+function findDataRowIndex(values, pred) {
+  for (let i = 1; i < (values || []).length; i++) {
+    if (pred(values[i])) return i;
+  }
+  return -1;
+}
+
+// シートの全内容を値配列で置き換える (残す行だけを書き戻す削除や、
+// 行順の書き換えで使う)。
+function replaceSheetValues(sheet, values) {
+  sheet.clearContents();
+  sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+}
+
+// 行順だけが違う値配列への書き換え。行参照の同一性で「並びが
+// 変わったか」を判定し、変わったときだけ書き戻して true を返す。
+function rewriteRowsIfChanged(sheet, current, next) {
+  for (let i = 0; i < current.length; i++) {
+    if (next[i] !== current[i]) {
+      replaceSheetValues(sheet, next);
+      return true;
+    }
+  }
+  return false;
+}
+
+// ヘッダーに列が無ければ末尾へ遅延追加し、その列位置 (0始まり) を
+// 返す (star_override / duration_sec と同じ移行パターン)。
+function ensureColumnIndex(sheet, headers, name) {
+  let idx = headers.indexOf(name);
+  if (idx < 0) {
+    idx = headers.length;
+    sheet.getRange(1, idx + 1).setValue(name);
+  }
+  return idx;
+}
+
+// スクリプトプロパティを1件読む (単一読み取り箇所の共通形)。
+function scriptProperty(name) {
+  return PropertiesService.getScriptProperties().getProperty(name);
 }
 
 function readSheetAsObjects(ss, sheetName) {
@@ -318,6 +368,12 @@ function youtubeFeedUrlFromPlaylistId(playlistId) {
   return 'https://www.youtube.com/playlist?list=' + String(playlistId || '');
 }
 
+// URL が YouTube フィード (チャンネル・プレイリスト) かどうかの判定。
+// 巡回対象の選定・fetchUrl の組み立て・?rss= の検証はすべてこれで揃える。
+function isYouTubeFeedUrl(url) {
+  return !!(youtubeChannelIdFromUrl(url) || youtubePlaylistIdFromUrl(url));
+}
+
 // シートに保存する正規形の YouTube フィード URL (チャンネルページ URL) を
 // チャンネルIDから組み立てる。フィードID (URL のハッシュ) はこの形から
 // 決めるため、登録経路が違っても保存形は必ずこれに寄せる。
@@ -455,21 +511,25 @@ function attachYouTubeDurations(entries, apiKey) {
   }
 }
 
-// channels.list の応答からチャンネル名を取り出す。タイトル未設定の
-// YouTube フィード (登録時に空で入る) の補完に使う。取れなければ空文字。
-function parseYouTubeChannelTitle(jsonText) {
+// channels.list / playlists.list の応答から、先頭 item の
+// snippet.title を取り出す共通処理。取れなければ空文字。
+function firstSnippetTitle(jsonText) {
   const items = jsonItems(jsonText);
   const sn = (items[0] && items[0].snippet) || {};
   return String(sn.title || '').trim();
+}
+
+// channels.list の応答からチャンネル名を取り出す。タイトル未設定の
+// YouTube フィード (登録時に空で入る) の補完に使う。取れなければ空文字。
+function parseYouTubeChannelTitle(jsonText) {
+  return firstSnippetTitle(jsonText);
 }
 
 // playlists.list の応答からプレイリスト名を取り出す
 // (parseYouTubeChannelTitle と対)。タイトル未設定のプレイリスト
 // フィードの補完に使う。取れなければ空文字。
 function parseYouTubePlaylistTitle(jsonText) {
-  const items = jsonItems(jsonText);
-  const sn = (items[0] && items[0].snippet) || {};
-  return String(sn.title || '').trim();
+  return firstSnippetTitle(jsonText);
 }
 
 // channels.list の応答から { channelId, title } を取り出す (登録時の
@@ -489,7 +549,7 @@ function parseChannelLookupResponse(jsonText) {
 // handleSaveFeed からは差し替え可能な resolver として呼ばれる。
 function lookupYouTubeChannelByHandle(handle) {
   try {
-    const apiKey = PropertiesService.getScriptProperties().getProperty('YOUTUBE_API_KEY');
+    const apiKey = scriptProperty('YOUTUBE_API_KEY');
     if (!apiKey) return null;
     const apiUrl = 'https://www.googleapis.com/youtube/v3/channels?part=snippet'
       + '&forHandle=' + encodeURIComponent('@' + String(handle || ''))
@@ -617,7 +677,7 @@ function getAudioUrlsMapFromCache(cache) {
     let data;
     try { data = JSON.parse(text); } catch (e) { return null; }
     if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
-    return parseAudioUrlsMap(text);
+    return audioUrlsMapFromData(data);
   } catch (e) {
     return null;
   }
@@ -666,6 +726,13 @@ function audioUrlsJsonUrl() {
 function parseAudioUrlsMap(jsonText) {
   let data;
   try { data = JSON.parse(String(jsonText || '')); } catch (e) { return {}; }
+  return audioUrlsMapFromData(data);
+}
+
+// パース済みの audio-urls.json オブジェクトをマップ化する
+// (parseAudioUrlsMap の本体。キャッシュ復元側はパース済みの
+// オブジェクトをそのまま渡し、二重パースを避ける)。
+function audioUrlsMapFromData(data) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
   const map = {};
   Object.keys(data).forEach((videoId) => {
@@ -910,8 +977,7 @@ function deleteRowsById(ss, sheetName, keyHeader, ids) {
   if (remaining.length === values.length) return;
   // deleteRow を行ごとに呼ぶと数十〜数百回になると極端に遅いため、
   // 残す行だけを一括で書き戻す。
-  sheet.clearContents();
-  sheet.getRange(1, 1, remaining.length, remaining[0].length).setValues(remaining);
+  replaceSheetValues(sheet, remaining);
 }
 
 // Rearranges the data rows of a sheet-values array to follow feedIds order.
@@ -1012,7 +1078,7 @@ function verifyIdToken(idToken) {
   if (res.getResponseCode() !== 200) return null;
   let json = null;
   try { json = JSON.parse(res.getContentText()); } catch (e) { return null; }
-  const clientId = PropertiesService.getScriptProperties().getProperty('GOOGLE_CLIENT_ID');
+  const clientId = scriptProperty('GOOGLE_CLIENT_ID');
   if (!isAllowedIdTokenPayload(json, clientId)) return null;
   return json;
 }
@@ -1173,8 +1239,7 @@ function backfillArticleDurations(articlesSheet, feed, entries, durationColIdx) 
 // YouTube フィードにはチャンネル (保存形 /channel/UC...) とプレイリスト
 // (保存形 /playlist?list=...) の2種がある。
 function selectFetchTargets(feeds) {
-  return (feeds || []).filter((f) => f && f.id && f.url
-    && (youtubeChannelIdFromUrl(f.url) || youtubePlaylistIdFromUrl(f.url)));
+  return (feeds || []).filter((f) => f && f.id && f.url && isYouTubeFeedUrl(f.url));
 }
 
 // --- YouTube 音声抽出トリガー (自宅サーバー連携) ---
@@ -1266,7 +1331,8 @@ function planYouTubeAudioTriggers(feedVideos, nowMs) {
       const ts = Date.parse(v.publishedAt || '');
       return !isNaN(ts);
     });
-    const sorted = candidates.slice().sort((a, b) => {
+    // candidates は filter の新規配列なので、そのまま並べ替えてよい。
+    const sorted = candidates.sort((a, b) => {
       const tb = Date.parse((b && b.publishedAt) || '') || 0;
       const ta = Date.parse((a && a.publishedAt) || '') || 0;
       return tb - ta;
@@ -1405,6 +1471,13 @@ function planStarredAudioTriggers(feeds, articles, nowMs) {
   return ids;
 }
 
+// テスト用の差し込み口 (fireTrigger) の解決: 関数でなければ
+// 既定実装に落とす。時間ベーストリガーから呼ばれる経路では
+// イベントオブジェクトが渡ってくるため、この判定が要る。
+function resolveFireTrigger(fireTrigger) {
+  return typeof fireTrigger === 'function' ? fireTrigger : fireYouTubeAudioTrigger;
+}
+
 // 実際のトリガー発火 (1件分)。応答は待たない (muteHttpExceptions)。
 // ベース URL (A_ZE_GS_BASE_URL) が未設定なら何もしない。
 function fireYouTubeAudioTrigger(videoId, token) {
@@ -1428,10 +1501,10 @@ function fireYouTubeAudioTrigger(videoId, token) {
 // plannedIds (動画IDの配列) を渡した場合は feedVideos からの計画を
 // 省いてそれを発火対象にする (スター制の計画はこちらで渡す)。
 function fireYouTubeAudioTriggers(feedVideos, fireTrigger, nowMs, plannedIds) {
-  const token = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
+  const token = scriptProperty('A_ZE_GS_TOKEN');
   if (!token) return 0;
   if (!scriptBaseUrl('A_ZE_GS_BASE_URL')) return 0;
-  const fire = typeof fireTrigger === 'function' ? fireTrigger : fireYouTubeAudioTrigger;
+  const fire = resolveFireTrigger(fireTrigger);
   const planned = Array.isArray(plannedIds) ? plannedIds : planYouTubeAudioTriggers(feedVideos, nowMs);
   const targets = planned.slice(0, YT_AUDIO_TRIGGER_MAX_PER_RUN);
   if (planned.length > targets.length) {
@@ -1638,33 +1711,18 @@ function syncYouTubeSubscriptions() {
   }
 }
 
-// channels.list でチャンネル名を引く (タイトル未設定の YouTube
-// フィードの補完用)。取れなければ空文字で、失敗は例外にしない
+// channels.list / playlists.list で名前を引く共通処理 (タイトル
+// 未設定の YouTube フィードの補完用)。endpoint は 'channels' か
+// 'playlists'。取れなければ空文字で、失敗は例外にしない
 // (補完できなくても記事の取り込みは続けるため)。
-function lookupYouTubeChannelTitle(channelId, apiKey) {
+function lookupYouTubeTitle(endpoint, id, apiKey) {
   try {
-    const channelUrl = 'https://www.googleapis.com/youtube/v3/channels?part=snippet'
-      + '&id=' + encodeURIComponent(channelId)
-      + '&key=' + encodeURIComponent(apiKey);
-    const res = UrlFetchApp.fetch(channelUrl, { method: 'get', muteHttpExceptions: true });
-    if (res.getResponseCode() !== 200) return '';
-    return parseYouTubeChannelTitle(res.getContentText());
-  } catch (e) {
-    return '';
-  }
-}
-
-// playlists.list でプレイリスト名を引く (lookupYouTubeChannelTitle
-// と対。タイトル未設定のプレイリストフィードの補完用)。取れなければ
-// 空文字で、失敗は例外にしない。
-function lookupYouTubePlaylistTitle(playlistId, apiKey) {
-  try {
-    const apiUrl = 'https://www.googleapis.com/youtube/v3/playlists?part=snippet'
-      + '&id=' + encodeURIComponent(playlistId)
+    const apiUrl = 'https://www.googleapis.com/youtube/v3/' + endpoint + '?part=snippet'
+      + '&id=' + encodeURIComponent(id)
       + '&key=' + encodeURIComponent(apiKey);
     const res = UrlFetchApp.fetch(apiUrl, { method: 'get', muteHttpExceptions: true });
     if (res.getResponseCode() !== 200) return '';
-    return parseYouTubePlaylistTitle(res.getContentText());
+    return firstSnippetTitle(res.getContentText());
   } catch (e) {
     return '';
   }
@@ -1797,15 +1855,11 @@ function fetchFeeds(fireTrigger) {
   // 同じ移行パターン)。
   const articleValuesForDuration = articlesSheet.getDataRange().getValues();
   const articleHeaders = articleValuesForDuration.length ? articleValuesForDuration[0] : ARTICLES_HEADERS;
-  let durationColIdx = articleHeaders.indexOf('duration_sec');
-  if (durationColIdx < 0) {
-    durationColIdx = articleHeaders.length;
-    articlesSheet.getRange(1, durationColIdx + 1).setValue('duration_sec');
-  }
+  const durationColIdx = ensureColumnIndex(articlesSheet, articleHeaders, 'duration_sec');
   const fetchedAt = new Date().toISOString();
   let addedTotal = 0;
   // YouTube フィードは公式APIから取り込む (RSS は 404 のため)。
-  const youtubeApiKey = PropertiesService.getScriptProperties().getProperty('YOUTUBE_API_KEY');
+  const youtubeApiKey = scriptProperty('YOUTUBE_API_KEY');
   youtubeFeeds.forEach((feed) => {
     const rowNum = rowNumById[feed.id];
     try {
@@ -1818,8 +1872,8 @@ function fetchFeeds(fireTrigger) {
       // 補完の失敗は巡回自体の失敗にせず、タイトルは空のまま続ける。
       if (!String(feed.title || '').trim()) {
         const foundTitle = channelId
-          ? lookupYouTubeChannelTitle(channelId, youtubeApiKey)
-          : lookupYouTubePlaylistTitle(playlistId, youtubeApiKey);
+          ? lookupYouTubeTitle('channels', channelId, youtubeApiKey)
+          : lookupYouTubeTitle('playlists', playlistId, youtubeApiKey);
         if (foundTitle) {
           updateFeedRow(feedsSheet, headers, rowNum, { title: foundTitle });
           feed.title = foundTitle;
@@ -2005,7 +2059,7 @@ function validateFeedInput(input) {
     return { ok: false, message: '自動生成プレイリスト（ラジオ／ミックス）は取得できないため登録できません' };
   }
   const title = String(input.title === undefined || input.title === null ? '' : input.title).trim();
-  if (!title && !youtubeChannelIdFromUrl(parsed.url) && !playlistId) {
+  if (!title && !isYouTubeFeedUrl(parsed.url)) {
     return { ok: false, message: 'title is required' };
   }
   let category = '';
@@ -2063,7 +2117,7 @@ function buildFetchUrl(feed, serviceUrl) {
   const url = String(f.url || '');
   const id = String(f.id || '');
   const base = String(serviceUrl || '');
-  if (id && base && (youtubeChannelIdFromUrl(url) || youtubePlaylistIdFromUrl(url))) {
+  if (id && base && isYouTubeFeedUrl(url)) {
     return base + '?rss=' + encodeURIComponent(id);
   }
   return url;
@@ -2153,18 +2207,9 @@ function handleSaveFeed(body, resolveHandle) {
   const headers = values.length ? values[0] : FEEDS_HEADERS;
   const idIdx = headers.indexOf('id');
   const urlIdx = headers.indexOf('url');
-  const rowAt = (i) => {
-    const obj = {};
-    headers.forEach((h, idx) => { obj[h] = values[i][idx]; });
-    return obj;
-  };
+  const rowAt = (i) => rowObject(headers, values[i]);
   // データ行 (1始まりの添字) から条件に合う最初の行を探す。無ければ -1。
-  const findRow = (pred) => {
-    for (let i = 1; i < values.length; i++) {
-      if (pred(values[i])) return i;
-    }
-    return -1;
-  };
+  const findRow = (pred) => findDataRowIndex(values, pred);
   let existing = null;
   let rowNum = -1;
   const takeRow = (i) => { existing = rowAt(i); rowNum = i + 1; };
@@ -2224,11 +2269,9 @@ function handleDeleteFeed(body) {
   const headers = values[0];
   const idIdx = headers.indexOf('id');
   if (idIdx < 0) return { ok: false, error: 'not_found' };
-  let rowNum = -1;
-  for (let i = 1; i < values.length; i++) {
-    if (String(values[i][idIdx]) === feedId) { rowNum = i + 1; break; }
-  }
-  if (rowNum < 0) return { ok: false, error: 'not_found' };
+  const found = findDataRowIndex(values, (row) => String(row[idIdx]) === feedId);
+  if (found < 0) return { ok: false, error: 'not_found' };
+  const rowNum = found + 1;
   deleteRowsById(ss, 'articles', 'feed_id', [feedId]);
   sheet.deleteRow(rowNum);
   // 消えたフィードの RSS がキャッシュから出続けないように落とす
@@ -2255,14 +2298,7 @@ function handleReorderFeeds(body) {
   if (!sheet || values.length < 2) return { ok: true };
   const reordered = reorderRowsByIds(values, idIdx, body.feedIds);
   // 並びが変わらない場合は書き戻しを省く (行参照の同一性で判定できる)。
-  let changed = false;
-  for (let i = 0; i < values.length; i++) {
-    if (reordered[i] !== values[i]) { changed = true; break; }
-  }
-  if (changed) {
-    sheet.clearContents();
-    sheet.getRange(1, 1, reordered.length, reordered[0].length).setValues(reordered);
-  }
+  rewriteRowsIfChanged(sheet, values, reordered);
   return { ok: true };
 }
 
@@ -2279,14 +2315,8 @@ function regroupFeedsByCategory() {
   const categoryIdx = values[0].indexOf('category');
   if (categoryIdx < 0) return { ok: true, changed: false };
   const grouped = groupRowsByCategory(values, categoryIdx);
-  let changed = false;
-  for (let i = 0; i < values.length; i++) {
-    if (grouped[i] !== values[i]) { changed = true; break; }
-  }
-  if (!changed) return { ok: true, changed: false };
-  sheet.clearContents();
-  sheet.getRange(1, 1, grouped.length, grouped[0].length).setValues(grouped);
-  return { ok: true, changed: true };
+  const changed = rewriteRowsIfChanged(sheet, values, grouped);
+  return { ok: true, changed };
 }
 
 // スターの手動オーバーライドを保存する (オーナー専用アクション
@@ -2308,16 +2338,10 @@ function handleSetStar(body, fireTrigger) {
   const headers = values[0];
   const idIdx = headers.indexOf('id');
   if (idIdx < 0) return { ok: false, error: 'not_found' };
-  let rowNum = -1;
-  for (let i = 1; i < values.length; i++) {
-    if (String(values[i][idIdx]) === id) { rowNum = i + 1; break; }
-  }
-  if (rowNum < 0) return { ok: false, error: 'not_found' };
-  let starIdx = headers.indexOf('star_override');
-  if (starIdx < 0) {
-    starIdx = headers.length;
-    sheet.getRange(1, starIdx + 1).setValue('star_override');
-  }
+  const found = findDataRowIndex(values, (row) => String(row[idIdx]) === id);
+  if (found < 0) return { ok: false, error: 'not_found' };
+  const rowNum = found + 1;
+  const starIdx = ensureColumnIndex(sheet, headers, 'star_override');
   sheet.getRange(rowNum, starIdx + 1).setValue(on ? 'on' : 'off');
   // スター状態は ?rss= の enclosure に直結するため、その記事の
   // フィードの RSS キャッシュを即時に落とす (次回 ?rss= で再生成)。
@@ -2326,9 +2350,9 @@ function handleSetStar(body, fireTrigger) {
   if (on) {
     const linkIdx = headers.indexOf('link');
     const videoId = linkIdx >= 0 ? videoIdFromLink(values[rowNum - 1][linkIdx]) : '';
-    const token = PropertiesService.getScriptProperties().getProperty('A_ZE_GS_TOKEN');
+    const token = scriptProperty('A_ZE_GS_TOKEN');
     if (videoId && token) {
-      const fire = typeof fireTrigger === 'function' ? fireTrigger : fireYouTubeAudioTrigger;
+      const fire = resolveFireTrigger(fireTrigger);
       try {
         fire(videoId, token);
       } catch (e) {
@@ -2385,15 +2409,13 @@ function sanitizeEvent(raw, nowIso) {
   const feedTitle = String(raw.feed_title || raw.feedTitle || '').slice(0, EVENT_TITLE_MAX_CHARS);
   const articleId = String(raw.article_id || raw.articleId || '').slice(0, EVENT_ID_MAX_CHARS);
   const articleTitle = String(raw.article_title || raw.articleTitle || '').slice(0, EVENT_TITLE_MAX_CHARS);
+  const secondsValue = Number(raw.seconds);
   let seconds = '';
-  if (type === 'deck_overlap') {
-    const s = Number(raw.seconds);
-    if (Number.isFinite(s) && s >= 0) seconds = Math.floor(s);
-  }
   if (type === 'play' || type === 'stall') {
-    const s = Number(raw.seconds);
-    if (!Number.isFinite(s) || s < 0) return null;
-    seconds = Math.floor(s);
+    if (!Number.isFinite(secondsValue) || secondsValue < 0) return null;
+    seconds = Math.floor(secondsValue);
+  } else if (type === 'deck_overlap' && Number.isFinite(secondsValue) && secondsValue >= 0) {
+    seconds = Math.floor(secondsValue);
   }
   let ts = nowIso;
   const parsed = Date.parse(String(raw.ts || ''));
@@ -2447,11 +2469,12 @@ function aggregateEventsByWeekFeed(events, weekFilter) {
     const agg = map[key];
     const title = String(ev.feed_title || '');
     if (title) agg.feed_title = title;
-    if (ev.type === 'feed_view') agg.views += 1;
-    else if (ev.type === 'article_open') agg.opens += 1;
-    else if (ev.type === 'scroll') agg.scrolls += 1;
-    else if (ev.type === 'expand') agg.expands += 1;
-    else if (ev.type === 'play') {
+    // 単純な件数カウンタは種別→フィールドの対応表で数え、play だけ
+    // 秒数の加算も伴うため分ける (doPost と同じく hasOwnProperty で
+    // 判定し、継承プロパティ名の種別が来ても数えない)。
+    if (Object.prototype.hasOwnProperty.call(EVENT_COUNTER_FIELDS, ev.type)) {
+      agg[EVENT_COUNTER_FIELDS[ev.type]] += 1;
+    } else if (ev.type === 'play') {
       agg.plays += 1;
       agg.seconds += Math.max(0, Number(ev.seconds) || 0);
     }
@@ -2505,11 +2528,7 @@ function rollupWeeklyEvents(nowIso) {
   const values = eventsSheet.getDataRange().getValues();
   if (values.length < 2) return { ok: true, appended: 0, pruned: 0 };
   const headers = values[0];
-  const events = values.slice(1).map((row) => {
-    const obj = {};
-    headers.forEach((h, idx) => { obj[h] = row[idx] === undefined ? '' : row[idx]; });
-    return obj;
-  });
+  const events = values.slice(1).map((row) => rowObject(headers, row));
   const stats = readSheetAsObjects(ss, WEEKLY_STATS_SHEET_NAME);
   const plan = planWeeklyRollup(events, stats, now);
   if (plan.rowsToAppend.length) {
@@ -2538,8 +2557,7 @@ function rollupWeeklyEvents(nowIso) {
     for (let i = 1; i < values.length; i++) {
       if (!drop[i - 1]) remaining.push(values[i]);
     }
-    eventsSheet.clearContents();
-    eventsSheet.getRange(1, 1, remaining.length, remaining[0].length).setValues(remaining);
+    replaceSheetValues(eventsSheet, remaining);
   }
   return { ok: true, appended: plan.rowsToAppend.length, pruned: plan.pruneIndexes.length };
 }
@@ -2609,7 +2627,7 @@ function doGet(e) {
     const ss = openDataSpreadsheet();
     const feeds = readSheetAsObjects(ss, 'feeds');
     const feed = feeds.filter((f) => String(f.id) === rssFeedId)[0] || null;
-    if (!feed || (!youtubeChannelIdFromUrl(feed.url) && !youtubePlaylistIdFromUrl(feed.url))) {
+    if (!feed || !isYouTubeFeedUrl(feed.url)) {
       return jsonOutput({ ok: false, error: 'feed_not_found' });
     }
     const allArticles = readSheetAsObjects(ss, 'articles');
@@ -2624,7 +2642,7 @@ function doGet(e) {
     });
     // MIME は付けない (取得側はプロキシ経由で本文だけを読むため)。
     // YT_PLAY_TOKEN が設定されていれば enclosure は中継 URL になる。
-    const ytPlayToken = PropertiesService.getScriptProperties().getProperty('YT_PLAY_TOKEN');
+    const ytPlayToken = scriptProperty('YT_PLAY_TOKEN');
     const xml = buildRssXml(feed, rows, fetchAudioUrlsMap(), ytPlayToken, starredVideoIds);
     if (cache) {
       try {
