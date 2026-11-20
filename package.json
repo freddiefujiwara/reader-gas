@@ -1,1 +1,1 @@
-{"devDependencies":{},"name":"reader-gas","private":true,"scripts":{"build":"node build.js","smoke":"node scripts/smoke.mjs","test":"node build.js && node --test test/main.test.js"},"type":"module"}
+{"devDependencies":{"fast-check":"^4.10.3"},"name":"reader-gas","private":true,"scripts":{"build":"node build.js","smoke":"node scripts/smoke.mjs","test":"node build.js && node --test test/main.test.js test/abnormal.test.js test/property.test.js"},"type":"module"}

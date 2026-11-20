@@ -183,8 +183,27 @@ function isTruthy(value) {
 
 function cellIso(value) {
   if (!value) return '';
-  if (value instanceof Date) return value.toISOString();
-  return String(value);
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? '' : value.toISOString();
+  return asText(value);
+}
+
+// 外部由来の値を安全にテキストとして読む。文字列はそのまま、
+// 数値・真値は文字列化し、それ以外 (オブジェクト・配列・null 等) は
+// 空文字にする。素の String() は、toString が関数でないオブジェクト
+// (JSON 由来で起こりうる) で例外になるため、入力の境界ではこちらを使う。
+function asText(value) {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return '';
+}
+
+// 外部由来の数値フィールドを読む。数値と数値文字列だけを数として
+// 認め、それ以外は NaN (= 読めない) にする。素の Number() は
+// true を 1、[65] を 65 に化けさせるため、時刻や実尺の判定には使わない。
+function asNumber(value) {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string' && value.trim() !== '') return Number(value);
+  return NaN;
 }
 
 // --- SHA-256 ---
@@ -298,11 +317,18 @@ function isSessionExpired(expiresAt, now) {
 // decodeXmlEntities は stripTags (要約のプレーン化) から使う。
 // フィード XML のパースは v2 でクライアント側へ移ったため、サーバー側には残っていない。
 
+// 数値文字参照の復号。範囲外・サロゲート・NUL はブラウザと同様に
+// 置換文字 (U+FFFD) にし、String.fromCodePoint の例外を出さない。
+function charFromCodePoint(cp) {
+  if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return '\uFFFD';
+  return String.fromCodePoint(cp);
+}
+
 function decodeXmlEntities(text) {
   if (!text) return '';
-  return String(text)
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, num) => String.fromCodePoint(parseInt(num, 10)))
+  return asText(text)
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => charFromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, num) => charFromCodePoint(parseInt(num, 10)))
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
@@ -313,19 +339,36 @@ function decodeXmlEntities(text) {
 function stripTags(html) {
   // Decode first so escaped markup (&lt;p&gt;...) is stripped as markup too,
   // then strip real tags. Plain-text entities survive the tag pass.
-  const decoded = decodeXmlEntities(String(html || ''));
+  const decoded = decodeXmlEntities(asText(html));
   return decoded.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function summarize(html, maxChars) {
   const limit = maxChars || SUMMARY_MAX_CHARS;
   const text = stripTags(html);
-  return text.length > limit ? text.slice(0, limit) : text;
+  if (text.length <= limit) return text;
+  const cut = text.slice(0, limit);
+  // サロゲートペアの途中で切れた場合は、ぶら下がった上位サロゲートを落とす。
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
 function toIsoDate(value) {
   if (!value) return '';
-  const t = Date.parse(String(value).trim());
+  const s = asText(value).trim();
+  if (!s) return '';
+  // ISO 形 (YYYY-MM-DD...) の入力は、書かれた日付が実在するか確認する。
+  // Date.parse は 2026-02-30 のような日付を 3月2日へ繰り上げて解釈する
+  // ため、そのままでは存在しない日付が本物らしく化けてしまう。
+  const dm = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (dm) {
+    const y = Number(dm[1]);
+    const mo = Number(dm[2]);
+    const d = Number(dm[3]);
+    const chk = new Date(Date.UTC(y, mo - 1, d));
+    if (chk.getUTCFullYear() !== y || chk.getUTCMonth() !== mo - 1 || chk.getUTCDate() !== d) return '';
+  }
+  const t = Date.parse(s);
   if (Number.isNaN(t)) return '';
   return new Date(t).toISOString();
 }
@@ -437,8 +480,8 @@ function parseYouTubePlaylistItems(jsonText, feed) {
   const entries = [];
   items.forEach((item) => {
     const sn = (item && item.snippet) || {};
-    const videoId = sn.resourceId && sn.resourceId.videoId ? String(sn.resourceId.videoId) : '';
-    const title = String(sn.title || '').trim();
+    const videoId = sn.resourceId ? asText(sn.resourceId.videoId) : '';
+    const title = asText(sn.title).trim();
     if (!videoId || !title || title === 'Deleted video' || title === 'Private video') return;
     entries.push({
       guid: videoId,
@@ -446,7 +489,7 @@ function parseYouTubePlaylistItems(jsonText, feed) {
       link: 'https://www.youtube.com/watch?v=' + videoId,
       publishedAt: toIsoDate(sn.publishedAt),
       summary: summarize(sn.description || ''),
-      author: String(sn.channelTitle || '').trim(),
+      author: asText(sn.channelTitle).trim(),
       feedId,
     });
   });
@@ -468,7 +511,7 @@ function parseYouTubeNextPageToken(jsonText) {
 // PT1H2M3S / PT45S / P1DT2H 等) を秒へ変換する (純関数)。
 // 読めなければ 0 (= 長さ不明)。
 function iso8601DurationToSec(text) {
-  const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(String(text || '').trim());
+  const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(asText(text).trim());
   if (!m) return 0;
   return (Number(m[1]) || 0) * 86400 + (Number(m[2]) || 0) * 3600
     + (Number(m[3]) || 0) * 60 + (Number(m[4]) || 0);
@@ -479,7 +522,7 @@ function iso8601DurationToSec(text) {
 function parseYouTubeDurations(jsonText) {
   const map = {};
   jsonItems(jsonText).forEach((item) => {
-    const videoId = String((item && item.id) || '');
+    const videoId = asText(item && item.id);
     const sec = iso8601DurationToSec(item && item.contentDetails ? item.contentDetails.duration : '');
     if (videoId && sec > 0) map[videoId] = sec;
   });
@@ -516,7 +559,7 @@ function attachYouTubeDurations(entries, apiKey) {
 function firstSnippetTitle(jsonText) {
   const items = jsonItems(jsonText);
   const sn = (items[0] && items[0].snippet) || {};
-  return String(sn.title || '').trim();
+  return asText(sn.title).trim();
 }
 
 // channels.list の応答からチャンネル名を取り出す。タイトル未設定の
@@ -538,10 +581,10 @@ function parseYouTubePlaylistTitle(jsonText) {
 function parseChannelLookupResponse(jsonText) {
   const items = jsonItems(jsonText);
   const first = items[0] || null;
-  const channelId = first ? String(first.id || '').trim() : '';
+  const channelId = first ? asText(first.id).trim() : '';
   if (!channelId) return null;
   const sn = (first && first.snippet) || {};
-  return { channelId, title: String(sn.title || '').trim() };
+  return { channelId, title: asText(sn.title).trim() };
 }
 
 // ハンドルから channels.list?forHandle= でチャンネルを引く (登録時専用)。
@@ -738,11 +781,11 @@ function audioUrlsMapFromData(data) {
   Object.keys(data).forEach((videoId) => {
     const entry = data[videoId];
     if (!entry || typeof entry !== 'object') return;
-    const url = String(entry.url || '');
-    const ts = Number(entry.ts);
+    const url = asText(entry.url);
+    const ts = asNumber(entry.ts);
     if (!url || !Number.isFinite(ts)) return;
     const parsed = { url, ts };
-    const dur = Number(entry.dur);
+    const dur = asNumber(entry.dur);
     if (Number.isFinite(dur) && dur > 0) parsed.dur = dur;
     map[videoId] = parsed;
   });
@@ -789,8 +832,10 @@ function freshAudioEntry(audioUrls, videoId, nowMs) {
   const entry = (audioUrls || {})[String(videoId || '')];
   if (!entry) return null;
   const now = typeof nowMs === 'number' ? nowMs : Date.now();
-  if (now - entry.ts * 1000 > AUDIO_URL_FRESH_MS) return null;
-  if (!String(entry.url || '')) return null;
+  const ts = asNumber(entry.ts);
+  if (!Number.isFinite(ts)) return null;
+  if (now - ts * 1000 > AUDIO_URL_FRESH_MS) return null;
+  if (!asText(entry.url)) return null;
   return entry;
 }
 
@@ -825,7 +870,12 @@ function ytPlayUrl(token, videoId) {
 // guid は動画IDにし、記事IDの互換 (feed_id + guid) を保つ。
 
 function escapeXml(s) {
-  return String(s === undefined || s === null ? '' : s)
+  return asText(s)
+    // XML 1.0 で使えない文字 (一部の C0 制御文字・U+FFFE/U+FFFF) と
+    // 単独サロゲートは置換文字にし、壊れたタイトルでも RSS 全体を
+    // パース不能にしない。タブ・改行・復帰は XML でも有効なので残す。
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '\uFFFD')
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -834,7 +884,7 @@ function escapeXml(s) {
 }
 
 function videoIdFromLink(link) {
-  const m = /[?&]v=([A-Za-z0-9_-]{6,})/.exec(String(link || ''));
+  const m = /[?&]v=([A-Za-z0-9_-]{6,})/.exec(asText(link));
   return m ? m[1] : '';
 }
 
@@ -864,7 +914,7 @@ const RSS_MAX_ITEMS = 50;
 // 従来どおり、スターに関係なく新鮮なエントリがあれば付ける。
 function buildRssXml(feed, articleRows, audioUrls, ytPlayToken, starredVideoIds) {
   const f = feed || {};
-  const title = String(f.title || '');
+  const title = asText(f.title);
   const channelId = youtubeChannelIdFromUrl(f.url);
   const playlistId = youtubePlaylistIdFromUrl(f.url);
   // チャンネルのリンクはフィード自身のページ (チャンネルページ or
@@ -872,7 +922,9 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken, starredVideoIds)
   const feedPageUrl = playlistId
     ? youtubeFeedUrlFromPlaylistId(playlistId)
     : 'https://www.youtube.com/channel/' + channelId;
-  const sorted = (articleRows || []).slice()
+  const sorted = (Array.isArray(articleRows) ? articleRows : [])
+    .filter((a) => a && typeof a === 'object')
+    .slice()
     .sort((a, b) => articleTimeMs(b.published_at, b.fetched_at) - articleTimeMs(a.published_at, a.fetched_at))
     .slice(0, RSS_MAX_ITEMS);
   const lines = [
@@ -884,7 +936,7 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken, starredVideoIds)
     '    <description>' + escapeXml(title) + '</description>',
   ];
   sorted.forEach((a) => {
-    const link = String(a.link || '');
+    const link = asText(a.link);
     const videoId = videoIdFromLink(link);
     const pubDate = toRfc822(cellIso(a.published_at) || cellIso(a.fetched_at));
     lines.push('    <item>');
@@ -897,7 +949,7 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken, starredVideoIds)
     const audioEntry = starredVideoIds && !starredVideoIds[videoId]
       ? null
       : freshAudioEntry(audioUrls, videoId);
-    const directUrl = audioEntry ? String(audioEntry.url || '') : '';
+    const directUrl = audioEntry ? asText(audioEntry.url) : '';
     const audioUrl = (directUrl && ytPlayUrl(ytPlayToken, videoId)) || directUrl;
     if (audioUrl) {
       lines.push('      <enclosure url="' + escapeXml(audioUrl) + '" type="audio/x-m4a" length="0"/>');
@@ -907,7 +959,7 @@ function buildRssXml(feed, articleRows, audioUrls, ytPlayToken, starredVideoIds)
       // しまう。エントリに実尺 (dur・秒) があれば整数秒に丸めて
       // itunes:duration として付け、クライアントが表示・シークの
       // 正として使えるようにする。dur の無いエントリには付けない。
-      const dur = Number(audioEntry.dur);
+      const dur = asNumber(audioEntry.dur);
       if (Number.isFinite(dur) && dur > 0) {
         lines.push('      <itunes:duration>' + Math.round(dur) + '</itunes:duration>');
       }
