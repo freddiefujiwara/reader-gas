@@ -78,6 +78,8 @@ const EVENT_TYPES = {
   feed_view: true, article_open: true, play: true, scroll: true, expand: true,
   preload_error: true, advance_swap: true, advance_load: true, stall: true, recover: true,
   deck_overlap: true,
+  play_rejected_not_allowed: true, play_rejected_not_supported: true, play_rejected_other: true,
+  start_retry: true, start_fallback: true, start_failed: true,
 };
 // 件数だけを数えるイベント種別と、weekly_stats 側のフィールド名の対応。
 const EVENT_COUNTER_FIELDS = { feed_view: 'views', article_open: 'opens', scroll: 'scrolls', expand: 'expands' };
@@ -2423,7 +2425,7 @@ function handleSetStar(body, fireTrigger) {
 // クライアントが訪問ごとに最大1回だけ送る) / expand (記事カードの
 // 要約を「もっと見る」で展開した。記事への興味の強さを示すシグナル)
 // の5つだけ。週次集計は weekly_stats タブへ畳み、生ログは90日で間引く。
-// 再生診断の6種も同じ経路で受ける (週次集計の対象外で、生ログとして
+// 再生診断の12種も同じ経路で受ける (週次集計の対象外で、生ログとして
 // だけ残る): preload_error (次曲の先読みでエラーが起きた) /
 // advance_swap (曲の終了で、待機側への役割交代で次へ進んだ) /
 // advance_load (曲の終了で、従来経路の新規読み込みで次へ進んだ) /
@@ -2431,7 +2433,13 @@ function handleSetStar(body, fireTrigger) {
 // 位置) / recover (フォアグラウンド復帰時の回復が、止まっていた
 // 再生を再開・前進させた) / deck_overlap (待機側の要素が再生状態
 // になっているのをクライアントが検出して止めた。対象は待機側に
-// 載っていた曲、seconds は待機側の止めた位置)。
+// 載っていた曲、seconds は待機側の止めた位置) /
+// play_rejected_not_allowed / play_rejected_not_supported /
+// play_rejected_other (play() が拒否された。理由 (エラーの name)
+// を種別で区別する) / start_retry (遷移直後の開始チェックが
+// play() を再発行した) / start_fallback (開始チェックが、直前
+// まで鳴っていた要素へ読み直して再生するフォールバックを行った)
+// / start_failed (再発行・フォールバックでも始まらなかった)。
 
 // Asia/Tokyo (UTC+9、夏時間なし) で見た週の開始日 (月曜) を
 // 'YYYY-MM-DD' で返す。文字列の辞書順がそのまま日付順になる。
