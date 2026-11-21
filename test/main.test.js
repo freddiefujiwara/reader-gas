@@ -4789,6 +4789,29 @@ test('sanitizeEvent: deck_overlap は seconds (待機側の止めた位置) を�
   );
 });
 
+test('sanitizeEvent: 開始チェック系の診断種別 (play_rejected_* / start_*) を行にし、seconds は持たない', () => {
+  const now = '2026-11-21T00:00:00.000Z';
+  // play() の拒否理由は種別で区別して保持し、対象の曲の文脈を残す。
+  // seconds は意味を持たないため、送られても保存しない (空)。
+  const types = [
+    'play_rejected_not_allowed',
+    'play_rejected_not_supported',
+    'play_rejected_other',
+    'start_retry',
+    'start_fallback',
+    'start_failed',
+  ];
+  for (const type of types) {
+    assert.deepEqual(
+      sanitizeEvent({ type, feed_id: 'feed-a', article_id: 'art-1', article_title: '曲1', seconds: 5 }, now),
+      [now, type, 'feed-a', '', 'art-1', '曲1', '']
+    );
+  }
+  // 似た名前でも、許可リストに無い種別は従来どおり捨てる。
+  assert.equal(sanitizeEvent({ type: 'play_rejected', feed_id: 'feed-a' }, now), null);
+  assert.equal(sanitizeEvent({ type: 'start_unknown', feed_id: 'feed-a' }, now), null);
+});
+
 test('sanitizeEventBatch: 文字列は上限で切り、1リクエスト最大50件', () => {
   const now = '2026-11-17T00:00:00.000Z';
   const rows = sanitizeEventBatch([
