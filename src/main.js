@@ -2074,6 +2074,9 @@ function buildListPayload(body) {
       url: String(f.url || ''),
       fetchUrl: buildFetchUrl(f, serviceUrl),
       category: String(f.category || ''),
+      // タイムライン側がフィード単体表示の並び順を決めるために必要
+      // (管理用 listFeeds の feedToApiShape と揃える)。
+      sortDirection: sortDirectionOf(f),
       unreadCount: unreadByFeed[f.id] || 0,
     })),
   };

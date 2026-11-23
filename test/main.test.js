@@ -1408,8 +1408,9 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
     assert.equal(byId['zenn'].fetchUrl, 'https://zenn.dev/feed');
     assert.ok(!('enabled' in byId['zenn']));
     assert.equal(byId['yt-x'].unreadCount, 1);
-    // フィードのキー集合は slim 化後 (PR #16) の形から enabled を除いた形に固定する
-    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'title', 'unreadCount', 'url']);
+    // フィードのキー集合は slim 化後 (PR #16) の形から enabled を除き、
+    // sortDirection を加えた形に固定する
+    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'sortDirection', 'title', 'unreadCount', 'url']);
     // 既読は端末ローカル管理のため、isRead は常に false
     assert.equal(payload.articles[0].isRead, false);
   } finally { restore(); }
@@ -1438,6 +1439,30 @@ test('buildListPayload: 旧10列シート (is_private 列が残っている過�
     assert.equal(payload.feeds[0].id, 'zenn');
     assert.equal(payload.feeds[0].category, 'tech');
     assert.ok(!('isPrivate' in payload.feeds[0]));
+  } finally { restore(); }
+});
+
+test('buildListPayload: feeds に sortDirection を含める (シートの sort_order を反映)', () => {
+  const headers = ['id', 'title', 'url', 'category', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error', 'sort_order'];
+  const ss = new FakeSpreadsheet({
+    feeds: [headers,
+      ['cal', '予定', 'https://example.com/cal', '個人', '', '', '', '', '', 'asc'],
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', '', ''],
+    ],
+    articles: [ARTICLE_HEADERS_ROW],
+  });
+  const restore = installGasGlobals({
+    SpreadsheetApp: { openById: () => ss },
+    PropertiesService: fakePropertiesService({ SPREADSHEET_ID: 'fake-spreadsheet-id' }).service,
+    ScriptApp: { getService: () => ({ getUrl: () => 'https://example.com/exec' }) },
+    Utilities: fakeUtilities,
+  });
+  try {
+    const payload = buildListPayload({});
+    const byId = {};
+    payload.feeds.forEach((f) => { byId[f.id] = f; });
+    assert.equal(byId['cal'].sortDirection, 'asc');
+    assert.equal(byId['zenn'].sortDirection, 'desc');
   } finally { restore(); }
 });
 
