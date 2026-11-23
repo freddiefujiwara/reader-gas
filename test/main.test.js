@@ -45,6 +45,12 @@ import {
   fetchAudioUrlsMap,
   ytPlayUrl,
   planYouTubeAudioTriggers,
+  normalizeStarMode,
+  normalizeStarCount,
+  normalizeStarMinSec,
+  starSettingsOf,
+  effectiveStarRule,
+  planStarSelection,
   computeStarredArticleIds,
   planStarredAudioTriggers,
   fireYouTubeAudioTriggers,
@@ -284,6 +290,7 @@ test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変
   assert.deepEqual(created, {
     id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech',
     etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '', sync_deletes: '',
+    star_mode: '', star_count: '', star_min_sec: '',
   });
   const existing = {
     id: 'zenn', title: 'Old', url: 'https://zenn.dev/feed', category: '',
@@ -320,7 +327,7 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
     last_status: '200', last_error: '', last_fetched_at: new Date('2026-11-14T00:15:30.088Z'),
   }, 7);
   assert.deepEqual(shaped, {
-    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private', sortDirection: 'desc', syncDeletes: false,
+    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private', sortDirection: 'desc', syncDeletes: false, starMode: null, starCount: null, starMinSec: null,
     lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
@@ -382,6 +389,84 @@ test('sync_deletes: feedToApiShape は on のフィードだけ syncDeletes: tru
   assert.equal(feedToApiShape({ id: 'x' }).syncDeletes, false);
   assert.equal(feedToApiShape({ id: 'x', sync_deletes: 'ON' }).syncDeletes, true);
   assert.equal(feedToApiShape({ id: 'x', sync_deletes: 'junk' }).syncDeletes, false);
+});
+
+test('star設定: normalizeStarMode / Count / MinSec は範囲外を未指定に倒す', () => {
+  assert.equal(normalizeStarMode(' RECENT '), 'recent');
+  assert.equal(normalizeStarMode('junk'), '');
+  assert.equal(normalizeStarMode(''), '');
+  assert.equal(normalizeStarCount(5), 5);
+  assert.equal(normalizeStarCount('3'), 3);
+  assert.equal(normalizeStarCount(0), null);
+  assert.equal(normalizeStarCount(101), null);
+  assert.equal(normalizeStarCount('x'), null);
+  assert.equal(normalizeStarCount(''), null);
+  assert.equal(normalizeStarMinSec(0), 0);
+  assert.equal(normalizeStarMinSec(90), 90);
+  assert.equal(normalizeStarMinSec(-1), null);
+  assert.equal(normalizeStarMinSec(3601), null);
+  assert.equal(normalizeStarMinSec(undefined), null);
+});
+
+test('star設定: validateFeedInput は値を受理し、不正値を弾き、未指定はキーなし、空は未指定に戻す', () => {
+  const base = { id: 'ok-id', title: 'Title', url: 'https://example.com/feed' };
+  const ok = validateFeedInput({ ...base, starMode: 'recent', starCount: 5, starMinSec: 0 });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.feed.starMode, 'recent');
+  assert.equal(ok.feed.starCount, 5);
+  assert.equal(ok.feed.starMinSec, 0);
+  assert.equal(validateFeedInput({ ...base, starMode: 'many' }).ok, false);
+  assert.equal(validateFeedInput({ ...base, starCount: 0 }).ok, false);
+  assert.equal(validateFeedInput({ ...base, starMinSec: -5 }).ok, false);
+  const bare = validateFeedInput(base).feed;
+  assert.ok(!('starMode' in bare) && !('starCount' in bare) && !('starMinSec' in bare));
+  // 空文字・null はクリア (未指定に戻す) として受理する。
+  const cleared = validateFeedInput({ ...base, starMode: '', starCount: '', starMinSec: null });
+  assert.equal(cleared.ok, true);
+  assert.equal(cleared.feed.starMode, '');
+  assert.equal(cleared.feed.starCount, null);
+  assert.equal(cleared.feed.starMinSec, null);
+});
+
+test('star設定: buildFeedRow は明示を反映し、未指定では既存行の値を引き継ぎ、クリアで空に戻る', () => {
+  const feed = { id: 'a', title: 'A', url: 'https://example.com/f', category: '' };
+  const made = buildFeedRow({ ...feed, starMode: 'all', starCount: 7, starMinSec: 30 }, null);
+  assert.equal(made.star_mode, 'all');
+  assert.equal(made.star_count, 7);
+  assert.equal(made.star_min_sec, 30);
+  const existing = { ...feed, etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '', sync_deletes: '', star_mode: 'recent', star_count: 5, star_min_sec: 120 };
+  const inherited = buildFeedRow(feed, existing);
+  assert.equal(inherited.star_mode, 'recent');
+  assert.equal(inherited.star_count, 5);
+  assert.equal(inherited.star_min_sec, 120);
+  const cleared = buildFeedRow({ ...feed, starMode: '', starCount: null, starMinSec: null }, existing);
+  assert.equal(cleared.star_mode, '');
+  assert.equal(cleared.star_count, '');
+  assert.equal(cleared.star_min_sec, '');
+});
+
+test('star設定: starSettingsOf / feedToApiShape は未指定を null で返す', () => {
+  assert.deepEqual(starSettingsOf({ star_mode: 'recent', star_count: 4, star_min_sec: 0 }), { starMode: 'recent', starCount: 4, starMinSec: 0 });
+  assert.deepEqual(starSettingsOf({}), { starMode: null, starCount: null, starMinSec: null });
+  assert.deepEqual(starSettingsOf({ star_mode: 'junk', star_count: 'x' }), { starMode: null, starCount: null, starMinSec: null });
+  const shaped = feedToApiShape({ id: 'x', star_mode: 'all', star_count: 2, star_min_sec: 45 });
+  assert.equal(shaped.starMode, 'all');
+  assert.equal(shaped.starCount, 2);
+  assert.equal(shaped.starMinSec, 45);
+});
+
+test('star設定: effectiveStarRule は未指定なら種別既定、保存値があればそれを使う', () => {
+  const ch = 'https://www.youtube.com/channel/UCxNfaRC6MbAnwSR1Dqqv69A';
+  const own = 'https://www.youtube.com/channel/UCbiDZXbr391oT_vsRiqwPFg';
+  const pl = 'https://www.youtube.com/playlist?list=PLxNfaRC6MbAnwSR1Dqqv69A00';
+  assert.deepEqual(effectiveStarRule({ url: ch }), { mode: 'recent', count: 3, minSec: 90 });
+  assert.deepEqual(effectiveStarRule({ url: own }), { mode: 'all', count: 3, minSec: 90 });
+  assert.deepEqual(effectiveStarRule({ url: pl }), { mode: 'all', count: 3, minSec: 90 });
+  assert.deepEqual(effectiveStarRule({ url: 'https://example.com/feed' }), { mode: 'none', count: 3, minSec: 90 });
+  // 本数だけの指定は、モード未指定 (種別既定) のまま効く。
+  assert.deepEqual(effectiveStarRule({ url: ch, star_count: 5 }), { mode: 'recent', count: 5, minSec: 90 });
+  assert.deepEqual(effectiveStarRule({ url: ch, star_mode: 'none' }), { mode: 'none', count: 3, minSec: 90 });
+  assert.deepEqual(effectiveStarRule({ url: pl, star_mode: 'recent', star_count: 2, star_min_sec: 0 }), { mode: 'recent', count: 2, minSec: 0 });
 });
 
 test('countUnreadByFeed: サーバー側に既読状態が無いため記事数をそのまま数える', () => {
@@ -1439,7 +1524,7 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
     assert.equal(byId['yt-x'].unreadCount, 1);
     // フィードのキー集合は slim 化後 (PR #16) の形から enabled を除き、
     // sortDirection と syncDeletes を加えた形に固定する
-    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'sortDirection', 'syncDeletes', 'title', 'unreadCount', 'url']);
+    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'sortDirection', 'starCount', 'starMinSec', 'starMode', 'syncDeletes', 'title', 'unreadCount', 'url']);
     // 既読は端末ローカル管理のため、isRead は常に false
     assert.equal(payload.articles[0].isRead, false);
   } finally { restore(); }
@@ -2013,7 +2098,7 @@ test('handleSaveFeed: slug ID の既存行は URL 一致で更新され、ID と
   } finally { restore(); }
 });
 
-test('handleSaveFeed: id 指定の更新は行を書き換え、11列で保存される (sort_order / sync_deletes 列を遅延追加)', () => {
+test('handleSaveFeed: id 指定の更新は行を書き換え、14列で保存される (属性列を遅延追加)', () => {
   const { ss, restore } = saveFeedEnv([
     ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
   ]);
@@ -2025,14 +2110,20 @@ test('handleSaveFeed: id 指定の更新は行を書き換え、11列で保存�
     assert.equal(rows.length, 2);
     assert.equal(rows[1][3], 'blog');
     // enabled / is_private 列は撤去済み: E列 (index 4) は etag になる。
-    // 入力の enabled は無視される。sort_order / sync_deletes 列は
-    // 保存時に末尾へ遅延追加され、行は11列になる (未指定なので値は空)。
+    // 入力の enabled は無視される。sort_order / sync_deletes / star_* 列は
+    // 保存時に末尾へ遅延追加され、行は14列になる (未指定なので値は空)。
     assert.equal(rows[0][9], 'sort_order');
     assert.equal(rows[0][10], 'sync_deletes');
-    assert.equal(rows[1].length, 11);
+    assert.equal(rows[0][11], 'star_mode');
+    assert.equal(rows[0][12], 'star_count');
+    assert.equal(rows[0][13], 'star_min_sec');
+    assert.equal(rows[1].length, 14);
     assert.equal(rows[1][4], '');
     assert.equal(rows[1][9], '');
     assert.equal(rows[1][10], '');
+    assert.equal(rows[1][11], '');
+    assert.equal(rows[1][12], '');
+    assert.equal(rows[1][13], '');
   } finally { restore(); }
 });
 
@@ -4215,7 +4306,7 @@ test('doPost listFeeds: 応答のキー集合が固定され、行順と記事�
     // シートの行順が表示順としてそのまま返る
     assert.deepEqual(res.feeds.map((f) => f.id), ['feed-b', 'feed-a']);
     assert.deepEqual(Object.keys(res.feeds[0]).sort(), [
-      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'sortDirection', 'syncDeletes', 'title', 'unreadCount', 'url',
+      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'sortDirection', 'starCount', 'starMinSec', 'starMode', 'syncDeletes', 'title', 'unreadCount', 'url',
     ]);
     // 未読数 = そのフィードの記事数 (サーバー側に既読は無い)
     assert.equal(res.feeds[0].unreadCount, 1);
@@ -4456,6 +4547,50 @@ test('computeStarredArticleIds: プレイリストフィードの記事は全件
   assert.equal(Object.keys(starred).length, 25);
   assert.ok(starred['p25']);
   assert.ok(!starred['pOff']);
+});
+
+test('computeStarredArticleIds: star_mode=all のチャンネルは全件、none は自動が付かない (手動 on は効く)', () => {
+  const mkArticles = () => [
+    starArticle('a1', 'yt-n', 'vidS00001', '2026-11-14T00:00:00.000Z'),
+    starArticle('a2', 'yt-n', 'vidS00002', '2026-11-13T00:00:00.000Z'),
+    starArticle('a3', 'yt-n', 'vidS00003', '2026-11-12T00:00:00.000Z'),
+    starArticle('a4', 'yt-n', 'vidS00004', '2026-11-11T00:00:00.000Z'),
+  ];
+  const allFeed = { ...STAR_FEED_NORMAL, star_mode: 'all' };
+  assert.deepEqual(Object.keys(computeStarredArticleIds([allFeed], mkArticles(), STAR_NOW)).sort(), ['a1', 'a2', 'a3', 'a4']);
+  const noneFeed = { ...STAR_FEED_NORMAL, star_mode: 'none' };
+  assert.deepEqual(Object.keys(computeStarredArticleIds([noneFeed], mkArticles(), STAR_NOW)), []);
+  const withManual = mkArticles();
+  withManual[3].star_override = 'on';
+  assert.deepEqual(Object.keys(computeStarredArticleIds([noneFeed], withManual, STAR_NOW)), ['a4']);
+});
+
+test('computeStarredArticleIds: star_count と star_min_sec の指定が選定に効く', () => {
+  const feed = { ...STAR_FEED_NORMAL, star_count: 2, star_min_sec: 0 };
+  const mk = (id, vid, date, sec) => {
+    const a = starArticle(id, 'yt-n', vid, date);
+    if (sec !== undefined) a.duration_sec = sec;
+    return a;
+  };
+  const articles = [
+    mk('s1', 'vidD00001', '2026-11-14T00:00:00.000Z', 45),
+    mk('s2', 'vidD00002', '2026-11-13T00:00:00.000Z', 200),
+    mk('s3', 'vidD00003', '2026-11-12T00:00:00.000Z', 300),
+  ];
+  // minSec=0 では45秒も数え、本数2で s1・s2。
+  assert.deepEqual(Object.keys(computeStarredArticleIds([feed], articles, STAR_NOW)).sort(), ['s1', 's2']);
+});
+
+test('planStarSelection: none は空、recent は本数と下限で選び、all は入力順の全件', () => {
+  const vids = [
+    { videoId: 'v1', publishedAt: '2026-11-14T00:00:00.000Z', durationSec: 30 },
+    { videoId: 'v2', publishedAt: '2026-11-13T00:00:00.000Z', durationSec: 500 },
+    { videoId: 'v3', publishedAt: '2026-11-12T00:00:00.000Z', durationSec: 500 },
+  ];
+  assert.deepEqual(planStarSelection(vids, { mode: 'none' }), []);
+  assert.deepEqual(planStarSelection(vids, { mode: 'all' }), ['v1', 'v2', 'v3']);
+  assert.deepEqual(planStarSelection(vids, { mode: 'recent', count: 2, minSec: 90 }), ['v2', 'v3']);
+  assert.deepEqual(planStarSelection(vids, { mode: 'recent', count: 1, minSec: 0 }), ['v1']);
 });
 
 test('computeStarredArticleIds: 手動オーバーライドが優先され、外した枠への繰り上げは起きない', () => {
