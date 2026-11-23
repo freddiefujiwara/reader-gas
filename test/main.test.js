@@ -283,7 +283,7 @@ test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変
   const created = buildFeedRow(feed, null);
   assert.deepEqual(created, {
     id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech',
-    etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '',
+    etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '',
   });
   const existing = {
     id: 'zenn', title: 'Old', url: 'https://zenn.dev/feed', category: '',
@@ -308,10 +308,10 @@ test('feedRowValues: ヘッダー順に並べ、未知ヘッダーは空文字',
   assert.deepEqual(feedRowValues(row, ['id', 'url', 'etag']), ['a', 'https://example.com/f', '']);
 });
 
-test('buildFeedRow: 行は9列 (enabled / is_private 列は撤去済み)', () => {
+test('buildFeedRow: 行は10列 (enabled / is_private 列は撤去済み、sort_order を末尾に追加)', () => {
   const row = buildFeedRow({ id: 'a', title: 'A', url: 'https://example.com/f', category: '' }, null);
   const values = feedRowValues(row);
-  assert.equal(values.length, 9);
+  assert.equal(values.length, 10);
 });
 
 test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
@@ -320,13 +320,39 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
     last_status: '200', last_error: '', last_fetched_at: new Date('2026-11-14T00:15:30.088Z'),
   }, 7);
   assert.deepEqual(shaped, {
-    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private',
+    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private', sortDirection: 'desc',
     lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
   // enabled / isPrivate は廃止: 行に値があっても API 形式には出さない。
   assert.ok(!('enabled' in feedToApiShape({ id: 'x', enabled: 'FALSE' })));
   assert.ok(!('isPrivate' in feedToApiShape({ id: 'x', is_private: 'TRUE' })));
+});
+
+test('sort_order: validateFeedInput は asc / desc を受理し、不正値を弾き、未指定はキーなし', () => {
+  const base = { id: 'ok-id', title: 'Title', url: 'https://example.com/feed' };
+  assert.equal(validateFeedInput({ ...base, sortDirection: 'asc' }).feed.sortDirection, 'asc');
+  assert.equal(validateFeedInput({ ...base, sortDirection: ' DESC ' }).feed.sortDirection, 'desc');
+  assert.equal(validateFeedInput({ ...base, sortDirection: 'up' }).ok, false);
+  assert.ok(!('sortDirection' in validateFeedInput(base).feed));
+});
+
+test('sort_order: buildFeedRow は明示を反映し、未指定では既存行の値を引き継ぐ', () => {
+  const feed = { id: 'a', title: 'A', url: 'https://example.com/f', category: '' };
+  assert.equal(buildFeedRow({ ...feed, sortDirection: 'asc' }, null).sort_order, 'asc');
+  assert.equal(buildFeedRow({ ...feed, sortDirection: 'desc' }, null).sort_order, '');
+  const existingAsc = { ...feed, etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: 'asc' };
+  // 並び順を送らない編集では、シート側の asc を消さない。
+  assert.equal(buildFeedRow(feed, existingAsc).sort_order, 'asc');
+  // 明示の desc で asc を解除できる。
+  assert.equal(buildFeedRow({ ...feed, sortDirection: 'desc' }, existingAsc).sort_order, '');
+});
+
+test('sort_order: feedToApiShape は asc のフィードだけ sortDirection: asc を返す', () => {
+  assert.equal(feedToApiShape({ id: 'x', sort_order: 'asc' }).sortDirection, 'asc');
+  assert.equal(feedToApiShape({ id: 'x', sort_order: '' }).sortDirection, 'desc');
+  assert.equal(feedToApiShape({ id: 'x' }).sortDirection, 'desc');
+  assert.equal(feedToApiShape({ id: 'x', sort_order: 'ASC' }).sortDirection, 'asc');
 });
 
 test('countUnreadByFeed: サーバー側に既読状態が無いため記事数をそのまま数える', () => {
@@ -1933,7 +1959,7 @@ test('handleSaveFeed: slug ID の既存行は URL 一致で更新され、ID と
   } finally { restore(); }
 });
 
-test('handleSaveFeed: id 指定の更新は行を書き換え、9列で保存される', () => {
+test('handleSaveFeed: id 指定の更新は行を書き換え、10列で保存される (sort_order 列を遅延追加)', () => {
   const { ss, restore } = saveFeedEnv([
     ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
   ]);
@@ -1944,10 +1970,13 @@ test('handleSaveFeed: id 指定の更新は行を書き換え、9列で保存さ
     const rows = ss.sheets['feeds'].rows;
     assert.equal(rows.length, 2);
     assert.equal(rows[1][3], 'blog');
-    // enabled / is_private 列は撤去済み: 行は9列で、E列 (index 4) は etag になる。
-    // 入力の enabled は無視される。
-    assert.equal(rows[1].length, 9);
+    // enabled / is_private 列は撤去済み: E列 (index 4) は etag になる。
+    // 入力の enabled は無視される。sort_order 列は保存時に末尾へ
+    // 遅延追加され、行は10列になる (未指定なので値は空)。
+    assert.equal(rows[0][9], 'sort_order');
+    assert.equal(rows[1].length, 10);
     assert.equal(rows[1][4], '');
+    assert.equal(rows[1][9], '');
   } finally { restore(); }
 });
 
@@ -4130,7 +4159,7 @@ test('doPost listFeeds: 応答のキー集合が固定され、行順と記事�
     // シートの行順が表示順としてそのまま返る
     assert.deepEqual(res.feeds.map((f) => f.id), ['feed-b', 'feed-a']);
     assert.deepEqual(Object.keys(res.feeds[0]).sort(), [
-      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'title', 'unreadCount', 'url',
+      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'sortDirection', 'title', 'unreadCount', 'url',
     ]);
     // 未読数 = そのフィードの記事数 (サーバー側に既読は無い)
     assert.equal(res.feeds[0].unreadCount, 1);

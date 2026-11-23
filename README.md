@@ -19,7 +19,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 
 | タブ | 内容 |
 |---|---|
-| `feeds` | フィード正本。管理はフロントの管理画面 (listFeeds / saveFeed / deleteFeed / reorderFeeds) から行う |
+| `feeds` | フィード正本。管理はフロントの管理画面 (listFeeds / saveFeed / deleteFeed / reorderFeeds) から行う。`sort_order` 列に記事の並び順を保存する (`asc` = 古い順、それ以外は既定の新しい順。列が無い既存タブには保存時・巡回時にヘッダーを遅延追加する) |
 | `articles` | 記事本体。`id` はフィードID＋guid/リンクの SHA-256。`star_override` 列にスターの手動オーバーライドだけを保存する (空 = 自動判定)。`duration_sec` 列に YouTube 動画の長さ (秒) を保存する (スター判定で90秒未満を除く材料。空 = 不明で fail-open 側に倒れる。列が無い既存タブには巡回時にヘッダーを遅延追加する) |
 | `owner_sessions` | セッションのトークンハッシュだけを保存 (自動作成)。複数端末の同時セッション可。`role` が `owner` / `readonly` |
 | `events` | 視聴ログの生イベント (自動作成)。列は `ts, type, feed_id, feed_title, article_id, article_title, seconds` (`seconds` は `play` のみ)。保持は90日 |
@@ -35,7 +35,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 | `exchange_share` | `shareToken` | 一時アクセスリンクを検証し、読み取り専用セッションを発行 |
 | `list` | `sessionToken`, `limit?` (最大500) | 記事一覧 (新しい順。`isRead` は既読を端末ローカル管理にするため常に `false`。各記事に `star_state` と `starred` が付く)＋フィード一覧 (未読数付き＝サーバー側の記事数)。v2 では主にフィード一覧 (fetchUrl 付き) の取得に使う |
 | `listFeeds` | `sessionToken` (owner) | フィード管理用一覧 (全件、最終取得・未読数付き)。読み取り専用セッションは拒否 |
-| `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消す。YouTube はチャンネルページ URL (`/channel/UC...`・`/@handle`) で登録でき、保存時は `/channel/UC...` 形に寄せる (ハンドルは Data API で解決し、タイトルも補完する)。プレイリスト URL (`/playlist?list=...`) でも登録でき、保存時は余分なクエリを落とした正規形に寄せる |
+| `saveFeed` | `sessionToken` (owner), `feed:{id,title,url,category,sortDirection?}` | フィードの追加・更新。不正な入力は `{ok:false, error:"invalid", message}`。URL変更時は etag/last_modified を消す。`sortDirection` (`asc` / `desc`) は任意で、未指定の更新では既存の並び順を引き継ぐ。YouTube はチャンネルページ URL (`/channel/UC...`・`/@handle`) で登録でき、保存時は `/channel/UC...` 形に寄せる (ハンドルは Data API で解決し、タイトルも補完する)。プレイリスト URL (`/playlist?list=...`) でも登録でき、保存時は余分なクエリを落とした正規形に寄せる |
 | `deleteFeed` | `sessionToken` (owner), `feedId` | フィード行と、その記事をまとめて削除。未知のIDは `{ok:false, error:"not_found"}` |
 | `reorderFeeds` | `sessionToken` (owner), `feedIds:[...]` | フィードの並び順を変更 (表示順＝feedsシートの行順なので、行を並び替えて一括で書き戻す)。現在の全フィードIDと集合が一致しない・重複する場合は `{ok:false, error:"invalid", message}` |
 | `set_star` | `sessionToken` (owner), `id`, `on` | 記事のスターの手動オーバーライドを保存する。`on:true` で付け (その場で音声抽出も依頼する)、`on:false` で外す。未知のIDは `{ok:false, error:"not_found"}` |
@@ -45,7 +45,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 | `getShareLinkStatus` | `sessionToken` (owner) | 共有リンクの状態を `{ok:true, active, expiresAt}` で返す。有効なリンクが無い・期限切れなら `active:false`、`expiresAt:null` |
 | `revokeShareLink` | `sessionToken` (owner) | 共有リンクの保存レコードを消して即時無効化し、`{ok:true}` を返す |
 
-非公開フラグ (`isPrivate` / feeds タブの `is_private` 列) は廃止した。フロントは表示・取得の分岐に使っておらず、入力値も無視されていたため、計算・保存・応答のすべてを取り除き、feeds タブは9列 (id, title, url, category, etag, last_modified, last_fetched_at, last_status, last_error) にした。
+非公開フラグ (`isPrivate` / feeds タブの `is_private` 列) は廃止した。フロントは表示・取得の分岐に使っておらず、入力値も無視されていたため、計算・保存・応答のすべてを取り除き、feeds タブは9列 (id, title, url, category, etag, last_modified, last_fetched_at, last_status, last_error) にした。その後、記事の並び順 (`sort_order`、`asc` のフィードだけ古い順) を末尾に遅延追加し、現在は10列。API では `sortDirection` (`asc` / `desc`) として返す。
 
 `doGet` は `{ok:true, service:"reader-gas"}` のヘルスチェックと、YouTube フィードの RSS 2.0 出力 (`?rss=<フィードID>`、対象外のIDは `{ok:false, error:"feed_not_found"}`) を行う。
 
