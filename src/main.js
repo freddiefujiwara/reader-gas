@@ -1381,47 +1381,150 @@ const YT_AUDIO_ALWAYS_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
 function planYouTubeAudioTriggers(feedVideos, nowMs) {
   const seen = {};
   const ids = [];
+  (feedVideos || []).forEach((videos) => {
+    const list = videos || [];
+    if (list.some((v) => v && (v.channelId === YT_AUDIO_ALWAYS_CHANNEL_ID || v.playlist))) {
+      // 全件クラス: 取得できた順 (新しい順) に全件を選ぶ。
+      planStarSelection(list, { mode: 'all' }).forEach((videoId) => {
+        if (seen[videoId]) return;
+        seen[videoId] = true;
+        ids.push(videoId);
+      });
+      return;
+    }
+    planStarSelection(list, {
+      mode: 'recent',
+      count: YT_AUDIO_TRIGGER_PER_FEED,
+      minSec: YT_AUDIO_TRIGGER_MIN_DURATION_SEC,
+    }).forEach((videoId) => {
+      if (seen[videoId]) return;
+      seen[videoId] = true;
+      ids.push(videoId);
+    });
+  });
+  return ids;
+}
+
+// --- スター選定の設定 (フィード属性) ---
+// 選定ルールは管理画面からフィードごとに変更できる。保存値は
+// feeds シートの star_mode / star_count / star_min_sec 列で、
+// 未指定 (空) の項目は種別ごとの既定に倒すため、設定が無い
+// フィードの挙動は従来と変わらない (引き継ぎ不要の移行)。
+// 既定: チャンネル = 新しい順3本・90秒未満を除く、プレイリストと
+// 常時対応チャンネル = 全件、それ以外 = なし。手動オーバーライド
+// (記事の star_override) は、このルールより優先される。
+
+// star_mode の保存値: 'none' / 'recent' / 'all' 以外は '' (= 未指定)。
+function normalizeStarMode(value) {
+  const v = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
+  return v === 'none' || v === 'recent' || v === 'all' ? v : '';
+}
+
+// star_count の保存値: 1〜100 の整数。それ以外は null (= 未指定)。
+function normalizeStarCount(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const i = Math.floor(n);
+  return i >= 1 && i <= 100 ? i : null;
+}
+
+// star_min_sec の保存値: 0〜3600 の整数 (0 = 短尺除外なし)。
+// それ以外は null (= 未指定)。
+function normalizeStarMinSec(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const i = Math.floor(n);
+  return i >= 0 && i <= 3600 ? i : null;
+}
+
+// フィードに保存されたスター選定の設定だけを取り出す (純関数)。
+// API へは未指定を null で返す (管理画面が「未指定 = 種別既定」と
+// 明示値を区別するため)。
+function starSettingsOf(feed) {
+  const f = feed || {};
+  return {
+    starMode: normalizeStarMode(f.star_mode !== undefined ? f.star_mode : f.starMode) || null,
+    starCount: normalizeStarCount(f.star_count !== undefined ? f.star_count : f.starCount),
+    starMinSec: normalizeStarMinSec(f.star_min_sec !== undefined ? f.star_min_sec : f.starMinSec),
+  };
+}
+
+// 実効ルール (純関数): 保存値があればそれを使い、無い項目は
+// 種別ごとの既定で埋める。count / minSec は mode が 'recent'
+// のときだけ意味を持つ。
+function effectiveStarRule(feed) {
+  const f = feed || {};
+  const settings = starSettingsOf(f);
+  const channelId = youtubeChannelIdFromUrl(f.url);
+  const isPlaylist = !!youtubePlaylistIdFromUrl(f.url);
+  let mode = settings.starMode;
+  if (!mode) {
+    mode = channelId === YT_AUDIO_ALWAYS_CHANNEL_ID || isPlaylist
+      ? 'all'
+      : channelId ? 'recent' : 'none';
+  }
+  return {
+    mode,
+    count: settings.starCount !== null ? settings.starCount : YT_AUDIO_TRIGGER_PER_FEED,
+    minSec: settings.starMinSec !== null ? settings.starMinSec : YT_AUDIO_TRIGGER_MIN_DURATION_SEC,
+  };
+}
+
+// ルールに従って1フィード分の動画IDを選ぶ (純関数)。
+// videos は { videoId, publishedAt, durationSec } の配列。
+// 'all' は動画IDのある全件 (並びは入力順)。'recent' は公開日時が
+// 読めるものを新しい順に並べ、長さが minSec 未満と分かっている
+// ものを数えずに count 本まで。'none' は空。
+function planStarSelection(videos, rule) {
+  const r = rule || {};
+  const list = videos || [];
+  const ids = [];
+  const seen = {};
   const push = (v) => {
     const videoId = String((v && v.videoId) || '');
     if (!videoId || seen[videoId]) return;
     seen[videoId] = true;
     ids.push(videoId);
   };
-  (feedVideos || []).forEach((videos) => {
-    const list = videos || [];
-    if (list.some((v) => v && (v.channelId === YT_AUDIO_ALWAYS_CHANNEL_ID || v.playlist))) {
-      // 全件クラス: 取得できた順 (新しい順) に全件を選ぶ。
-      list.forEach(push);
-      return;
-    }
-    const candidates = list.filter((v) => {
-      // 動画IDの無いものは件数上限の枠も使わないよう、最初に除く。
-      if (!v || !String(v.videoId || '')) return false;
-      const ts = Date.parse(v.publishedAt || '');
-      return !isNaN(ts);
-    });
-    // candidates は filter の新規配列なので、そのまま並べ替えてよい。
-    const sorted = candidates.sort((a, b) => {
-      const tb = Date.parse((b && b.publishedAt) || '') || 0;
-      const ta = Date.parse((a && a.publishedAt) || '') || 0;
-      return tb - ta;
-    });
-    let picked = 0;
-    for (const v of sorted) {
-      if (picked >= YT_AUDIO_TRIGGER_PER_FEED) break;
-      const sec = Number(v.durationSec) || 0;
-      // 短尺と分かっている動画は数えない (枠を消費しない)。
-      if (sec > 0 && sec < YT_AUDIO_TRIGGER_MIN_DURATION_SEC) continue;
-      push(v);
-      picked += 1;
-    }
+  if (r.mode === 'all') {
+    list.forEach(push);
+    return ids;
+  }
+  if (r.mode !== 'recent') return ids;
+  const count = normalizeStarCount(r.count) || YT_AUDIO_TRIGGER_PER_FEED;
+  const minSecRaw = normalizeStarMinSec(r.minSec);
+  const minSec = minSecRaw !== null ? minSecRaw : YT_AUDIO_TRIGGER_MIN_DURATION_SEC;
+  const candidates = list.filter((v) => {
+    // 動画IDの無いものは件数上限の枠も使わないよう、最初に除く。
+    if (!v || !String(v.videoId || '')) return false;
+    const ts = Date.parse(v.publishedAt || '');
+    return !isNaN(ts);
   });
+  // candidates は filter の新規配列なので、そのまま並べ替えてよい。
+  const sorted = candidates.sort((a, b) => {
+    const tb = Date.parse((b && b.publishedAt) || '') || 0;
+    const ta = Date.parse((a && a.publishedAt) || '') || 0;
+    return tb - ta;
+  });
+  let picked = 0;
+  for (const v of sorted) {
+    if (picked >= count) break;
+    const sec = Number(v.durationSec) || 0;
+    // 短尺と分かっている動画は数えない (枠を消費しない)。
+    // minSec が 0 のときは sec < 0 にならず、除外なしとして効く。
+    if (sec > 0 && sec < minSec) continue;
+    push(v);
+    picked += 1;
+  }
   return ids;
 }
 
 // --- YouTube 再生対象のスター制 ---
 // 実効スターの計算 (純関数)。デフォルトルールの評価は
-// planYouTubeAudioTriggers をフィード単位でそのまま使う。
+// フィードの実効ルール (effectiveStarRule) を planStarSelection で
+// フィード単位に評価する。
 // ランキングはオーバーライドの有無に関係なくフィードの記事集合
 // 全体で評価するため、手動で外した動画の枠に次の動画が繰り上がる
 // ことはない (繰り上げたい場合は次の動画にも手動で付ける)。
@@ -1483,7 +1586,7 @@ function computeStarredArticleIds(feeds, articles, nowMs) {
   order.forEach((feedId) => {
     const group = byFeedId[feedId];
     const defaultIds = {};
-    planYouTubeAudioTriggers([group.videos], now).forEach((videoId) => { defaultIds[videoId] = true; });
+    planStarSelection(group.videos, effectiveStarRule(group.feed)).forEach((videoId) => { defaultIds[videoId] = true; });
     group.infos.forEach((info) => {
       if (!info.articleId) return;
       if (info.override === 'on') starred[info.articleId] = true;
@@ -1512,7 +1615,7 @@ function planStarredAudioTriggers(feeds, articles, nowMs) {
     group.infos.forEach((info) => {
       if (info.videoId && !infoByVideoId[info.videoId]) infoByVideoId[info.videoId] = info;
     });
-    return { group, infoByVideoId, defaultIds: planYouTubeAudioTriggers([group.videos], now) };
+    return { group, infoByVideoId, defaultIds: planStarSelection(group.videos, effectiveStarRule(group.feed)) };
   });
   const seen = {};
   const ids = [];
@@ -2079,6 +2182,10 @@ function buildListPayload(body) {
       sortDirection: sortDirectionOf(f),
       // 削除同期の対象かどうかもタイムライン側 (取り込み) が要る。
       syncDeletes: syncDeletesOf(f),
+      // スター選定の設定 (管理画面の表示用。未指定は null)。
+      starMode: starSettingsOf(f).starMode,
+      starCount: starSettingsOf(f).starCount,
+      starMinSec: starSettingsOf(f).starMinSec,
       unreadCount: unreadByFeed[f.id] || 0,
     })),
   };
@@ -2164,6 +2271,40 @@ function validateFeedInput(input) {
     if (sd !== 'on' && sd !== 'off') return { ok: false, message: 'syncDeletes must be a boolean' };
     syncDeletes = sd === 'on';
   }
+  // スター選定は任意。undefined の項目は feed に含めない (未指定 =
+  // キーなし) で、更新時は buildFeedRow が既存行の値を引き継ぐ。
+  // 空文字・null は「未指定に戻す」明示として受け付ける (管理画面の
+  // フォームが全項目を常に送るため、クリアもこの経路で表す)。
+  let starMode;
+  if (input.starMode !== undefined) {
+    if (input.starMode === null || input.starMode === '') {
+      starMode = '';
+    } else {
+      const m = normalizeStarMode(input.starMode);
+      if (!m) return { ok: false, message: 'starMode must be one of none, recent, all' };
+      starMode = m;
+    }
+  }
+  let starCount;
+  if (input.starCount !== undefined) {
+    if (input.starCount === null || input.starCount === '') {
+      starCount = null;
+    } else {
+      const n = normalizeStarCount(input.starCount);
+      if (n === null) return { ok: false, message: 'starCount must be an integer between 1 and 100' };
+      starCount = n;
+    }
+  }
+  let starMinSec;
+  if (input.starMinSec !== undefined) {
+    if (input.starMinSec === null || input.starMinSec === '') {
+      starMinSec = null;
+    } else {
+      const n = normalizeStarMinSec(input.starMinSec);
+      if (n === null) return { ok: false, message: 'starMinSec must be an integer between 0 and 3600' };
+      starMinSec = n;
+    }
+  }
   const feed = {
     id,
     title,
@@ -2172,6 +2313,9 @@ function validateFeedInput(input) {
   };
   if (sortDirection !== undefined) feed.sortDirection = sortDirection;
   if (syncDeletes !== undefined) feed.syncDeletes = syncDeletes;
+  if (starMode !== undefined) feed.starMode = starMode;
+  if (starCount !== undefined) feed.starCount = starCount;
+  if (starMinSec !== undefined) feed.starMinSec = starMinSec;
   return {
     ok: true,
     feed,
@@ -2203,6 +2347,17 @@ function buildFeedRow(feed, existing) {
     sync_deletes: feed.syncDeletes !== undefined
       ? normalizeSyncDeletes(feed.syncDeletes)
       : (prev ? normalizeSyncDeletes(prev.sync_deletes) : ''),
+    // スター選定: 明示があればそれを、無ければ既存行の値を引き継ぐ。
+    // 数値は未指定を '' で保存する。
+    star_mode: feed.starMode !== undefined
+      ? normalizeStarMode(feed.starMode)
+      : (prev ? normalizeStarMode(prev.star_mode) : ''),
+    star_count: feed.starCount !== undefined
+      ? (normalizeStarCount(feed.starCount) === null ? '' : normalizeStarCount(feed.starCount))
+      : (prev ? (normalizeStarCount(prev.star_count) === null ? '' : normalizeStarCount(prev.star_count)) : ''),
+    star_min_sec: feed.starMinSec !== undefined
+      ? (normalizeStarMinSec(feed.starMinSec) === null ? '' : normalizeStarMinSec(feed.starMinSec))
+      : (prev ? (normalizeStarMinSec(prev.star_min_sec) === null ? '' : normalizeStarMinSec(prev.star_min_sec)) : ''),
   };
 }
 
@@ -2280,6 +2435,9 @@ function feedToApiShape(feedObj, unreadCount, serviceUrl) {
     category: String(f.category || ''),
     sortDirection: sortDirectionOf(f),
     syncDeletes: syncDeletesOf(f),
+    starMode: starSettingsOf(f).starMode,
+    starCount: starSettingsOf(f).starCount,
+    starMinSec: starSettingsOf(f).starMinSec,
     lastStatus: String(status || ''),
     lastError: String(error || ''),
     lastFetchedAt: cellIso(fetched),
@@ -2361,6 +2519,13 @@ function handleSaveFeed(body, resolveHandle) {
     ensureColumnIndex(sheet, headers, 'sync_deletes');
     headers.push('sync_deletes');
   }
+  // スター選定の3列も同じ移行パターンで遅延追加する。
+  ['star_mode', 'star_count', 'star_min_sec'].forEach((name) => {
+    if (!headers.includes(name)) {
+      ensureColumnIndex(sheet, headers, name);
+      headers.push(name);
+    }
+  });
   const idIdx = headers.indexOf('id');
   const urlIdx = headers.indexOf('url');
   const rowAt = (i) => rowObject(headers, values[i]);
@@ -2870,4 +3035,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, normalizeStarMode, normalizeStarCount, normalizeStarMinSec, starSettingsOf, effectiveStarRule, planStarSelection, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
