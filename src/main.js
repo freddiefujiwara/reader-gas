@@ -2186,6 +2186,8 @@ function buildListPayload(body) {
       starMode: starSettingsOf(f).starMode,
       starCount: starSettingsOf(f).starCount,
       starMinSec: starSettingsOf(f).starMinSec,
+      // 過去分ガードの設定も取り込み側が要る (未指定は null)。
+      pastGuard: pastGuardOf(f),
       unreadCount: unreadByFeed[f.id] || 0,
     })),
   };
@@ -2316,6 +2318,17 @@ function validateFeedInput(input) {
   if (starMode !== undefined) feed.starMode = starMode;
   if (starCount !== undefined) feed.starCount = starCount;
   if (starMinSec !== undefined) feed.starMinSec = starMinSec;
+  // 過去分ガードも任意 (スター選定と同じ扱い: undefined はキーなし、
+  // 空文字・null は未指定に戻す明示)。
+  if (input.pastGuard !== undefined) {
+    if (input.pastGuard === null || input.pastGuard === '') {
+      feed.pastGuard = '';
+    } else {
+      const pg = normalizePastGuard(input.pastGuard);
+      if (!pg) return { ok: false, message: 'pastGuard must be one of skip, read, off' };
+      feed.pastGuard = pg;
+    }
+  }
   return {
     ok: true,
     feed,
@@ -2358,6 +2371,10 @@ function buildFeedRow(feed, existing) {
     star_min_sec: feed.starMinSec !== undefined
       ? (normalizeStarMinSec(feed.starMinSec) === null ? '' : normalizeStarMinSec(feed.starMinSec))
       : (prev ? (normalizeStarMinSec(prev.star_min_sec) === null ? '' : normalizeStarMinSec(prev.star_min_sec)) : ''),
+    // 過去分ガード: 明示があればそれを、無ければ既存行の値を引き継ぐ。
+    past_guard: feed.pastGuard !== undefined
+      ? normalizePastGuard(feed.pastGuard)
+      : (prev ? normalizePastGuard(prev.past_guard) : ''),
   };
 }
 
@@ -2420,6 +2437,25 @@ function syncDeletesOf(f) {
   return normalizeSyncDeletes(raw) === 'on';
 }
 
+// フィードの過去分ガード (公開から保持期間を過ぎた記事を、端末に
+// 無いときにどう取り込むか) の設定。シートの past_guard 列に
+// 'skip' (取り込まない) / 'read' (既読として取り込む) / 'off'
+// (未読として取り込む = ガードなし) のいずれかを保存し、未指定は
+// ''。API へは未指定を null で返す。実際の判定はクライアント
+// (localDb の effectivePastGuard) が行い、種別ごとの既定は
+// 通常フィード = 'skip'、YouTube 由来 = 'read'。サーバーは
+// 属性の置き場所と配布だけを担う (スター選定と同じ分担)。
+function normalizePastGuard(value) {
+  const v = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
+  return v === 'skip' || v === 'read' || v === 'off' ? v : '';
+}
+
+function pastGuardOf(f) {
+  const src = f || {};
+  const raw = src.past_guard !== undefined ? src.past_guard : src.pastGuard;
+  return normalizePastGuard(raw) || null;
+}
+
 // Shapes a feeds-tab object (or a buildFeedRow result) into the API feed item.
 function feedToApiShape(feedObj, unreadCount, serviceUrl) {
   const f = feedObj || {};
@@ -2438,6 +2474,7 @@ function feedToApiShape(feedObj, unreadCount, serviceUrl) {
     starMode: starSettingsOf(f).starMode,
     starCount: starSettingsOf(f).starCount,
     starMinSec: starSettingsOf(f).starMinSec,
+    pastGuard: pastGuardOf(f),
     lastStatus: String(status || ''),
     lastError: String(error || ''),
     lastFetchedAt: cellIso(fetched),
@@ -2519,8 +2556,8 @@ function handleSaveFeed(body, resolveHandle) {
     ensureColumnIndex(sheet, headers, 'sync_deletes');
     headers.push('sync_deletes');
   }
-  // スター選定の3列も同じ移行パターンで遅延追加する。
-  ['star_mode', 'star_count', 'star_min_sec'].forEach((name) => {
+  // スター選定の3列と過去分ガードの列も同じ移行パターンで遅延追加する。
+  ['star_mode', 'star_count', 'star_min_sec', 'past_guard'].forEach((name) => {
     if (!headers.includes(name)) {
       ensureColumnIndex(sheet, headers, name);
       headers.push(name);
@@ -3035,4 +3072,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, normalizeStarMode, normalizeStarCount, normalizeStarMinSec, starSettingsOf, effectiveStarRule, planStarSelection, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, normalizeStarMode, normalizeStarCount, normalizeStarMinSec, starSettingsOf, effectiveStarRule, planStarSelection, normalizePastGuard, pastGuardOf, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
