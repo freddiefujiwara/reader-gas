@@ -2077,6 +2077,8 @@ function buildListPayload(body) {
       // タイムライン側がフィード単体表示の並び順を決めるために必要
       // (管理用 listFeeds の feedToApiShape と揃える)。
       sortDirection: sortDirectionOf(f),
+      // 削除同期の対象かどうかもタイムライン側 (取り込み) が要る。
+      syncDeletes: syncDeletesOf(f),
       unreadCount: unreadByFeed[f.id] || 0,
     })),
   };
@@ -2151,6 +2153,17 @@ function validateFeedInput(input) {
     if (sd !== 'asc' && sd !== 'desc') return { ok: false, message: 'sortDirection must be asc or desc' };
     sortDirection = sd;
   }
+  // 削除同期は任意の真偽値。指定が無ければ feed に含めない (未指定 =
+  // キーなし) で、更新時は buildFeedRow が既存行の値を引き継ぐ
+  // (並び順と同じ扱い)。
+  let syncDeletes;
+  if (input.syncDeletes !== undefined && input.syncDeletes !== null && input.syncDeletes !== '') {
+    const sd = typeof input.syncDeletes === 'boolean'
+      ? (input.syncDeletes ? 'on' : 'off')
+      : String(input.syncDeletes).trim().toLowerCase();
+    if (sd !== 'on' && sd !== 'off') return { ok: false, message: 'syncDeletes must be a boolean' };
+    syncDeletes = sd === 'on';
+  }
   const feed = {
     id,
     title,
@@ -2158,6 +2171,7 @@ function validateFeedInput(input) {
     category,
   };
   if (sortDirection !== undefined) feed.sortDirection = sortDirection;
+  if (syncDeletes !== undefined) feed.syncDeletes = syncDeletes;
   return {
     ok: true,
     feed,
@@ -2185,6 +2199,10 @@ function buildFeedRow(feed, existing) {
     sort_order: feed.sortDirection !== undefined
       ? normalizeSortOrder(feed.sortDirection)
       : (prev ? normalizeSortOrder(prev.sort_order) : ''),
+    // 削除同期: 明示があればそれを、無ければ既存行の値を引き継ぐ。
+    sync_deletes: feed.syncDeletes !== undefined
+      ? normalizeSyncDeletes(feed.syncDeletes)
+      : (prev ? normalizeSyncDeletes(prev.sync_deletes) : ''),
   };
 }
 
@@ -2227,6 +2245,26 @@ function sortDirectionOf(f) {
   return normalizeSortOrder(raw) === 'asc' ? 'asc' : 'desc';
 }
 
+// フィードの削除同期 (フィードから消えた記事を端末側でも消す) 設定。
+// シートの sync_deletes 列に 'on' とあるフィードだけが対象で、
+// それ以外 (空・列なし・不正値) はすべてオフ。シートに書く値は
+// 'on' か '' のみで、API へは真偽値で返す。実際の削除はクライアント
+// 取り込みのフィードについて端末側が行う (サーバー管理の YouTube
+// フィードには適用しない。プレイリストは従来どおりサーバー側で
+// 同期する)。予定のように「配信窓から外れたら消えてよい」フィード
+// のための設定で、並び順と同じく管理画面から変更できる。
+function normalizeSyncDeletes(value) {
+  if (value === true) return 'on';
+  const v = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
+  return v === 'on' || v === 'true' || v === '1' ? 'on' : '';
+}
+
+function syncDeletesOf(f) {
+  const src = f || {};
+  const raw = src.sync_deletes !== undefined ? src.sync_deletes : src.syncDeletes;
+  return normalizeSyncDeletes(raw) === 'on';
+}
+
 // Shapes a feeds-tab object (or a buildFeedRow result) into the API feed item.
 function feedToApiShape(feedObj, unreadCount, serviceUrl) {
   const f = feedObj || {};
@@ -2241,6 +2279,7 @@ function feedToApiShape(feedObj, unreadCount, serviceUrl) {
     fetchUrl: buildFetchUrl(f, base),
     category: String(f.category || ''),
     sortDirection: sortDirectionOf(f),
+    syncDeletes: syncDeletesOf(f),
     lastStatus: String(status || ''),
     lastError: String(error || ''),
     lastFetchedAt: cellIso(fetched),
@@ -2316,6 +2355,11 @@ function handleSaveFeed(body, resolveHandle) {
   if (!headers.includes('sort_order')) {
     ensureColumnIndex(sheet, headers, 'sort_order');
     headers.push('sort_order');
+  }
+  // sync_deletes 列も同じ移行パターンで遅延追加する。
+  if (!headers.includes('sync_deletes')) {
+    ensureColumnIndex(sheet, headers, 'sync_deletes');
+    headers.push('sync_deletes');
   }
   const idIdx = headers.indexOf('id');
   const urlIdx = headers.indexOf('url');
@@ -2826,4 +2870,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, weekStartKey, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateEventsByWeekFeed, planWeeklyRollup, rollupWeeklyEvents, maybeRollupWeeklyEvents, buildStatsPayload, doGet, doPost };

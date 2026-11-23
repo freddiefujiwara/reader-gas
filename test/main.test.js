@@ -283,7 +283,7 @@ test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変
   const created = buildFeedRow(feed, null);
   assert.deepEqual(created, {
     id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech',
-    etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '',
+    etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '', sync_deletes: '',
   });
   const existing = {
     id: 'zenn', title: 'Old', url: 'https://zenn.dev/feed', category: '',
@@ -320,7 +320,7 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
     last_status: '200', last_error: '', last_fetched_at: new Date('2026-11-14T00:15:30.088Z'),
   }, 7);
   assert.deepEqual(shaped, {
-    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private', sortDirection: 'desc',
+    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private', sortDirection: 'desc', syncDeletes: false,
     lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
@@ -353,6 +353,35 @@ test('sort_order: feedToApiShape は asc のフィードだけ sortDirection: as
   assert.equal(feedToApiShape({ id: 'x', sort_order: '' }).sortDirection, 'desc');
   assert.equal(feedToApiShape({ id: 'x' }).sortDirection, 'desc');
   assert.equal(feedToApiShape({ id: 'x', sort_order: 'ASC' }).sortDirection, 'asc');
+});
+
+test('sync_deletes: validateFeedInput は真偽値と on / off を受理し、不正値を弾き、未指定はキーなし', () => {
+  const base = { id: 'ok-id', title: 'Title', url: 'https://example.com/feed' };
+  assert.equal(validateFeedInput({ ...base, syncDeletes: true }).feed.syncDeletes, true);
+  assert.equal(validateFeedInput({ ...base, syncDeletes: false }).feed.syncDeletes, false);
+  assert.equal(validateFeedInput({ ...base, syncDeletes: ' ON ' }).feed.syncDeletes, true);
+  assert.equal(validateFeedInput({ ...base, syncDeletes: 'off' }).feed.syncDeletes, false);
+  assert.equal(validateFeedInput({ ...base, syncDeletes: 'yes' }).ok, false);
+  assert.ok(!('syncDeletes' in validateFeedInput(base).feed));
+});
+
+test('sync_deletes: buildFeedRow は明示を反映し、未指定では既存行の値を引き継ぐ', () => {
+  const feed = { id: 'a', title: 'A', url: 'https://example.com/f', category: '' };
+  assert.equal(buildFeedRow({ ...feed, syncDeletes: true }, null).sync_deletes, 'on');
+  assert.equal(buildFeedRow({ ...feed, syncDeletes: false }, null).sync_deletes, '');
+  const existingOn = { ...feed, etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '', sync_deletes: 'on' };
+  // 削除同期を送らない編集では、シート側の on を消さない。
+  assert.equal(buildFeedRow(feed, existingOn).sync_deletes, 'on');
+  // 明示の false で on を解除できる。
+  assert.equal(buildFeedRow({ ...feed, syncDeletes: false }, existingOn).sync_deletes, '');
+});
+
+test('sync_deletes: feedToApiShape は on のフィードだけ syncDeletes: true を返す', () => {
+  assert.equal(feedToApiShape({ id: 'x', sync_deletes: 'on' }).syncDeletes, true);
+  assert.equal(feedToApiShape({ id: 'x', sync_deletes: '' }).syncDeletes, false);
+  assert.equal(feedToApiShape({ id: 'x' }).syncDeletes, false);
+  assert.equal(feedToApiShape({ id: 'x', sync_deletes: 'ON' }).syncDeletes, true);
+  assert.equal(feedToApiShape({ id: 'x', sync_deletes: 'junk' }).syncDeletes, false);
 });
 
 test('countUnreadByFeed: サーバー側に既読状態が無いため記事数をそのまま数える', () => {
@@ -1409,8 +1438,8 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
     assert.ok(!('enabled' in byId['zenn']));
     assert.equal(byId['yt-x'].unreadCount, 1);
     // フィードのキー集合は slim 化後 (PR #16) の形から enabled を除き、
-    // sortDirection を加えた形に固定する
-    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'sortDirection', 'title', 'unreadCount', 'url']);
+    // sortDirection と syncDeletes を加えた形に固定する
+    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'sortDirection', 'syncDeletes', 'title', 'unreadCount', 'url']);
     // 既読は端末ローカル管理のため、isRead は常に false
     assert.equal(payload.articles[0].isRead, false);
   } finally { restore(); }
@@ -1984,7 +2013,7 @@ test('handleSaveFeed: slug ID の既存行は URL 一致で更新され、ID と
   } finally { restore(); }
 });
 
-test('handleSaveFeed: id 指定の更新は行を書き換え、10列で保存される (sort_order 列を遅延追加)', () => {
+test('handleSaveFeed: id 指定の更新は行を書き換え、11列で保存される (sort_order / sync_deletes 列を遅延追加)', () => {
   const { ss, restore } = saveFeedEnv([
     ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
   ]);
@@ -1996,12 +2025,14 @@ test('handleSaveFeed: id 指定の更新は行を書き換え、10列で保存�
     assert.equal(rows.length, 2);
     assert.equal(rows[1][3], 'blog');
     // enabled / is_private 列は撤去済み: E列 (index 4) は etag になる。
-    // 入力の enabled は無視される。sort_order 列は保存時に末尾へ
-    // 遅延追加され、行は10列になる (未指定なので値は空)。
+    // 入力の enabled は無視される。sort_order / sync_deletes 列は
+    // 保存時に末尾へ遅延追加され、行は11列になる (未指定なので値は空)。
     assert.equal(rows[0][9], 'sort_order');
-    assert.equal(rows[1].length, 10);
+    assert.equal(rows[0][10], 'sync_deletes');
+    assert.equal(rows[1].length, 11);
     assert.equal(rows[1][4], '');
     assert.equal(rows[1][9], '');
+    assert.equal(rows[1][10], '');
   } finally { restore(); }
 });
 
@@ -4184,7 +4215,7 @@ test('doPost listFeeds: 応答のキー集合が固定され、行順と記事�
     // シートの行順が表示順としてそのまま返る
     assert.deepEqual(res.feeds.map((f) => f.id), ['feed-b', 'feed-a']);
     assert.deepEqual(Object.keys(res.feeds[0]).sort(), [
-      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'sortDirection', 'title', 'unreadCount', 'url',
+      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'sortDirection', 'syncDeletes', 'title', 'unreadCount', 'url',
     ]);
     // 未読数 = そのフィードの記事数 (サーバー側に既読は無い)
     assert.equal(res.feeds[0].unreadCount, 1);
