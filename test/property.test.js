@@ -178,13 +178,16 @@ test('性質: parseAudioUrlsMap はどんなマップでも例外にならず、
   }, { requiredKeys: [] });
   fc.assert(fc.property(fc.dictionary(fc.stringMatching(/^[A-Za-z0-9_-]{1,20}$/), entry), (data) => {
     const map = parseAudioUrlsMap(JSON.stringify(data));
+    // 実装が見られるのは JSON を往復した後の値だけなので、期待値も
+    // 往復後の値と比較する (例: -0 は JSON で 0 になる)。
+    const parsed = JSON.parse(JSON.stringify(data));
     for (const [id, e] of Object.entries(map)) {
       assert.equal(typeof e.url, 'string');
       assert.notEqual(e.url, '');
       assert.ok(Number.isFinite(e.ts));
       if ('dur' in e) assert.ok(Number.isFinite(e.dur) && e.dur > 0);
       // 整形式のエントリ (文字列 URL・数値 ts) は必ず残る。
-      const src = data[id];
+      const src = parsed[id];
       if (src && typeof src.url === 'string' && src.url !== '' && typeof src.ts === 'number' && Number.isFinite(src.ts)) {
         assert.equal(e.url, src.url);
         assert.equal(e.ts, src.ts);
