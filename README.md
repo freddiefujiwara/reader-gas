@@ -85,7 +85,7 @@ Web版RSSリーダー `/reader` のバックエンド (Google Apps Script Web Ap
 ## 開発
 
 ```sh
-npm test   # node build.js && node --test test/main.test.js
+npm test   # node build.js && node --test test/main.test.js test/abnormal.test.js test/property.test.js
 npm run build
 npm run smoke   # 本番 /exec のスモークチェック (下記)
 ```
