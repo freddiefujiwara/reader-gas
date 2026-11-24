@@ -2180,9 +2180,17 @@ function buildListPayload(body) {
   if (!Number.isFinite(limit) || limit <= 0) limit = 100;
   limit = Math.min(limit, 500);
   const serviceUrl = getServiceUrl();
+  const page = sorted.slice(0, limit);
+  // scope=stars は背景更新のスター同期専用の軽量形。記事は id と
+  // スター状態だけに絞り、タイトル・要約・リンクは送らない (実測で
+  // 全体の大半が記事の要約だった)。初回取り込みのように全項目が
+  // 要るときは scope を付けずに呼ぶ。フィード側は両形とも従来どおり。
+  const articles = body.scope === 'stars'
+    ? page.map((a) => ({ id: a.id, starred: a.starred, star_state: a.star_state }))
+    : page;
   return {
     ok: true,
-    articles: sorted.slice(0, limit),
+    articles,
     feeds: feeds.filter((f) => f.id).map((f) => ({
       id: f.id,
       title: String(f.title || ''),
