@@ -89,15 +89,12 @@ import {
   handleSaveFeed,
   handleDeleteFeed,
   handleSetStar,
-  weekStartKey,
   sanitizeEvent,
   sanitizeEventBatch,
   handleLogEvents,
-  aggregateEventsByWeekFeed,
-  planWeeklyRollup,
-  rollupWeeklyEvents,
-  maybeRollupWeeklyEvents,
-  buildStatsPayload,
+  planEventPrune,
+  pruneOldEvents,
+  maybePruneOldEvents,
   doGet,
   doPost,
 } from '../src/main.js';
@@ -4949,24 +4946,10 @@ test('fetchFeeds: スター制で、off の最新動画は発火せず、on の�
 });
 
 // ============================================================
-// 視聴ログ (events / weekly_stats)
+// 視聴ログ (events)
 // ============================================================
 
 const EVENTS_HEADERS_ROW = ['ts', 'type', 'feed_id', 'feed_title', 'article_id', 'article_title', 'seconds'];
-const WEEKLY_STATS_HEADERS_ROW = ['week', 'feed_id', 'feed_title', 'views', 'opens', 'plays', 'seconds', 'scrolls', 'expands'];
-const WEEKLY_STATS_HEADERS_ROW_NO_EXPANDS = ['week', 'feed_id', 'feed_title', 'views', 'opens', 'plays', 'seconds', 'scrolls'];
-const WEEKLY_STATS_HEADERS_ROW_LEGACY = ['week', 'feed_id', 'feed_title', 'views', 'opens', 'plays', 'seconds'];
-
-test('weekStartKey: Asia/Tokyo の月曜始まりで週の開始日を返す', () => {
-  // 2026-11-15 (日) 23:59:59 JST は 11/9 週、16 (月) 00:00 JST から新しい週
-  assert.equal(weekStartKey(Date.parse('2026-11-15T14:59:59.000Z')), '2026-11-09');
-  assert.equal(weekStartKey(Date.parse('2026-11-15T15:00:00.000Z')), '2026-11-16');
-  assert.equal(weekStartKey(Date.parse('2026-11-16T00:00:00.000Z')), '2026-11-16');
-  assert.equal(weekStartKey(Date.parse('2026-11-22T14:59:59.000Z')), '2026-11-16');
-  assert.equal(weekStartKey(Date.parse('2026-11-22T15:00:00.000Z')), '2026-11-23');
-  // 月をまたぐ週 (2026-11-01 は日曜 → 週の開始は 10/26)
-  assert.equal(weekStartKey(Date.parse('2026-10-31T15:00:00.000Z')), '2026-10-26');
-});
 
 test('sanitizeEvent: 5種のイベントを行にし、不正な行は捨てる', () => {
   const now = '2026-11-17T00:00:00.000Z';
@@ -5155,19 +5138,17 @@ test('handleLogEvents: events タブを遅延作成して一括追記し、保�
   } finally { restore(); }
 });
 
-test('doPost log_events / stats: オーナーは実行でき、readonly は forbidden、無セッションは unauthorized', () => {
+test('doPost log_events: オーナーは実行でき、readonly は forbidden、無セッションは unauthorized', () => {
   const ss = new FakeSpreadsheet({});
   const restore = installSpreadsheet(ss);
   const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
   try {
     assert.deepEqual(post({ action: 'log_events', events: [] }), { ok: false, error: 'unauthorized' });
-    assert.deepEqual(post({ action: 'stats' }), { ok: false, error: 'unauthorized' });
     const readonly = issueSession('readonly');
     assert.deepEqual(
       post({ action: 'log_events', sessionToken: readonly.sessionToken, events: [{ type: 'feed_view', feed_id: 'f' }] }),
       { ok: false, error: 'forbidden' }
     );
-    assert.deepEqual(post({ action: 'stats', sessionToken: readonly.sessionToken }), { ok: false, error: 'forbidden' });
     assert.equal(ss.sheets['events'], undefined);
     const owner = issueSession('owner');
     const logged = post({
@@ -5176,79 +5157,25 @@ test('doPost log_events / stats: オーナーは実行でき、readonly は forb
       events: [{ type: 'feed_view', feed_id: 'feed-a' }, { type: 'bogus', feed_id: 'x' }],
     });
     assert.deepEqual(logged, { ok: true, saved: 1 });
-    const stats = post({ action: 'stats', sessionToken: owner.sessionToken });
-    assert.equal(stats.ok, true);
-    assert.deepEqual(stats.weekly, []);
-    assert.equal(stats.current.length, 1);
-    assert.equal(stats.current[0].feed_id, 'feed-a');
-    assert.equal(stats.current[0].views, 1);
+    // stats アクションは廃止したので unknown_action になる
+    assert.deepEqual(post({ action: 'stats', sessionToken: owner.sessionToken }), { ok: false, error: 'unknown_action' });
   } finally { restore(); }
 });
 
-test('aggregateEventsByWeekFeed: 週×フィードで views/opens/plays/seconds/scrolls/expands を集計する', () => {
+test('planEventPrune: 90日超の生ログだけを間引き対象にし、ts が読めない行は残す', () => {
+  const now = '2026-11-17T00:00:00.000Z'; // 90日前 = 2026-08-19T00:00:00.000Z
   const events = [
-    { ts: '2026-11-10T00:00:00.000Z', type: 'feed_view', feed_id: 'feed-a', feed_title: 'A', seconds: '' },
-    { ts: '2026-11-11T00:00:00.000Z', type: 'feed_view', feed_id: 'feed-a', feed_title: 'A', seconds: '' },
-    { ts: '2026-11-11T01:00:00.000Z', type: 'article_open', feed_id: 'feed-a', feed_title: 'A', seconds: '' },
-    { ts: '2026-11-12T00:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 120 },
-    { ts: '2026-11-12T01:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: '30' },
-    { ts: '2026-11-17T00:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 999 },
-    { ts: 'bad', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 5 },
+    { ts: '2026-08-10T00:00:00.000Z', type: 'play', feed_id: 'feed-a' },
+    { ts: '2026-08-18T23:59:59.000Z', type: 'play', feed_id: 'feed-b' },
+    { ts: '2026-08-19T00:00:00.000Z', type: 'play', feed_id: 'feed-a' },
+    { ts: '2026-11-10T00:00:00.000Z', type: 'play', feed_id: 'feed-a' },
+    { ts: 'bad', type: 'play', feed_id: 'feed-a' },
   ];
-  const all = aggregateEventsByWeekFeed(events, null);
-  assert.deepEqual(all.map['2026-11-09\nfeed-a'], {
-    week: '2026-11-09', feed_id: 'feed-a', feed_title: 'A', views: 2, opens: 1, plays: 2, seconds: 150, scrolls: 0, expands: 0,
-  });
-  const onlyCurrent = aggregateEventsByWeekFeed(events, '2026-11-16');
-  assert.deepEqual(onlyCurrent.order, ['2026-11-16\nfeed-a']);
-  assert.equal(onlyCurrent.map['2026-11-16\nfeed-a'].seconds, 999);
+  // 90日ちょうど (8/19) と新しい行と ts が読めない行は残す
+  assert.deepEqual(planEventPrune(events, now), [0, 1]);
 });
 
-test('planWeeklyRollup: 完了週だけを集計し、既存の週は二重集計せず、今週分は対象外', () => {
-  const now = '2026-11-17T00:00:00.000Z'; // 火曜。今週 = 2026-11-16 週
-  const events = [
-    { ts: '2026-11-10T00:00:00.000Z', type: 'feed_view', feed_id: 'feed-a', feed_title: 'A', seconds: '' },
-    { ts: '2026-11-10T01:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 60 },
-    { ts: '2026-11-03T00:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 30 },
-    { ts: '2026-11-03T01:00:00.000Z', type: 'feed_view', feed_id: 'feed-b', feed_title: 'B', seconds: '' },
-    { ts: '2026-11-16T10:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 999 },
-  ];
-  const existing = [
-    { week: '2026-11-02', feed_id: 'feed-a', feed_title: 'A', views: 0, opens: 0, plays: 1, seconds: 30 },
-  ];
-  const plan = planWeeklyRollup(events, existing, now);
-  assert.equal(plan.currentWeek, '2026-11-16');
-  // 2026-11-02 の feed-a は集計済みなので追記しない。feed-b と 2026-11-09 の feed-a だけ
-  assert.deepEqual(plan.rowsToAppend, [
-    ['2026-11-09', 'feed-a', 'A', 1, 0, 1, 60, 0, 0],
-    ['2026-11-02', 'feed-b', 'B', 1, 0, 0, 0, 0, 0],
-  ]);
-  assert.deepEqual(plan.pruneIndexes, []);
-});
-
-test('planWeeklyRollup: 90日超の生ログは集計済みの週だけ間引く', () => {
-  const now = '2026-11-17T00:00:00.000Z'; // 90日前 = 2026-08-19
-  const events = [
-    { ts: '2026-08-10T00:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 10 },
-    { ts: '2026-08-10T01:00:00.000Z', type: 'play', feed_id: 'feed-b', feed_title: 'B', seconds: 20 },
-    { ts: '2026-08-19T00:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 30 },
-    { ts: '2026-11-10T00:00:00.000Z', type: 'play', feed_id: 'feed-a', feed_title: 'A', seconds: 40 },
-  ];
-  const existing = [
-    { week: '2026-08-10', feed_id: 'feed-b', feed_title: 'B', views: 0, opens: 0, plays: 1, seconds: 20 },
-  ];
-  const plan = planWeeklyRollup(events, existing, now);
-  // feed-a の 8/10 週は今回集計されるので間引き対象。feed-b は集計済みでも対象。
-  // 8/19 (ちょうど90日) と 11/10 は残す
-  assert.deepEqual(plan.pruneIndexes, [0, 1]);
-  assert.deepEqual(plan.rowsToAppend, [
-    ['2026-08-10', 'feed-a', 'A', 0, 0, 1, 10, 0, 0],
-    ['2026-08-17', 'feed-a', 'A', 0, 0, 1, 30, 0, 0],
-    ['2026-11-09', 'feed-a', 'A', 0, 0, 1, 40, 0, 0],
-  ]);
-});
-
-test('rollupWeeklyEvents: weekly_stats へ畳み、90日超を間引き、再実行しても二重集計しない', () => {
+test('pruneOldEvents: 90日超の生ログだけを間引き、再実行しても何も消えない', () => {
   const ss = new FakeSpreadsheet({
     events: [EVENTS_HEADERS_ROW,
       ['2026-08-10T00:00:00.000Z', 'play', 'feed-a', 'A', 'art-0', '', 10],
@@ -5259,31 +5186,23 @@ test('rollupWeeklyEvents: weekly_stats へ畳み、90日超を間引き、再実
   });
   const restore = installSpreadsheet(ss);
   try {
-    const first = rollupWeeklyEvents('2026-11-17T00:00:00.000Z');
-    assert.deepEqual(first, { ok: true, appended: 2, pruned: 1 });
-    assert.deepEqual(ss.sheets['weekly_stats'].rows, [
-      WEEKLY_STATS_HEADERS_ROW,
-      ['2026-08-10', 'feed-a', 'A', 0, 0, 1, 10, 0, 0],
-      ['2026-11-09', 'feed-a', 'A', 1, 0, 1, 60, 0, 0],
-    ]);
-    // 90日超の行だけ消え、今週分と先週分は残る
+    assert.deepEqual(pruneOldEvents('2026-11-17T00:00:00.000Z'), { ok: true, pruned: 1 });
+    // 90日超の行だけ消え、それ以外は残る
     assert.deepEqual(ss.sheets['events'].rows.map((r) => r[4]), ['article_id', '', 'art-1', 'art-2']);
-    const second = rollupWeeklyEvents('2026-11-17T01:00:00.000Z');
-    assert.deepEqual(second, { ok: true, appended: 0, pruned: 0 });
-    assert.equal(ss.sheets['weekly_stats'].rows.length, 3);
+    assert.deepEqual(pruneOldEvents('2026-11-17T01:00:00.000Z'), { ok: true, pruned: 0 });
     // events タブが無い場合は何もしない
     const ss2 = new FakeSpreadsheet({});
     const restore2 = installSpreadsheet(ss2);
     try {
-      assert.deepEqual(rollupWeeklyEvents('2026-11-17T00:00:00.000Z'), { ok: true, appended: 0, pruned: 0 });
-      assert.equal(ss2.sheets['weekly_stats'], undefined);
+      assert.deepEqual(pruneOldEvents('2026-11-17T00:00:00.000Z'), { ok: true, pruned: 0 });
     } finally { restore2(); }
   } finally { restore(); }
 });
 
-test('maybeRollupWeeklyEvents: 最終実行から7日空いたときだけ走る', () => {
+test('maybePruneOldEvents: 最終実行から7日空いたときだけ走る', () => {
   const ss = new FakeSpreadsheet({
     events: [EVENTS_HEADERS_ROW,
+      ['2026-08-10T00:00:00.000Z', 'play', 'feed-a', 'A', 'art-0', '', 10],
       ['2026-11-10T00:00:00.000Z', 'feed_view', 'feed-a', 'A', '', '', ''],
     ],
   });
@@ -5295,47 +5214,19 @@ test('maybeRollupWeeklyEvents: 最終実行から7日空いたときだけ走る
   });
   try {
     const t0 = Date.parse('2026-11-17T00:00:00.000Z');
-    assert.equal(maybeRollupWeeklyEvents(t0), true);
-    assert.equal(props.store['WEEKLY_ROLLUP_LAST_RUN_AT'], String(t0));
-    assert.equal(ss.sheets['weekly_stats'].rows.length, 2);
+    assert.equal(maybePruneOldEvents(t0), true);
+    assert.equal(props.store['EVENT_PRUNE_LAST_RUN_AT'], String(t0));
+    // 90日超の行が間引かれている
+    assert.equal(ss.sheets['events'].rows.length, 2);
     // 1時間後は走らない
-    assert.equal(maybeRollupWeeklyEvents(t0 + 60 * 60 * 1000), false);
-    // 8日後は再び走る (新しい集計対象は無い)
-    assert.equal(maybeRollupWeeklyEvents(t0 + 8 * 24 * 60 * 60 * 1000), true);
-    assert.equal(ss.sheets['weekly_stats'].rows.length, 2);
+    assert.equal(maybePruneOldEvents(t0 + 60 * 60 * 1000), false);
+    // 8日後は再び走る (新しい間引き対象は無い)
+    assert.equal(maybePruneOldEvents(t0 + 8 * 24 * 60 * 60 * 1000), true);
+    assert.equal(ss.sheets['events'].rows.length, 2);
   } finally { restore(); }
 });
 
-test('buildStatsPayload: weekly_stats の直近26週と今週の未集計分を返す', () => {
-  const statsRows = [WEEKLY_STATS_HEADERS_ROW];
-  // 2026-05-18 (月) から30週分を生成し、直近26週だけが返ることを見る
-  for (let i = 0; i < 30; i++) {
-    const monday = new Date(Date.parse('2026-05-18T00:00:00.000Z') + i * 7 * 24 * 60 * 60 * 1000);
-    statsRows.push([monday.toISOString().slice(0, 10), 'feed-a', 'A', i, 0, 0, 0]);
-  }
-  const ss = new FakeSpreadsheet({
-    weekly_stats: statsRows,
-    events: [EVENTS_HEADERS_ROW,
-      ['2026-11-16T10:00:00.000Z', 'play', 'feed-b', 'B', 'art-1', '', 120],
-      ['2026-11-10T10:00:00.000Z', 'play', 'feed-b', 'B', 'art-2', '', 999],
-    ],
-  });
-  const restore = installSpreadsheet(ss);
-  try {
-    const payload = buildStatsPayload('2026-11-17T00:00:00.000Z');
-    assert.equal(payload.ok, true);
-    assert.equal(payload.weekly.length, 26);
-    assert.equal(payload.weekly[0].week, '2026-06-15');
-    assert.equal(payload.weekly[25].week, '2026-12-07');
-    assert.equal(payload.currentWeek, '2026-11-16');
-    // 今週分は events からその場で集計し、先週分は混ざらない
-    assert.deepEqual(payload.current, [
-      { week: '2026-11-16', feed_id: 'feed-b', feed_title: 'B', views: 0, opens: 0, plays: 1, seconds: 120, scrolls: 0, expands: 0 },
-    ]);
-  } finally { restore(); }
-});
-
-test('scroll イベント: log_events で保存され、週次集計と stats の両方に scrolls が出る', () => {
+test('scroll イベント: log_events で保存される', () => {
   const ss = new FakeSpreadsheet({});
   const restore = installSpreadsheet(ss);
   try {
@@ -5351,51 +5242,10 @@ test('scroll イベント: log_events で保存され、週次集計と stats �
     // scroll 行は seconds を持たずに保存される
     assert.deepEqual(ss.sheets['events'].rows[1],
       ['2026-11-10T00:00:00.000Z', 'scroll', 'feed-a', 'A', '', '', '']);
-    // 完了週 (2026-11-09) の scroll 2件が weekly_stats の scrolls に畳まれる
-    assert.deepEqual(rollupWeeklyEvents('2026-11-17T00:00:00.000Z'), { ok: true, appended: 1, pruned: 0 });
-    assert.deepEqual(ss.sheets['weekly_stats'].rows, [
-      WEEKLY_STATS_HEADERS_ROW,
-      ['2026-11-09', 'feed-a', 'A', 1, 0, 0, 0, 2, 0],
-    ]);
-    const payload = buildStatsPayload('2026-11-17T00:00:00.000Z');
-    assert.equal(payload.weekly.length, 1);
-    assert.equal(payload.weekly[0].scrolls, 2);
-    // 今週分 (2026-11-16) の scroll 1件はライブ集計側に出る
-    assert.deepEqual(payload.current, [
-      { week: '2026-11-16', feed_id: 'feed-a', feed_title: 'A', views: 0, opens: 0, plays: 0, seconds: 0, scrolls: 1, expands: 0 },
-    ]);
   } finally { restore(); }
 });
 
-test('rollupWeeklyEvents: scrolls 列の無い既存 weekly_stats へヘッダーを遅延追加する', () => {
-  const ss = new FakeSpreadsheet({
-    weekly_stats: [WEEKLY_STATS_HEADERS_ROW_LEGACY,
-      ['2026-11-02', 'feed-a', 'A', 1, 2, 3, 40],
-    ],
-    events: [EVENTS_HEADERS_ROW,
-      ['2026-11-10T00:00:00.000Z', 'scroll', 'feed-a', 'A', '', '', ''],
-      ['2026-11-10T01:00:00.000Z', 'scroll', 'feed-a', 'A', '', '', ''],
-      ['2026-11-10T02:00:00.000Z', 'play', 'feed-a', 'A', 'art-1', '', 30],
-    ],
-  });
-  const restore = installSpreadsheet(ss);
-  try {
-    assert.deepEqual(rollupWeeklyEvents('2026-11-17T00:00:00.000Z'), { ok: true, appended: 1, pruned: 0 });
-    const rows = ss.sheets['weekly_stats'].rows;
-    // ヘッダーの末尾に scrolls と expands が付き、既存行はそのまま (7セル) 残る
-    assert.deepEqual(rows[0], WEEKLY_STATS_HEADERS_ROW);
-    assert.deepEqual(rows[1], ['2026-11-02', 'feed-a', 'A', 1, 2, 3, 40]);
-    assert.deepEqual(rows[2], ['2026-11-09', 'feed-a', 'A', 0, 0, 1, 30, 2, 0]);
-    // 既存行は scrolls 0 件として読め、新規行は scrolls 付きで返る
-    const payload = buildStatsPayload('2026-11-17T00:00:00.000Z');
-    assert.deepEqual(payload.weekly.map((w) => [w.week, w.scrolls]), [
-      ['2026-11-02', 0],
-      ['2026-11-09', 2],
-    ]);
-  } finally { restore(); }
-});
-
-test('expand イベント: log_events で保存され、週次集計と stats の両方に expands が出る', () => {
+test('expand イベント: log_events で保存される', () => {
   const ss = new FakeSpreadsheet({});
   const restore = installSpreadsheet(ss);
   try {
@@ -5411,46 +5261,5 @@ test('expand イベント: log_events で保存され、週次集計と stats �
     // expand 行は seconds を持たず、article_id / article_title を保持して保存される
     assert.deepEqual(ss.sheets['events'].rows[1],
       ['2026-11-10T00:00:00.000Z', 'expand', 'feed-a', 'A', 'art-1', '記事1', '']);
-    // 完了週 (2026-11-09) の expand 2件が weekly_stats の expands に畳まれる
-    assert.deepEqual(rollupWeeklyEvents('2026-11-17T00:00:00.000Z'), { ok: true, appended: 1, pruned: 0 });
-    assert.deepEqual(ss.sheets['weekly_stats'].rows, [
-      WEEKLY_STATS_HEADERS_ROW,
-      ['2026-11-09', 'feed-a', 'A', 0, 1, 0, 0, 0, 2],
-    ]);
-    const payload = buildStatsPayload('2026-11-17T00:00:00.000Z');
-    assert.equal(payload.weekly.length, 1);
-    assert.equal(payload.weekly[0].expands, 2);
-    // 今週分 (2026-11-16) の expand 1件はライブ集計側に出る
-    assert.deepEqual(payload.current, [
-      { week: '2026-11-16', feed_id: 'feed-a', feed_title: 'A', views: 0, opens: 0, plays: 0, seconds: 0, scrolls: 0, expands: 1 },
-    ]);
-  } finally { restore(); }
-});
-
-test('rollupWeeklyEvents: expands 列の無い既存 weekly_stats へヘッダーを遅延追加する', () => {
-  const ss = new FakeSpreadsheet({
-    weekly_stats: [WEEKLY_STATS_HEADERS_ROW_NO_EXPANDS,
-      ['2026-11-02', 'feed-a', 'A', 1, 2, 3, 40, 5],
-    ],
-    events: [EVENTS_HEADERS_ROW,
-      ['2026-11-10T00:00:00.000Z', 'expand', 'feed-a', 'A', 'art-1', '記事1', ''],
-      ['2026-11-10T01:00:00.000Z', 'expand', 'feed-a', 'A', 'art-2', '記事2', ''],
-      ['2026-11-10T02:00:00.000Z', 'play', 'feed-a', 'A', 'art-1', '', 30],
-    ],
-  });
-  const restore = installSpreadsheet(ss);
-  try {
-    assert.deepEqual(rollupWeeklyEvents('2026-11-17T00:00:00.000Z'), { ok: true, appended: 1, pruned: 0 });
-    const rows = ss.sheets['weekly_stats'].rows;
-    // ヘッダーの末尾に expands が付き、既存行はそのまま (8セル) 残る
-    assert.deepEqual(rows[0], WEEKLY_STATS_HEADERS_ROW);
-    assert.deepEqual(rows[1], ['2026-11-02', 'feed-a', 'A', 1, 2, 3, 40, 5]);
-    assert.deepEqual(rows[2], ['2026-11-09', 'feed-a', 'A', 0, 0, 1, 30, 0, 2]);
-    // 既存行は expands 0 件として読め、新規行は expands 付きで返る
-    const payload = buildStatsPayload('2026-11-17T00:00:00.000Z');
-    assert.deepEqual(payload.weekly.map((w) => [w.week, w.expands]), [
-      ['2026-11-02', 0],
-      ['2026-11-09', 2],
-    ]);
   } finally { restore(); }
 });
