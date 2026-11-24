@@ -92,6 +92,8 @@ import {
   sanitizeEvent,
   sanitizeEventBatch,
   handleLogEvents,
+  aggregateFeedStats,
+  buildFeedStatsPayload,
   planEventPrune,
   pruneOldEvents,
   maybePruneOldEvents,
@@ -5159,6 +5161,58 @@ test('doPost log_events: オーナーは実行でき、readonly は forbidden、
     assert.deepEqual(logged, { ok: true, saved: 1 });
     // stats アクションは廃止したので unknown_action になる
     assert.deepEqual(post({ action: 'stats', sessionToken: owner.sessionToken }), { ok: false, error: 'unknown_action' });
+  } finally { restore(); }
+});
+
+test('aggregateFeedStats: 利用を表す4種だけをフィード別に集計し、診断系は数えない', () => {
+  const events = [
+    { ts: '2026-11-20T10:00:00.000Z', type: 'play', feed_id: 'feed-a', seconds: 61 },
+    { ts: '2026-11-21T10:00:00.000Z', type: 'play', feed_id: 'feed-a', seconds: '30' },
+    { ts: '2026-11-19T10:00:00.000Z', type: 'article_open', feed_id: 'feed-a' },
+    { ts: '2026-11-22T10:00:00.000Z', type: 'expand', feed_id: 'feed-a' },
+    { ts: '2026-11-18T10:00:00.000Z', type: 'feed_view', feed_id: 'feed-a' },
+    // 診断系は利用に数えない (lastAt も進めない)
+    { ts: '2026-11-23T10:00:00.000Z', type: 'stall', feed_id: 'feed-a', seconds: 999 },
+    { ts: '2026-11-23T11:00:00.000Z', type: 'advance_swap', feed_id: 'feed-a' },
+    { ts: '2026-11-23T12:00:00.000Z', type: 'scroll', feed_id: 'feed-a' },
+    // feed_id が無い行・壊れた行は読み飛ばす
+    { ts: '2026-11-23T13:00:00.000Z', type: 'play', feed_id: '', seconds: 10 },
+    null,
+    { ts: '2026-11-17T10:00:00.000Z', type: 'play', feed_id: 'feed-b', seconds: -5 },
+  ];
+  assert.deepEqual(aggregateFeedStats(events), {
+    'feed-a': { plays: 2, playSeconds: 91, opens: 1, expands: 1, views: 1, lastAt: '2026-11-22T10:00:00.000Z' },
+    'feed-b': { plays: 1, playSeconds: 0, opens: 0, expands: 0, views: 0, lastAt: '2026-11-17T10:00:00.000Z' },
+  });
+  assert.deepEqual(aggregateFeedStats([]), {});
+  assert.deepEqual(aggregateFeedStats(null), {});
+});
+
+test('doPost feed_stats: オーナーは集計を取得でき、readonly は forbidden、events が無ければ空', () => {
+  const ss = new FakeSpreadsheet({
+    events: [EVENTS_HEADERS_ROW,
+      ['2026-11-20T10:00:00.000Z', 'play', 'feed-a', 'A', 'art-1', '', 120],
+      ['2026-11-21T10:00:00.000Z', 'feed_view', 'feed-a', 'A', '', '', ''],
+      ['2026-11-21T11:00:00.000Z', 'stall', 'feed-a', 'A', 'art-1', '', 5],
+    ],
+  });
+  const restore = installSpreadsheet(ss);
+  const post = (obj) => JSON.parse(doPost({ postData: { contents: JSON.stringify(obj) } }).getContent());
+  try {
+    assert.deepEqual(post({ action: 'feed_stats' }), { ok: false, error: 'unauthorized' });
+    const readonly = issueSession('readonly');
+    assert.deepEqual(post({ action: 'feed_stats', sessionToken: readonly.sessionToken }), { ok: false, error: 'forbidden' });
+    const owner = issueSession('owner');
+    assert.deepEqual(post({ action: 'feed_stats', sessionToken: owner.sessionToken }), {
+      ok: true,
+      stats: { 'feed-a': { plays: 1, playSeconds: 120, opens: 0, expands: 0, views: 1, lastAt: '2026-11-21T10:00:00.000Z' } },
+    });
+    // events タブが無いスプレッドシートでは空の集計
+    const ss2 = new FakeSpreadsheet({});
+    const restore2 = installSpreadsheet(ss2);
+    try {
+      assert.deepEqual(buildFeedStatsPayload(), { ok: true, stats: {} });
+    } finally { restore2(); }
   } finally { restore(); }
 });
 

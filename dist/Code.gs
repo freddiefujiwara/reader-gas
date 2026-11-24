@@ -2796,6 +2796,44 @@ function handleLogEvents(body, nowIso) {
 // 90日超の生ログの間引き計画を立てる純関数。保持期間
 // (EVENT_RETENTION_DAYS) を過ぎた行のインデックス (events 配列の
 // 0始まり) を返す。ts が解釈できない行は消さない。
+// フィードの削除候補を管理画面で判断できるよう、視聴ログ (events) を
+// フィード別に集計する。数えるのは利用を表す4種だけ (feed_view /
+// article_open / expand / play)。診断系の種別 (stall や advance_* 等)
+// は利用に数えない。play の seconds は実再生秒数の合計、lastAt は
+// 最終活動の ts。保持は生ログと同じ90日なので、集計も直近90日分。
+const FEED_STAT_TYPES = { feed_view: true, article_open: true, expand: true, play: true };
+
+function aggregateFeedStats(events) {
+  const stats = {};
+  (events || []).forEach((ev) => {
+    if (!ev || !FEED_STAT_TYPES[ev.type]) return;
+    const feedId = asText(ev.feed_id);
+    if (!feedId) return;
+    const s = stats[feedId]
+      || (stats[feedId] = { plays: 0, playSeconds: 0, opens: 0, expands: 0, views: 0, lastAt: '' });
+    if (ev.type === 'play') {
+      s.plays += 1;
+      const sec = Number(ev.seconds);
+      if (Number.isFinite(sec) && sec > 0) s.playSeconds += Math.round(sec);
+    } else if (ev.type === 'article_open') s.opens += 1;
+    else if (ev.type === 'expand') s.expands += 1;
+    else if (ev.type === 'feed_view') s.views += 1;
+    const ts = cellIso(ev.ts);
+    if (ts && ts > s.lastAt) s.lastAt = ts;
+  });
+  return stats;
+}
+
+function buildFeedStatsPayload() {
+  const ss = openDataSpreadsheet();
+  const eventsSheet = ss.getSheetByName(EVENTS_SHEET_NAME);
+  if (!eventsSheet) return { ok: true, stats: {} };
+  const values = eventsSheet.getDataRange().getValues();
+  if (!values || values.length < 2) return { ok: true, stats: {} };
+  const events = values.slice(1).map((row) => rowObject(values[0], row));
+  return { ok: true, stats: aggregateFeedStats(events) };
+}
+
 function planEventPrune(events, nowIso) {
   const nowMs = Date.parse(nowIso || '') || Date.now();
   const cutoffMs = nowMs - EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -2930,6 +2968,7 @@ function doPost(e) {
       revokeShareLink: () => revokeShareLink(),
       set_star: () => handleSetStar(body),
       log_events: () => handleLogEvents(body),
+      feed_stats: () => buildFeedStatsPayload(),
     };
     if (Object.prototype.hasOwnProperty.call(ownerActions, action)) {
       if (session.role !== 'owner') return jsonOutput({ ok: false, error: 'forbidden' });
