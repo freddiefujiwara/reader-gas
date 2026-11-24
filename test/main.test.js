@@ -1517,6 +1517,46 @@ test('doPost: セッション無しの list は unauthorized、不正な JSON �
   } finally { restore(); }
 });
 
+test('buildListPayload: scope=stars では記事が id とスター状態だけに絞られる', () => {
+  const tables = {
+    feeds: [
+      ['id', 'title', 'url', 'category', 'etag', 'last_modified', 'last_fetched_at', 'last_status', 'last_error'],
+      ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
+    ],
+    articles: [
+      ['id', 'feed_id', 'title', 'link', 'published_at', 'fetched_at', 'summary', 'author'],
+      ['a1', 'zenn', '記事1', 'https://example.com/1', '2026-11-14T00:00:00.000Z', '2026-11-14T01:00:00.000Z', '要約1', '著者1'],
+      ['a2', 'zenn', '記事2', 'https://example.com/2', '2026-11-13T00:00:00.000Z', '2026-11-13T01:00:00.000Z', '', ''],
+    ],
+  };
+  const ss = {
+    getSheetByName(name) {
+      const values = tables[name];
+      if (!values) return null;
+      return { getDataRange: () => ({ getValues: () => values }) };
+    },
+  };
+  globalThis.PropertiesService = {
+    getScriptProperties: () => ({ getProperty: (k) => (k === 'SPREADSHEET_ID' ? 'fake-id' : null) }),
+  };
+  globalThis.SpreadsheetApp = { openById: () => ss };
+  try {
+    const payload = buildListPayload({ scope: 'stars' });
+    assert.equal(payload.articles.length, 2);
+    assert.deepEqual(Object.keys(payload.articles[0]).sort(), ['id', 'star_state', 'starred']);
+    assert.equal(payload.articles[0].id, 'a1');
+    // フィード側は軽量形でも従来どおり (未読数も付く)。
+    assert.equal(payload.feeds.length, 1);
+    assert.equal(payload.feeds[0].unreadCount, 2);
+    // scope 無し・未知の scope は全項目のまま。
+    assert.ok('summary' in buildListPayload({}).articles[0]);
+    assert.ok('summary' in buildListPayload({ scope: 'other' }).articles[0]);
+  } finally {
+    delete globalThis.PropertiesService;
+    delete globalThis.SpreadsheetApp;
+  }
+});
+
 test('buildListPayload: limit は 500 にクランプされ、不正値は既定 100 に戻る', () => {
   const articles = [ARTICLE_HEADERS_ROW];
   const base = Date.parse('2026-11-01T00:00:00.000Z');
