@@ -1158,6 +1158,20 @@ function issueSession(role) {
   return { sessionToken: token, expiresAt: expiresIso, role };
 }
 
+// セッション検証のたびに access_count と last_accessed_at を書き戻すと、
+// 認証付きの呼び出しすべてにシート書き込みが乗り、応答が遅くなる。
+// 最終アクセスの記録は概況が分かれば足りるため、書き戻しは間隔が
+// 空いたときだけに間引く (access_count は概数になる)。
+const SESSION_TOUCH_INTERVAL_MS = 10 * 60 * 1000;
+
+function shouldTouchSession(lastAccessedIso, nowIso) {
+  if (!lastAccessedIso) return true;
+  const last = Date.parse(lastAccessedIso);
+  const now = Date.parse(nowIso);
+  if (!Number.isFinite(last) || !Number.isFinite(now)) return true;
+  return now - last >= SESSION_TOUCH_INTERVAL_MS;
+}
+
 function validateSession(token) {
   if (!token) return null;
   const ss = openDataSpreadsheet();
@@ -1177,8 +1191,16 @@ function validateSession(token) {
     if (!hashesEqual(row[hashIdx], hash)) continue;
     const expiresAt = cellIso(row[expIdx]);
     if (isSessionExpired(expiresAt, nowIso)) return null;
-    if (accessIdx >= 0) sheet.getRange(i + 1, accessIdx + 1).setValue(Number(row[accessIdx] || 0) + 1);
-    if (lastIdx >= 0) sheet.getRange(i + 1, lastIdx + 1).setValue(nowIso);
+    if (shouldTouchSession(lastIdx >= 0 ? cellIso(row[lastIdx]) : '', nowIso)) {
+      // 書くときは、隣り合う2セル (access_count, last_accessed_at) を
+      // 1回の書き込みにまとめる。列順が想定と違う場合は個別に書く。
+      if (accessIdx >= 0 && lastIdx === accessIdx + 1) {
+        sheet.getRange(i + 1, accessIdx + 1, 1, 2).setValues([[Number(row[accessIdx] || 0) + 1, nowIso]]);
+      } else {
+        if (accessIdx >= 0) sheet.getRange(i + 1, accessIdx + 1).setValue(Number(row[accessIdx] || 0) + 1);
+        if (lastIdx >= 0) sheet.getRange(i + 1, lastIdx + 1).setValue(nowIso);
+      }
+    }
     const role = roleIdx >= 0 && row[roleIdx] ? String(row[roleIdx]) : 'owner';
     return { role, expiresAt };
   }

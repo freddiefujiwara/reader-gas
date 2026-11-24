@@ -81,6 +81,7 @@ import {
   fetchFeeds,
   issueSession,
   validateSession,
+  shouldTouchSession,
   validateShareToken,
   shareLinkStatus,
   issueShareLink,
@@ -1334,18 +1335,32 @@ test('issueSession / validateSession: ハッシュだけを保存し、検証で
     const ttlMs = Date.parse(row[2]) - Date.parse(row[1]);
     assert.ok(Math.abs(ttlMs - 30 * 24 * 60 * 60 * 1000) < 5000, 'TTL は約30日: ' + ttlMs);
     assert.equal(row[6], 'owner');
-    // 検証が通り、呼ばれるたびに access_count が加算される
+    // 検証が通り、初回は access_count と last_accessed_at が書き戻される
     const v1 = validateSession(issued.sessionToken);
     assert.equal(v1.role, 'owner');
     assert.equal(v1.expiresAt, issued.expiresAt);
     assert.equal(sheet.rows[1][4], 1);
+    assert.ok(sheet.rows[1][5], 'last_accessed_at も記録される');
+    // 直後の検証では書き戻しを間引く (access_count は増えない)
+    validateSession(issued.sessionToken);
+    assert.equal(sheet.rows[1][4], 1);
+    // 最終アクセスが間隔より古くなれば、また書き戻される
+    sheet.rows[1][5] = new Date(Date.now() - 11 * 60 * 1000).toISOString();
     validateSession(issued.sessionToken);
     assert.equal(sheet.rows[1][4], 2);
-    assert.ok(sheet.rows[1][5], 'last_accessed_at も記録される');
     // 無関係なトークン・空トークンは通らない
     assert.equal(validateSession('not-a-real-token'), null);
     assert.equal(validateSession(''), null);
   } finally { restore(); }
+});
+
+test('shouldTouchSession: 空・解釈不能・間隔以上空いたときだけ書き戻す', () => {
+  const now = '2026-11-25T00:10:00.000Z';
+  assert.equal(shouldTouchSession('', now), true);
+  assert.equal(shouldTouchSession('bad', now), true);
+  assert.equal(shouldTouchSession('2026-11-25T00:09:00.000Z', now), false);
+  assert.equal(shouldTouchSession('2026-11-25T00:00:00.000Z', now), true);
+  assert.equal(shouldTouchSession('2026-11-24T23:00:00.000Z', now), true);
 });
 
 test('validateSession: 期限切れは拒否し、role 空欄は owner 扱い', () => {
