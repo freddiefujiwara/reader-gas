@@ -1108,13 +1108,17 @@ function groupRowsByCategory(values, categoryIdx) {
 // --- Auth (tweet-gas pattern, simplified for reader) ---
 
 // オーナーのメールアドレスはコードに直書きせず、スクリプトプロパティ
-// ALLOWED_EMAIL から読む。未設定・空・PropertiesService 自体が無い環境
-// では空文字を返し、どのメールも一致しない (fail-closed)。
-function allowedEmail() {
+// ALLOWED_EMAIL から読む。カンマ区切りで複数指定できる。未設定・空・
+// PropertiesService 自体が無い環境では空のリストを返し、どのメールも
+// 一致しない (fail-closed)。
+function allowedEmails() {
   try {
-    return String(PropertiesService.getScriptProperties().getProperty(ALLOWED_EMAIL_PROP) || '').trim();
+    return String(PropertiesService.getScriptProperties().getProperty(ALLOWED_EMAIL_PROP) || '')
+      .split(',')
+      .map((v) => v.trim().toLowerCase())
+      .filter((v) => v.length > 0);
   } catch (e) {
-    return '';
+    return [];
   }
 }
 
@@ -1122,8 +1126,8 @@ function isAllowedIdTokenPayload(json, clientId) {
   if (!json) return false;
   const verified = json.email_verified === true || json.email_verified === 'true';
   if (!verified) return false;
-  const allowed = allowedEmail();
-  if (!allowed || json.email !== allowed) return false;
+  const allowed = allowedEmails();
+  if (allowed.length === 0 || !allowed.includes(String(json.email || '').toLowerCase())) return false;
   if (clientId && json.aud !== clientId) return false;
   return true;
 }
