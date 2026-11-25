@@ -169,6 +169,18 @@ test('isAllowedIdTokenPayload: オーナーの検証済みトークンだけ許�
   } finally { restore(); }
 });
 
+test('isAllowedIdTokenPayload: ALLOWED_EMAIL はカンマ区切りで複数指定できる', () => {
+  const restore = installGasGlobals({
+    PropertiesService: fakePropertiesService({ ALLOWED_EMAIL: 'owner@example.com, second@example.com' }).service,
+  });
+  try {
+    const base = { email_verified: 'true', aud: 'client-1' };
+    assert.equal(isAllowedIdTokenPayload({ ...base, email: 'owner@example.com' }, 'client-1'), true);
+    assert.equal(isAllowedIdTokenPayload({ ...base, email: 'second@example.com' }, 'client-1'), true);
+    assert.equal(isAllowedIdTokenPayload({ ...base, email: 'third@example.com' }, 'client-1'), false);
+  } finally { restore(); }
+});
+
 test('isAllowedIdTokenPayload: ALLOWED_EMAIL プロパティ未設定なら全て拒否 (fail-closed)', () => {
   const restore = installGasGlobals({
     PropertiesService: fakePropertiesService({}).service,
