@@ -94,6 +94,7 @@ import {
   sanitizeEventBatch,
   handleLogEvents,
   aggregateFeedStats,
+  rekeyFeedStats,
   buildFeedStatsPayload,
   planEventPrune,
   pruneOldEvents,
@@ -5253,6 +5254,58 @@ test('aggregateFeedStats: 利用を表す4種だけをフィード別に集計�
   });
   assert.deepEqual(aggregateFeedStats([]), {});
   assert.deepEqual(aggregateFeedStats(null), {});
+});
+
+test('rekeyFeedStats: ログ側の URL ハッシュのキーを、シートの ID へ付け替える', () => {
+  const urlA = 'https://example.com/a.xml';
+  const urlB = 'https://example.com/b.xml';
+  const hashA = feedIdFromUrl(urlA);
+  const hashB = feedIdFromUrl(urlB);
+  const stat = (views) => ({ plays: 0, playSeconds: 0, opens: 0, expands: 0, views, lastAt: '2026-11-21T10:00:00.000Z' });
+  // スラッグ ID の行: ハッシュのキーで来た集計がスラッグへ移る
+  assert.deepEqual(
+    rekeyFeedStats({ [hashA]: stat(3) }, [{ id: 'weather', url: urlA }]),
+    { weather: stat(3) }
+  );
+  // シート ID が既にハッシュと一致する行はそのまま
+  assert.deepEqual(
+    rekeyFeedStats({ [hashB]: stat(1) }, [{ id: hashB, url: urlB }]),
+    { [hashB]: stat(1) }
+  );
+  // 一覧に無いキーはそのまま残す。URL や ID が無い行は読み飛ばす
+  assert.deepEqual(
+    rekeyFeedStats({ unknown: stat(2) }, [{ id: '', url: urlA }, { id: 'x' }, null]),
+    { unknown: stat(2) }
+  );
+  // 付け替え先が重なったら合算し、lastAt は新しい方を取る
+  const older = { plays: 1, playSeconds: 10, opens: 1, expands: 0, views: 1, lastAt: '2026-11-20T10:00:00.000Z' };
+  const newer = { plays: 2, playSeconds: 20, opens: 0, expands: 1, views: 2, lastAt: '2026-11-22T10:00:00.000Z' };
+  assert.deepEqual(
+    rekeyFeedStats({ [hashA]: older, weather: newer }, [{ id: 'weather', url: urlA }]),
+    { weather: { plays: 3, playSeconds: 30, opens: 1, expands: 1, views: 3, lastAt: '2026-11-22T10:00:00.000Z' } }
+  );
+  assert.deepEqual(rekeyFeedStats(null, null), {});
+});
+
+test('buildFeedStatsPayload: スラッグ ID のフィードでも、URL ハッシュで記録された利用がシート ID で返る', () => {
+  const url = 'https://example.com/weather-rss';
+  const hash = feedIdFromUrl(url);
+  const ss = new FakeSpreadsheet({
+    feeds: [['id', 'title', 'url'],
+      ['weather', '天気', url],
+    ],
+    events: [EVENTS_HEADERS_ROW,
+      ['2026-11-24T10:00:00.000Z', 'feed_view', hash, '天気', '', '', ''],
+      ['2026-11-24T11:00:00.000Z', 'article_open', hash, '天気', 'art-1', '', ''],
+    ],
+  });
+  const restore = installSpreadsheet(ss);
+  try {
+    assert.deepEqual(buildFeedStatsPayload(), {
+      ok: true,
+      stats: { weather: { plays: 0, playSeconds: 0, opens: 1, expands: 0, views: 1, lastAt: '2026-11-24T11:00:00.000Z' } },
+    });
+  } finally { restore(); }
 });
 
 test('doPost feed_stats: オーナーは集計を取得でき、readonly は forbidden、events が無ければ空', () => {

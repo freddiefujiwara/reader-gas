@@ -2858,6 +2858,38 @@ function aggregateFeedStats(events) {
   return stats;
 }
 
+// 集計結果のキーを、フィード一覧 (シート) の ID へ付け替える。
+// 視聴ログの feed_id はクライアント側の同一性 (URL のハッシュ) で
+// 記録される一方、管理画面はシートの ID で引く。シート ID が URL
+// ハッシュと違うフィード (スラッグ ID の行や、URL の変更前に
+// 決まったハッシュが残る行) は、そのままだと記録があるのに
+// 「記録なし」になるため、ここで揃える。付け替え先が重なったら
+// 合算する (移行前の旧 ID で記録された分と合算されるケース)。
+function rekeyFeedStats(stats, feeds) {
+  const sheetIdByHash = {};
+  (feeds || []).forEach((f) => {
+    if (!f || !f.id || !f.url) return;
+    sheetIdByHash[feedIdFromUrl(f.url)] = String(f.id);
+  });
+  const out = {};
+  Object.keys(stats || {}).forEach((key) => {
+    const target = sheetIdByHash[key] || key;
+    const s = stats[key];
+    const cur = out[target];
+    if (!cur) {
+      out[target] = { ...s };
+      return;
+    }
+    cur.plays += s.plays;
+    cur.playSeconds += s.playSeconds;
+    cur.opens += s.opens;
+    cur.expands += s.expands;
+    cur.views += s.views;
+    if (s.lastAt > cur.lastAt) cur.lastAt = s.lastAt;
+  });
+  return out;
+}
+
 function buildFeedStatsPayload() {
   const ss = openDataSpreadsheet();
   const eventsSheet = ss.getSheetByName(EVENTS_SHEET_NAME);
@@ -2865,7 +2897,9 @@ function buildFeedStatsPayload() {
   const values = eventsSheet.getDataRange().getValues();
   if (!values || values.length < 2) return { ok: true, stats: {} };
   const events = values.slice(1).map((row) => rowObject(values[0], row));
-  return { ok: true, stats: aggregateFeedStats(events) };
+  const stats = aggregateFeedStats(events);
+  const feeds = readSheetAsObjects(ss, 'feeds');
+  return { ok: true, stats: rekeyFeedStats(stats, feeds) };
 }
 
 function planEventPrune(events, nowIso) {
@@ -3016,4 +3050,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, normalizeStarMode, normalizeStarCount, normalizeStarMinSec, starSettingsOf, effectiveStarRule, planStarSelection, normalizePastGuard, pastGuardOf, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, shouldTouchSession, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateFeedStats, buildFeedStatsPayload, planEventPrune, pruneOldEvents, maybePruneOldEvents, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, normalizeStarMode, normalizeStarCount, normalizeStarMinSec, starSettingsOf, effectiveStarRule, planStarSelection, normalizePastGuard, pastGuardOf, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, shouldTouchSession, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateFeedStats, rekeyFeedStats, buildFeedStatsPayload, planEventPrune, pruneOldEvents, maybePruneOldEvents, doGet, doPost };
