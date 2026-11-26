@@ -2500,9 +2500,9 @@ function pastGuardOf(f) {
 // 対象にするかの設定。シートの prune_exempt 列に 'on' (掃除しない) /
 // 'off' (掃除する) を保存し、未指定は ''。API へは未指定を null で
 // 返す。実際の判定はクライアント (localDb の effectivePruneExempt)
-// が行い、種別ごとの既定は YouTube 由来 = 'on' (最新分しか再配信
-// されず、消すと戻らないため)、それ以外 = 'off'。サーバーは属性の
-// 置き場所と配布だけを担う (過去分ガードと同じ分担)。
+// が行い、設定だけで決める ('on' のフィードだけ対象外。種別による
+// 既定は持たない)。サーバーは属性の置き場所と配布だけを担う
+// (過去分ガードと同じ分担)。
 function normalizePruneExempt(value) {
   const v = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
   return v === 'on' || v === 'off' ? v : '';
