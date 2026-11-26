@@ -2212,6 +2212,8 @@ function buildListPayload(body) {
       starMinSec: starSettingsOf(f).starMinSec,
       // 過去分ガードの設定も取り込み側が要る (未指定は null)。
       pastGuard: pastGuardOf(f),
+      // ローカル掃除の対象外設定も、掃除を行う端末側が要る。
+      pruneExempt: pruneExemptOf(f),
       unreadCount: unreadByFeed[f.id] || 0,
     })),
   };
@@ -2353,6 +2355,16 @@ function validateFeedInput(input) {
       feed.pastGuard = pg;
     }
   }
+  // ローカル掃除の対象外設定も任意 (過去分ガードと同じ扱い)。
+  if (input.pruneExempt !== undefined) {
+    if (input.pruneExempt === null || input.pruneExempt === '') {
+      feed.pruneExempt = '';
+    } else {
+      const pe = normalizePruneExempt(input.pruneExempt);
+      if (!pe) return { ok: false, message: 'pruneExempt must be one of on, off' };
+      feed.pruneExempt = pe;
+    }
+  }
   return {
     ok: true,
     feed,
@@ -2399,6 +2411,10 @@ function buildFeedRow(feed, existing) {
     past_guard: feed.pastGuard !== undefined
       ? normalizePastGuard(feed.pastGuard)
       : (prev ? normalizePastGuard(prev.past_guard) : ''),
+    // ローカル掃除の対象外: 明示があればそれを、無ければ既存行の値を引き継ぐ。
+    prune_exempt: feed.pruneExempt !== undefined
+      ? normalizePruneExempt(feed.pruneExempt)
+      : (prev ? normalizePruneExempt(prev.prune_exempt) : ''),
   };
 }
 
@@ -2480,6 +2496,24 @@ function pastGuardOf(f) {
   return normalizePastGuard(raw) || null;
 }
 
+// フィードの記事を、端末ローカルの保持ルール (既読記事の掃除) の
+// 対象にするかの設定。シートの prune_exempt 列に 'on' (掃除しない) /
+// 'off' (掃除する) を保存し、未指定は ''。API へは未指定を null で
+// 返す。実際の判定はクライアント (localDb の effectivePruneExempt)
+// が行い、種別ごとの既定は YouTube 由来 = 'on' (最新分しか再配信
+// されず、消すと戻らないため)、それ以外 = 'off'。サーバーは属性の
+// 置き場所と配布だけを担う (過去分ガードと同じ分担)。
+function normalizePruneExempt(value) {
+  const v = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
+  return v === 'on' || v === 'off' ? v : '';
+}
+
+function pruneExemptOf(f) {
+  const src = f || {};
+  const raw = src.prune_exempt !== undefined ? src.prune_exempt : src.pruneExempt;
+  return normalizePruneExempt(raw) || null;
+}
+
 // Shapes a feeds-tab object (or a buildFeedRow result) into the API feed item.
 function feedToApiShape(feedObj, unreadCount, serviceUrl) {
   const f = feedObj || {};
@@ -2499,6 +2533,7 @@ function feedToApiShape(feedObj, unreadCount, serviceUrl) {
     starCount: starSettingsOf(f).starCount,
     starMinSec: starSettingsOf(f).starMinSec,
     pastGuard: pastGuardOf(f),
+    pruneExempt: pruneExemptOf(f),
     lastStatus: String(status || ''),
     lastError: String(error || ''),
     lastFetchedAt: cellIso(fetched),
@@ -2581,7 +2616,7 @@ function handleSaveFeed(body, resolveHandle) {
     headers.push('sync_deletes');
   }
   // スター選定の3列と過去分ガードの列も同じ移行パターンで遅延追加する。
-  ['star_mode', 'star_count', 'star_min_sec', 'past_guard'].forEach((name) => {
+  ['star_mode', 'star_count', 'star_min_sec', 'past_guard', 'prune_exempt'].forEach((name) => {
     if (!headers.includes(name)) {
       ensureColumnIndex(sheet, headers, name);
       headers.push(name);
