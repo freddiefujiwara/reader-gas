@@ -46,9 +46,8 @@
 // するのは articles タブの star_override 列 (手動オーバーライド:
 // '' = 自動判定に任せる、'on' = 手動で付けた、'off' = 手動で外した)
 // だけで、実効スターはオーバーライドがあればそれを優先し、無ければ
-// デフォルトルール (従来の planYouTubeAudioTriggers の選定規則) を
-// 現在の記事集合に対して評価した結果で決める。列が無いシートでは
-// 全行が '' 扱いになるため、移行なしで従来の挙動と一致する。
+// デフォルトルール (フィードのスター選定設定を planStarSelection で
+// 評価した結果) で決める。
 
 const ALLOWED_EMAIL_PROP = 'ALLOWED_EMAIL';
 const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
@@ -1333,29 +1332,14 @@ function selectFetchTargets(feeds) {
 // 自宅サーバーのバッチが音声ストリーム
 // URL を抽出して audio-urls.json として公開する (非同期)。
 // ?rss= はその JSON の新鮮なエントリを enclosure として配信する。
-// 発火対象は各 YouTube フィードの新しい順3本で、期間制限は無く、
-// 新着かどうかも問わない (自宅サーバー側が抽出済みのものは重複排除
-// するため、毎時叩き直しても安い)。ただし長さが90秒未満と分かって
-// いる動画は数えない (Shorts・短尺クリップ対策。本人の決定)。
-// 長さは取り込み時に videos.list で補って記事行へ保存しておき、
-// 長さ不明の動画は fail-open で通常どおり数える。
-// ジャンルによる特別扱いはしない (旧来のジャンル「音楽」の特別
-// ルールは廃止した。本人の決定。過去分を広く再生したい用途は、
-// 下記のプレイリストフィードでカバーする)。
-// 例外は「全件クラス」の2種類で、最新3本の上限も90秒未満の除外も付けない:
-// - YT_AUDIO_ALWAYS_CHANNEL_ID のチャンネルは、取得できた動画を
-//   毎時すべて依頼し直して常時再生可能な状態を保つ (下の定数の
-//   コメント参照)。
-// - プレイリストフィードは、本人が手で選んだ動画の集まりなので、
-//   取り込んだ記事すべてを対象にする (本人の決定)。
-// 失敗しても巡回自体は失敗にしない (fire-and-forget)。
-// スター制の導入後は、この選定規則は「デフォルトのスター判定」と
-// して computeStarredArticleIds / planStarredAudioTriggers から
-// 使われ、実際の発火対象は実効スターの付いた動画だけになる。
+// 発火対象は実効スターの付いた動画だけ (スター制)。実効スターは
+// 手動オーバーライド (記事の star_override) を優先し、無ければ
+// フィードのスター選定設定 (effectiveStarRule / planStarSelection)
+// で決まる。失敗しても巡回自体は失敗にしない (fire-and-forget)。
 
 const YT_AUDIO_TRIGGER_PER_FEED = 3;
-// 全体キャップ。計画合計は通常フィード分 (3本/フィード) + 全件
-// クラス分 (常時対応チャンネルとプレイリスト) で増えうるため、
+// 全体キャップ。計画合計はフィードごとの本数や全件モードの
+// フィードで増えうるため、
 // 余裕を持たせて200とする (旧上限の100では合計が超過し、フィード
 // 順の後ろのフィードが毎回締め出されていた)。200を超える場合は
 // フィード順の先頭から打ち切るが、手動スターは計画側
@@ -1365,70 +1349,20 @@ const YT_AUDIO_TRIGGER_MAX_PER_RUN = 200;
 // 未満と分かっている動画は最新3本の枠に入れない。ちょうどこの値の
 // 動画は対象 (未満だけを除く)。
 const YT_AUDIO_TRIGGER_MIN_DURATION_SEC = 90;
-// 常時対応チャンネル (本人のチャンネル「藤原史和 川口を歩くQAエンジニア」)。
-// reader-gas が毎時、このチャンネルの動画をすべて yt-audio のキューへ
-// 入れ直し、自宅サーバー側のバッチは URL が4時間を超えたエントリを
-// 取り直す。
-// そのため、このチャンネルの音声 URL は失効前に更新され続け、
-// 常に新鮮な enclosure が付く (= 常に再生可能)。自宅サーバー側の変更は不要。
+// 本人のチャンネル「藤原史和 川口を歩くQAエンジニア」。購読同期の
+// 対象外としてピン留めするためにだけ使う (追加・削除ともに対象外)。
+// このチャンネルの動画が全件スター扱いで毎時抽出され直し、常に
+// 再生可能に保たれるのは、フィードのスター選定設定 (star_mode =
+// 'all') による (種別既定ではない)。
 const YT_AUDIO_ALWAYS_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
-
-// 発火対象を選ぶ純関数: フィードごとに、公開日時が読める動画を
-// 新しい順に並べ、長さが YT_AUDIO_TRIGGER_MIN_DURATION_SEC 未満と
-// 分かっている動画を数えずに (枠を消費せず次の動画へ進む)、最大
-// YT_AUDIO_TRIGGER_PER_FEED 本を選び、動画IDで重複を除いて並べる。
-// 期間制限は無い。公開日時が読めない動画は安全側で対象外。
-// 長さ不明 (durationSec が 0 以下・欠落) の動画は fail-open で
-// 通常どおり数える (長さを補う取得に失敗した回でも、通常の
-// 新しい順3本に倒れる)。
-// ジャンルによる特別扱いはしない (音楽ジャンルの特別ルールは廃止)。
-// 例外は「全件クラス」の2種類で、どちらも公開日時や件数・長さに
-// 関係なく動画IDのある全件を選ぶ (公開日時が読めない動画も対象):
-// - 常時対応チャンネル (YT_AUDIO_ALWAYS_CHANNEL_ID) のフィード
-//   (常時再生可能を保つため)。
-// - プレイリストフィード (playlist フラグ。本人が手で選んだ動画
-//   の集まりのため。手で選んだものを長さで落とさない)。
-// 上限件数の適用は発火側 (fireYouTubeAudioTriggers) で行う。
-// nowMs は呼び出し側の互換のため残す (期間制限の廃止後は未使用)。
-// feedVideos はフィードごとの { videoId, publishedAt, channelId,
-// playlist, durationSec } の配列の配列 (channelId は常時対応
-// チャンネルの判定用、playlist はプレイリストフィードの印、
-// durationSec は動画の長さ (秒)。0以下・欠落は不明)。
-function planYouTubeAudioTriggers(feedVideos, nowMs) {
-  const seen = {};
-  const ids = [];
-  (feedVideos || []).forEach((videos) => {
-    const list = videos || [];
-    if (list.some((v) => v && (v.channelId === YT_AUDIO_ALWAYS_CHANNEL_ID || v.playlist))) {
-      // 全件クラス: 取得できた順 (新しい順) に全件を選ぶ。
-      planStarSelection(list, { mode: 'all' }).forEach((videoId) => {
-        if (seen[videoId]) return;
-        seen[videoId] = true;
-        ids.push(videoId);
-      });
-      return;
-    }
-    planStarSelection(list, {
-      mode: 'recent',
-      count: YT_AUDIO_TRIGGER_PER_FEED,
-      minSec: YT_AUDIO_TRIGGER_MIN_DURATION_SEC,
-    }).forEach((videoId) => {
-      if (seen[videoId]) return;
-      seen[videoId] = true;
-      ids.push(videoId);
-    });
-  });
-  return ids;
-}
 
 // --- スター選定の設定 (フィード属性) ---
 // 選定ルールは管理画面からフィードごとに変更できる。保存値は
-// feeds シートの star_mode / star_count / star_min_sec 列で、
-// 未指定 (空) の項目は種別ごとの既定に倒すため、設定が無い
-// フィードの挙動は従来と変わらない (引き継ぎ不要の移行)。
-// 既定: チャンネル = 新しい順3本・90秒未満を除く、プレイリストと
-// 常時対応チャンネル = 全件、それ以外 = なし。手動オーバーライド
-// (記事の star_override) は、このルールより優先される。
+// feeds シートの star_mode / star_count / star_min_sec 列で、実効
+// ルールは保存値だけで決める (種別ごとの既定は持たない)。モード
+// 未指定は 'none' (なし)、本数・下限の未指定は一律の既定 (3本・
+// 90秒) を使う。手動オーバーライド (記事の star_override) は、
+// このルールより優先される。
 
 // star_mode の保存値: 'none' / 'recent' / 'all' 以外は '' (= 未指定)。
 function normalizeStarMode(value) {
@@ -1456,8 +1390,8 @@ function normalizeStarMinSec(value) {
 }
 
 // フィードに保存されたスター選定の設定だけを取り出す (純関数)。
-// API へは未指定を null で返す (管理画面が「未指定 = 種別既定」と
-// 明示値を区別するため)。
+// API へは未指定を null で返す (管理画面が未指定と明示値を
+// 区別するため)。
 function starSettingsOf(feed) {
   const f = feed || {};
   return {
@@ -1467,22 +1401,13 @@ function starSettingsOf(feed) {
   };
 }
 
-// 実効ルール (純関数): 保存値があればそれを使い、無い項目は
-// 種別ごとの既定で埋める。count / minSec は mode が 'recent'
-// のときだけ意味を持つ。
+// 実効ルール (純関数): 保存値だけで決める。モード未指定は 'none'。
+// count / minSec は mode が 'recent' のときだけ意味を持ち、未指定は
+// 一律の既定 (YT_AUDIO_TRIGGER_PER_FEED / _MIN_DURATION_SEC) を使う。
 function effectiveStarRule(feed) {
-  const f = feed || {};
-  const settings = starSettingsOf(f);
-  const channelId = youtubeChannelIdFromUrl(f.url);
-  const isPlaylist = !!youtubePlaylistIdFromUrl(f.url);
-  let mode = settings.starMode;
-  if (!mode) {
-    mode = channelId === YT_AUDIO_ALWAYS_CHANNEL_ID || isPlaylist
-      ? 'all'
-      : channelId ? 'recent' : 'none';
-  }
+  const settings = starSettingsOf(feed || {});
   return {
-    mode,
+    mode: settings.starMode || 'none',
     count: settings.starCount !== null ? settings.starCount : YT_AUDIO_TRIGGER_PER_FEED,
     minSec: settings.starMinSec !== null ? settings.starMinSec : YT_AUDIO_TRIGGER_MIN_DURATION_SEC,
   };
@@ -1616,8 +1541,7 @@ function computeStarredArticleIds(feeds, articles, nowMs) {
 // 抽出トリガーの発火計画 (純関数): 実効スターが付いた動画IDを返す。
 // 並びは、手動で付けた分 (star_override='on') を全体の先頭に寄せ
 // (フィード順・フィード内は新しい順)、続いてデフォルト分を
-// フィード順に並べる (デフォルトの並びは planYouTubeAudioTriggers
-// のまま。手動で外した分は除く)。全体キャップ
+// フィード順に並べる (手動で外した分は除く)。全体キャップ
 // (YT_AUDIO_TRIGGER_MAX_PER_RUN) は発火側
 // (fireYouTubeAudioTriggers) で付けるが、手動スターが先頭に
 // あるため上限で落ちることはない。
@@ -1686,14 +1610,14 @@ function fireYouTubeAudioTrigger(videoId, token) {
 // (省略時は fireYouTubeAudioTrigger)。時間ベーストリガーから呼ばれる
 // fetchFeeds 経由ではイベントオブジェクトが渡ってくるため、関数で
 // なければ既定実装に落とす。nowMs は30日判定用のテスト差し込み口。
-// plannedIds (動画IDの配列) を渡した場合は feedVideos からの計画を
-// 省いてそれを発火対象にする (スター制の計画はこちらで渡す)。
+// 発火対象は plannedIds (スター制の計画) で渡す。渡されなければ
+// 発火しない。
 function fireYouTubeAudioTriggers(feedVideos, fireTrigger, nowMs, plannedIds) {
   const token = scriptProperty('A_ZE_GS_TOKEN');
   if (!token) return 0;
   if (!scriptBaseUrl('A_ZE_GS_BASE_URL')) return 0;
   const fire = resolveFireTrigger(fireTrigger);
-  const planned = Array.isArray(plannedIds) ? plannedIds : planYouTubeAudioTriggers(feedVideos, nowMs);
+  const planned = Array.isArray(plannedIds) ? plannedIds : [];
   const targets = planned.slice(0, YT_AUDIO_TRIGGER_MAX_PER_RUN);
   if (planned.length > targets.length) {
     console.log('yt-audio: triggers capped at ' + targets.length + ' of ' + planned.length + ' videos');
@@ -1875,6 +1799,12 @@ function syncYouTubeSubscriptions() {
           title: item.title,
           url: item.url,
           category: YT_SUBSCRIPTION_SYNC_CATEGORY,
+          // 新規チャンネルの設定は明示値で作る (種別既定は持たない)。
+          starMode: 'recent',
+          starCount: YT_AUDIO_TRIGGER_PER_FEED,
+          starMinSec: YT_AUDIO_TRIGGER_MIN_DURATION_SEC,
+          pastGuard: 'read',
+          pruneExempt: 'on',
         }, null);
         sheet.appendRow(feedRowValues(rowObj, headers));
         added++;
@@ -1995,16 +1925,19 @@ function fetchYouTubePlaylistFeed(ss, articlesSheet, feed, playlistId, apiKey, e
   const added = appendNewEntries(articlesSheet, feed, entries, existingIds, fetchedAt, durationColIdx);
   // 既存記事 (再追加されない) の長さも埋め戻す (チャンネル側と対)。
   backfillArticleDurations(articlesSheet, feed, entries, durationColIdx);
-  // 削除同期: ここまで例外なく来た = 全ページの取得が成功している。
-  const ownArticles = (existingArticleRows || []).filter((a) => String(a.feed_id) === String(feed.id));
-  const plan = planPlaylistArticleDeletions(ownArticles, entries.map((e) => e.guid));
-  if (plan.blocked) {
-    console.log('youtube-playlist-sync: deletes skipped for feed ' + feed.id + ': '
-      + plan.candidates + ' candidates exceed the cap of ' + YT_PLAYLIST_SYNC_MAX_DELETES);
-  } else if (plan.deleteIds.length) {
-    deleteRowsById(ss, 'articles', 'id', plan.deleteIds);
-    // 消えた記事が RSS キャッシュから出続けないように落とす。
-    invalidateRssCache(feed.id);
+  // 削除同期: フィード設定 (sync_deletes) が 'on' のときだけ行う。
+  // ここまで例外なく来た = 全ページの取得が成功している。
+  if (syncDeletesOf(feed)) {
+    const ownArticles = (existingArticleRows || []).filter((a) => String(a.feed_id) === String(feed.id));
+    const plan = planPlaylistArticleDeletions(ownArticles, entries.map((e) => e.guid));
+    if (plan.blocked) {
+      console.log('youtube-playlist-sync: deletes skipped for feed ' + feed.id + ': '
+        + plan.candidates + ' candidates exceed the cap of ' + YT_PLAYLIST_SYNC_MAX_DELETES);
+    } else if (plan.deleteIds.length) {
+      deleteRowsById(ss, 'articles', 'id', plan.deleteIds);
+      // 消えた記事が RSS キャッシュから出続けないように落とす。
+      invalidateRssCache(feed.id);
+    }
   }
   return added;
 }
@@ -2482,8 +2415,8 @@ function syncDeletesOf(f) {
 // 'skip' (取り込まない) / 'read' (既読として取り込む) / 'off'
 // (未読として取り込む = ガードなし) のいずれかを保存し、未指定は
 // ''。API へは未指定を null で返す。実際の判定はクライアント
-// (localDb の effectivePastGuard) が行い、種別ごとの既定は
-// 通常フィード = 'skip'、YouTube 由来 = 'read'。サーバーは
+// (localDb の effectivePastGuard) が行い、保存値だけで決める
+// (未指定は 'skip'。種別ごとの既定は持たない)。サーバーは
 // 属性の置き場所と配布だけを担う (スター選定と同じ分担)。
 function normalizePastGuard(value) {
   const v = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
@@ -3085,4 +3018,4 @@ function doPost(e) {
     return jsonOutput({ ok: false, error: String((err && err.message) || err) });
   }
 }
-export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, planYouTubeAudioTriggers, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, normalizeStarMode, normalizeStarCount, normalizeStarMinSec, starSettingsOf, effectiveStarRule, planStarSelection, normalizePastGuard, pastGuardOf, normalizePruneExempt, pruneExemptOf, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, shouldTouchSession, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateFeedStats, rekeyFeedStats, buildFeedStatsPayload, planEventPrune, pruneOldEvents, maybePruneOldEvents, doGet, doPost };
+export { rowsToObjects, articleId, feedIdFromUrl, sha256Hex, sha256HexPure, stripTags, summarize, decodeXmlEntities, toIsoDate, isTruthy, isAllowedIdTokenPayload, verifyIdToken, hashesEqual, isSessionExpired, prunePlan, filterArticles, buildListPayload, selectFetchTargets, youtubeChannelIdFromUrl, youtubeFeedUrlFromChannelId, youtubePlaylistIdFromUrl, youtubeFeedUrlFromPlaylistId, parseYouTubeChannelUrl, youtubeUploadsPlaylistId, parseYouTubePlaylistItems, parseYouTubeNextPageToken, parseYouTubeChannelTitle, parseYouTubePlaylistTitle, parseYouTubeDurations, parseChannelLookupResponse, lookupYouTubeChannelByHandle, youtubeApiErrorDetail, parseAudioUrlsMap, utf8ByteLength, scriptCache, rssCacheKey, invalidateRssCache, getAudioUrlsMapFromCache, putAudioUrlsMapCache, scriptBaseUrl, fetchAudioUrlsMap, ytPlayUrl, computeStarredArticleIds, planStarredAudioTriggers, fireYouTubeAudioTriggers, escapeXml, videoIdFromLink, toRfc822, buildRssXml, buildFetchUrl, parseFeedUrl, validateFeedInput, buildFeedRow, feedRowValues, normalizeSortOrder, sortDirectionOf, normalizeSyncDeletes, syncDeletesOf, normalizeStarMode, normalizeStarCount, normalizeStarMinSec, starSettingsOf, effectiveStarRule, planStarSelection, normalizePastGuard, pastGuardOf, normalizePruneExempt, pruneExemptOf, feedToApiShape, countUnreadByFeed, remainingRowsAfterDelete, reorderRowsByIds, validateFeedOrder, groupRowsByCategory, regroupFeedsByCategory, shouldTouchSession, appendNewEntries, parseYouTubeSubscriptionsPage, fetchMyYouTubeSubscriptions, planYouTubeSubscriptionSync, syncYouTubeSubscriptions, planPlaylistArticleDeletions, fetchFeeds, issueSession, validateSession, validateShareToken, shareLinkStatus, issueShareLink, getShareLinkStatus, revokeShareLink, handleSaveFeed, handleDeleteFeed, handleSetStar, sanitizeEvent, sanitizeEventBatch, handleLogEvents, aggregateFeedStats, rekeyFeedStats, buildFeedStatsPayload, planEventPrune, pruneOldEvents, maybePruneOldEvents, doGet, doPost };
