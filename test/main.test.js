@@ -53,6 +53,8 @@ import {
   planStarSelection,
   normalizePastGuard,
   pastGuardOf,
+  normalizePruneExempt,
+  pruneExemptOf,
   computeStarredArticleIds,
   planStarredAudioTriggers,
   fireYouTubeAudioTriggers,
@@ -305,7 +307,7 @@ test('buildFeedRow: 新規はキャッシュ欄が空、更新は保持、URL変
   assert.deepEqual(created, {
     id: 'zenn', title: 'Zenn', url: 'https://zenn.dev/feed', category: 'tech',
     etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '', sync_deletes: '',
-    star_mode: '', star_count: '', star_min_sec: '', past_guard: '',
+    star_mode: '', star_count: '', star_min_sec: '', past_guard: '', prune_exempt: '',
   });
   const existing = {
     id: 'zenn', title: 'Old', url: 'https://zenn.dev/feed', category: '',
@@ -342,7 +344,7 @@ test('feedToApiShape: シート表現をAPI形式へ変換する', () => {
     last_status: '200', last_error: '', last_fetched_at: new Date('2026-11-14T00:15:30.088Z'),
   }, 7);
   assert.deepEqual(shaped, {
-    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private', sortDirection: 'desc', syncDeletes: false, starMode: null, starCount: null, starMinSec: null, pastGuard: null,
+    id: 'x-freddie', title: 'X freddie', url: 'https://example.com/x.freddie.xml', fetchUrl: 'https://example.com/x.freddie.xml', category: 'private', sortDirection: 'desc', syncDeletes: false, starMode: null, starCount: null, starMinSec: null, pastGuard: null, pruneExempt: null,
     lastStatus: '200', lastError: '', lastFetchedAt: '2026-11-14T00:15:30.088Z', unreadCount: 7,
   });
   assert.equal(feedToApiShape({ id: 'x' }).unreadCount, 0);
@@ -511,6 +513,34 @@ test('past_guard: buildFeedRow は明示を反映し、未指定では既存行�
   const existing = { ...feed, etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '', sync_deletes: '', past_guard: 'read' };
   assert.equal(buildFeedRow(feed, existing).past_guard, 'read');
   assert.equal(buildFeedRow({ ...feed, pastGuard: '' }, existing).past_guard, '');
+});
+
+test('prune_exempt: normalizePruneExempt は on/off 以外を未指定に倒し、pruneExemptOf は未指定を null で返す', () => {
+  assert.equal(normalizePruneExempt(' ON '), 'on');
+  assert.equal(normalizePruneExempt('off'), 'off');
+  assert.equal(normalizePruneExempt('junk'), '');
+  assert.equal(normalizePruneExempt(''), '');
+  assert.equal(pruneExemptOf({ prune_exempt: 'on' }), 'on');
+  assert.equal(pruneExemptOf({ prune_exempt: '' }), null);
+  assert.equal(pruneExemptOf({}), null);
+  assert.equal(feedToApiShape({ id: 'x', prune_exempt: 'off' }).pruneExempt, 'off');
+  assert.equal(feedToApiShape({ id: 'x' }).pruneExempt, null);
+});
+
+test('prune_exempt: validateFeedInput は値を受理し、不正値を弾き、未指定はキーなし、空は未指定に戻す', () => {
+  const base = { id: 'ok-id', title: 'Title', url: 'https://example.com/feed' };
+  assert.equal(validateFeedInput({ ...base, pruneExempt: 'on' }).feed.pruneExempt, 'on');
+  assert.equal(validateFeedInput({ ...base, pruneExempt: 'keep' }).ok, false);
+  assert.ok(!('pruneExempt' in validateFeedInput(base).feed));
+  assert.equal(validateFeedInput({ ...base, pruneExempt: '' }).feed.pruneExempt, '');
+});
+
+test('prune_exempt: buildFeedRow は明示を反映し、未指定では既存行の値を引き継ぎ、クリアで空に戻る', () => {
+  const feed = { id: 'a', title: 'A', url: 'https://example.com/f', category: '' };
+  assert.equal(buildFeedRow({ ...feed, pruneExempt: 'on' }, null).prune_exempt, 'on');
+  const existing = { ...feed, etag: '', last_modified: '', last_fetched_at: '', last_status: '', last_error: '', sort_order: '', sync_deletes: '', prune_exempt: 'off' };
+  assert.equal(buildFeedRow(feed, existing).prune_exempt, 'off');
+  assert.equal(buildFeedRow({ ...feed, pruneExempt: '' }, existing).prune_exempt, '');
 });
 
 test('countUnreadByFeed: サーバー側に既読状態が無いため記事数をそのまま数える', () => {
@@ -1622,7 +1652,7 @@ test('buildListPayload: フィードは fetchUrl を持ち、応答形は slim �
     assert.equal(byId['yt-x'].unreadCount, 1);
     // フィードのキー集合は slim 化後 (PR #16) の形から enabled を除き、
     // sortDirection と syncDeletes を加えた形に固定する
-    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'pastGuard', 'sortDirection', 'starCount', 'starMinSec', 'starMode', 'syncDeletes', 'title', 'unreadCount', 'url']);
+    assert.deepEqual(Object.keys(byId['yt-x']).sort(), ['category', 'fetchUrl', 'id', 'pastGuard', 'pruneExempt', 'sortDirection', 'starCount', 'starMinSec', 'starMode', 'syncDeletes', 'title', 'unreadCount', 'url']);
     // 既読は端末ローカル管理のため、isRead は常に false
     assert.equal(payload.articles[0].isRead, false);
   } finally { restore(); }
@@ -2196,7 +2226,7 @@ test('handleSaveFeed: slug ID の既存行は URL 一致で更新され、ID と
   } finally { restore(); }
 });
 
-test('handleSaveFeed: id 指定の更新は行を書き換え、15列で保存される (属性列を遅延追加)', () => {
+test('handleSaveFeed: id 指定の更新は行を書き換え、16列で保存される (属性列を遅延追加)', () => {
   const { ss, restore } = saveFeedEnv([
     ['zenn', 'Zenn', 'https://zenn.dev/feed', 'tech', '', '', '', '', ''],
   ]);
@@ -2209,15 +2239,16 @@ test('handleSaveFeed: id 指定の更新は行を書き換え、15列で保存�
     assert.equal(rows[1][3], 'blog');
     // enabled / is_private 列は撤去済み: E列 (index 4) は etag になる。
     // 入力の enabled は無視される。sort_order / sync_deletes / star_* /
-    // past_guard 列は保存時に末尾へ遅延追加され、行は15列になる
-    // (未指定なので値は空)。
+    // past_guard / prune_exempt 列は保存時に末尾へ遅延追加され、
+    // 行は16列になる (未指定なので値は空)。
     assert.equal(rows[0][9], 'sort_order');
     assert.equal(rows[0][10], 'sync_deletes');
     assert.equal(rows[0][11], 'star_mode');
     assert.equal(rows[0][12], 'star_count');
     assert.equal(rows[0][13], 'star_min_sec');
     assert.equal(rows[0][14], 'past_guard');
-    assert.equal(rows[1].length, 15);
+    assert.equal(rows[0][15], 'prune_exempt');
+    assert.equal(rows[1].length, 16);
     assert.equal(rows[1][4], '');
     assert.equal(rows[1][9], '');
     assert.equal(rows[1][10], '');
@@ -2225,6 +2256,7 @@ test('handleSaveFeed: id 指定の更新は行を書き換え、15列で保存�
     assert.equal(rows[1][12], '');
     assert.equal(rows[1][13], '');
     assert.equal(rows[1][14], '');
+    assert.equal(rows[1][15], '');
   } finally { restore(); }
 });
 
@@ -4407,7 +4439,7 @@ test('doPost listFeeds: 応答のキー集合が固定され、行順と記事�
     // シートの行順が表示順としてそのまま返る
     assert.deepEqual(res.feeds.map((f) => f.id), ['feed-b', 'feed-a']);
     assert.deepEqual(Object.keys(res.feeds[0]).sort(), [
-      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'pastGuard', 'sortDirection', 'starCount', 'starMinSec', 'starMode', 'syncDeletes', 'title', 'unreadCount', 'url',
+      'category', 'fetchUrl', 'id', 'lastError', 'lastFetchedAt', 'lastStatus', 'pastGuard', 'pruneExempt', 'sortDirection', 'starCount', 'starMinSec', 'starMode', 'syncDeletes', 'title', 'unreadCount', 'url',
     ]);
     // 未読数 = そのフィードの記事数 (サーバー側に既読は無い)
     assert.equal(res.feeds[0].unreadCount, 1);
